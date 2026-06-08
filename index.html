@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NFL BLITZ - Arcade Edition</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div id="gameContainer">
+        <canvas id="gameCanvas"></canvas>
+        <div id="loadingScreen">LOADING...</div>
+    </div>
+
+    <!-- Game Scripts (order matters) -->
+    <script src="js/constants.js"></script>
+    <script src="js/utils.js"></script>
+    <script src="js/input.js"></script>
+    <script src="js/audio.js"></script>
+    <script src="js/plays.js"></script>
+    <script src="js/player.js"></script>
+    <script src="js/field.js"></script>
+    <script src="js/ai.js"></script>
+    <script src="js/ui.js"></script>
+    <script src="js/game.js"></script>
+    <script>
+        // Hide loading screen once everything is ready
+        window.addEventListener('load', () => {
+            document.getElementById('loadingScreen').classList.add('hidden');
+        });
+    </script>
+</body>
+</html>

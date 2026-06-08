@@ -1,0 +1,98 @@
+/* =============================================================================
+   NFL BLITZ CLONE - STYLES
+   ============================================================================= */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background: #0a0a0a;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    font-family: 'Arial Black', Arial, sans-serif;
+    overflow: hidden;
+}
+
+#gameContainer {
+    position: relative;
+    width: 100%;
+    max-width: 1280px;
+    aspect-ratio: 16/9;
+}
+
+#gameCanvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    image-rendering: auto;
+    border: 3px solid #333;
+    border-radius: 4px;
+    box-shadow: 0 0 30px rgba(255, 215, 0, 0.2), 0 0 60px rgba(0, 0, 0, 0.5);
+}
+
+/* Scanline effect overlay */
+#gameContainer::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+        0deg,
+        rgba(0, 0, 0, 0.03) 0px,
+        rgba(0, 0, 0, 0.03) 1px,
+        transparent 1px,
+        transparent 3px
+    );
+    border-radius: 4px;
+}
+
+/* Loading screen */
+#loadingScreen {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    background: #0a0a0a;
+    color: #FFD700;
+    font-size: 24px;
+    z-index: 100;
+    transition: opacity 0.5s;
+}
+
+#loadingScreen.hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* Responsive scaling */
+@media (max-width: 1300px) {
+    #gameContainer {
+        max-width: 100vw;
+    }
+}
+
+@media (max-height: 750px) {
+    #gameContainer {
+        max-height: 100vh;
+        max-width: calc(100vh * 16 / 9);
+    }
+}
+
+/* Fullscreen styles */
+:fullscreen #gameContainer,
+:-webkit-full-screen #gameContainer {
+    max-width: 100vw;
+    max-height: 100vh;
+}
