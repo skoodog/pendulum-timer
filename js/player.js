@@ -93,14 +93,18 @@ class Player {
         this.y = clamp(this.y, 50, 1350);
 
         // Speed trail
-        const speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
-        if (speed > 2) {
+        const spd = this.vx * this.vx + this.vy * this.vy;
+        if (spd > 4) {
             this.speedTrail.push({ x: this.x, y: this.y, alpha: 0.5 });
         }
-        this.speedTrail = this.speedTrail.filter(t => {
-            t.alpha -= 0.05;
-            return t.alpha > 0;
-        });
+        let w = 0;
+        for (let i = 0; i < this.speedTrail.length; i++) {
+            this.speedTrail[i].alpha -= 0.05;
+            if (this.speedTrail[i].alpha > 0) {
+                this.speedTrail[w++] = this.speedTrail[i];
+            }
+        }
+        this.speedTrail.length = w;
 
         if (this.flashTimer > 0) this.flashTimer--;
     }

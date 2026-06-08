@@ -2,6 +2,10 @@
 // NFL BLITZ CLONE - FIELD RENDERING
 // =============================================================================
 
+const _DASH_LOS = [8, 6];
+const _DASH_FIRST_DOWN = [10, 5];
+const _DASH_NONE = [];
+
 class FieldRenderer {
     constructor() {
         this.grassPattern = null;
@@ -32,17 +36,19 @@ class FieldRenderer {
     }
 
     drawGrass(ctx, camX, camY) {
-        // Draw alternating grass stripes every 5 yards
-        // Extend from -10 to 130 to cover both endzones fully
-        for (let yard = -ENDZONE_YARDS; yard <= TOTAL_YARDS + ENDZONE_YARDS; yard += 5) {
+        const minYard = -ENDZONE_YARDS;
+        const maxYard = TOTAL_YARDS + ENDZONE_YARDS;
+        const flx = FIELD_WORLD_LEFT - camX;
+        for (let yard = minYard; yard <= maxYard; yard += 5) {
             const wy = yardToWorldY(yard);
             const nextWy = yardToWorldY(yard + 5);
             const sy = Math.min(wy, nextWy) - camY;
             const sh = Math.abs(nextWy - wy);
+            if (sy + sh < -10 || sy > GAME_HEIGHT + 10) continue;
 
             const stripe = Math.floor((yard + ENDZONE_YARDS) / 5);
             ctx.fillStyle = stripe % 2 === 0 ? '#2d8a4e' : '#35A05A';
-            ctx.fillRect(FIELD_WORLD_LEFT - camX, sy, FIELD_WORLD_WIDTH, sh);
+            ctx.fillRect(flx, sy, FIELD_WORLD_WIDTH, sh);
         }
     }
 
@@ -53,14 +59,12 @@ class FieldRenderer {
         ctx.fillStyle = 'rgba(0, 0, 180, 0.5)';
         ctx.fillRect(FIELD_WORLD_LEFT - camX, topEzY, FIELD_WORLD_WIDTH, topEzH);
 
-        // "END ZONE" text top
-        ctx.save();
+        // Endzone text setup (used for both)
         ctx.fillStyle = 'rgba(255,255,255,0.4)';
         ctx.font = 'bold 28px Arial';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText('END ZONE', (FIELD_WORLD_LEFT + FIELD_WORLD_WIDTH / 2) - camX, topEzY + topEzH / 2);
-        ctx.restore();
 
         // Bottom endzone (yard -10 to 0)
         const botEzY = yardToWorldY(0) - camY;
@@ -68,13 +72,8 @@ class FieldRenderer {
         ctx.fillStyle = 'rgba(180, 0, 0, 0.5)';
         ctx.fillRect(FIELD_WORLD_LEFT - camX, botEzY, FIELD_WORLD_WIDTH, botEzH);
 
-        ctx.save();
         ctx.fillStyle = 'rgba(255,255,255,0.4)';
-        ctx.font = 'bold 28px Arial';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
         ctx.fillText('END ZONE', (FIELD_WORLD_LEFT + FIELD_WORLD_WIDTH / 2) - camX, botEzY + botEzH / 2);
-        ctx.restore();
     }
 
     drawYardLines(ctx, camX, camY) {
@@ -110,26 +109,30 @@ class FieldRenderer {
     drawHashMarks(ctx, camX, camY) {
         ctx.strokeStyle = 'rgba(255,255,255,0.4)';
         ctx.lineWidth = 1;
-        const hashLeft1 = FIELD_WORLD_LEFT + FIELD_WORLD_WIDTH * 0.33;
-        const hashLeft2 = FIELD_WORLD_LEFT + FIELD_WORLD_WIDTH * 0.67;
+        const h1 = FIELD_WORLD_LEFT + FIELD_WORLD_WIDTH * 0.33 - camX;
+        const h2 = FIELD_WORLD_LEFT + FIELD_WORLD_WIDTH * 0.67 - camX;
 
+        // Batch left hashes
+        ctx.beginPath();
         for (let yard = 1; yard < 100; yard++) {
-            if (yard % 5 === 0) continue; // skip where yard lines are
-            const wy = yardToWorldY(yard);
-            const sy = wy - camY;
+            if (yard % 5 === 0) continue;
+            const sy = yardToWorldY(yard) - camY;
             if (sy < -10 || sy > GAME_HEIGHT + 10) continue;
-
-            // Left hash
-            ctx.beginPath();
-            ctx.moveTo(hashLeft1 - camX - 4, sy);
-            ctx.lineTo(hashLeft1 - camX + 4, sy);
-            ctx.stroke();
-            // Right hash
-            ctx.beginPath();
-            ctx.moveTo(hashLeft2 - camX - 4, sy);
-            ctx.lineTo(hashLeft2 - camX + 4, sy);
-            ctx.stroke();
+            ctx.moveTo(h1 - 4, sy);
+            ctx.lineTo(h1 + 4, sy);
         }
+        ctx.stroke();
+
+        // Batch right hashes
+        ctx.beginPath();
+        for (let yard = 1; yard < 100; yard++) {
+            if (yard % 5 === 0) continue;
+            const sy = yardToWorldY(yard) - camY;
+            if (sy < -10 || sy > GAME_HEIGHT + 10) continue;
+            ctx.moveTo(h2 - 4, sy);
+            ctx.lineTo(h2 + 4, sy);
+        }
+        ctx.stroke();
     }
 
     drawFieldNumbers(ctx, camX, camY) {
@@ -180,30 +183,28 @@ class FieldRenderer {
     }
 
     drawLOS(ctx, camX, camY, yard) {
-        const wy = yardToWorldY(yard);
-        const sy = wy - camY;
+        const sy = yardToWorldY(yard) - camY;
         ctx.strokeStyle = 'rgba(0, 100, 255, 0.8)';
         ctx.lineWidth = 3;
-        ctx.setLineDash([8, 6]);
+        ctx.setLineDash(_DASH_LOS);
         ctx.beginPath();
         ctx.moveTo(FIELD_WORLD_LEFT - camX, sy);
         ctx.lineTo(FIELD_WORLD_RIGHT - camX, sy);
         ctx.stroke();
-        ctx.setLineDash([]);
+        ctx.setLineDash(_DASH_NONE);
     }
 
     drawFirstDownLine(ctx, camX, camY, yard) {
         if (yard < 0 || yard > 100) return;
-        const wy = yardToWorldY(yard);
-        const sy = wy - camY;
+        const sy = yardToWorldY(yard) - camY;
         ctx.strokeStyle = 'rgba(255, 255, 0, 0.8)';
         ctx.lineWidth = 3;
-        ctx.setLineDash([10, 5]);
+        ctx.setLineDash(_DASH_FIRST_DOWN);
         ctx.beginPath();
         ctx.moveTo(FIELD_WORLD_LEFT - camX, sy);
         ctx.lineTo(FIELD_WORLD_RIGHT - camX, sy);
         ctx.stroke();
-        ctx.setLineDash([]);
+        ctx.setLineDash(_DASH_NONE);
 
         // First down marker
         ctx.fillStyle = '#FFD700';

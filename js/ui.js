@@ -2,6 +2,8 @@
 // NFL BLITZ CLONE - UI RENDERING
 // =============================================================================
 
+const _DOWN_NAMES = ['', '1st', '2nd', '3rd', '4th'];
+
 class UIRenderer {
     constructor() {
         this.titleFlash = 0;
@@ -321,8 +323,7 @@ class UIRenderer {
         ctx.font = 'bold 16px Arial';
         ctx.textAlign = 'center';
 
-        const downNames = ['', '1st', '2nd', '3rd', '4th'];
-        const downText = downNames[game.down] || '4th';
+        const downText = _DOWN_NAMES[game.down] || '4th';
         let distText;
         if (game.yardsToGo <= 0) {
             distText = '& GOAL';

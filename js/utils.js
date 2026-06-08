@@ -116,7 +116,13 @@ class ParticleSystem {
     }
 
     update() {
-        this.particles = this.particles.filter(p => p.update());
+        let w = 0;
+        for (let i = 0; i < this.particles.length; i++) {
+            if (this.particles[i].update()) {
+                this.particles[w++] = this.particles[i];
+            }
+        }
+        this.particles.length = w;
     }
 
     draw(ctx, camX, camY) {
@@ -171,10 +177,14 @@ class FlashText {
     }
 
     update() {
-        this.texts = this.texts.filter(t => {
-            t.timer++;
-            return t.timer < t.duration;
-        });
+        let w = 0;
+        for (let i = 0; i < this.texts.length; i++) {
+            this.texts[i].timer++;
+            if (this.texts[i].timer < this.texts[i].duration) {
+                this.texts[w++] = this.texts[i];
+            }
+        }
+        this.texts.length = w;
     }
 
     draw(ctx) {

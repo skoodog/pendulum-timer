@@ -36,6 +36,7 @@ const DEFAULT_GAMEPAD_BINDINGS = {
 };
 
 const GAMEPAD_STICK_DEADZONE = 0.25;
+const _moveVec = { x: 0, y: 0 };
 
 const ACTION_NAMES = {
     move_up: 'Move Up',
@@ -67,7 +68,10 @@ class InputManager {
 
         // Gamepad state
         this.gamepadIndex = -1;
-        this.gamepadButtons = {};
+        this._btnBufA = {};
+        this._btnBufB = {};
+        this.gamepadButtons = this._btnBufA;
+        this._prevButtons = this._btnBufB;
         this.gamepadButtonsJustPressed = {};
         this.gamepadAxes = [0, 0, 0, 0];
         this.gamepadConnected = false;
@@ -280,13 +284,14 @@ class InputManager {
         }
 
         this.gamepadConnected = true;
-        const prevButtons = { ...this.gamepadButtons };
+        const prev = this.gamepadButtons;
+        this.gamepadButtons = (this.gamepadButtons === this._btnBufA) ? this._btnBufB : this._btnBufA;
         this.gamepadButtonsJustPressed = {};
 
         for (let i = 0; i < gp.buttons.length; i++) {
             const pressed = gp.buttons[i].pressed;
             this.gamepadButtons[i] = pressed;
-            if (pressed && !prevButtons[i]) {
+            if (pressed && !prev[i]) {
                 this.gamepadButtonsJustPressed[i] = true;
 
                 if (this.rebinding && this.rebindSource === 'gamepad') {
@@ -345,7 +350,9 @@ class InputManager {
             mx /= len;
             my /= len;
         }
-        return { x: mx, y: my };
+        _moveVec.x = mx;
+        _moveVec.y = my;
+        return _moveVec;
     }
 
     isSprinting() {

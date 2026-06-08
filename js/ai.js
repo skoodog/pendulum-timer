@@ -9,6 +9,7 @@ class AIController {
         this.passDecisionMade = false;
         this.targetReceiver = null;
         this.qbScrambleTimer = 0;
+        this._receivers = new Array(PLAYERS_PER_TEAM);
     }
 
     choosePlay(isOffense) {
@@ -21,7 +22,10 @@ class AIController {
 
     updateOffense(players, opponents, ball, game) {
         // Find QB
-        const qb = players.find(p => p.isQB && !p.tackled);
+        let qb = null;
+        for (let i = 0; i < players.length; i++) {
+            if (players[i].isQB && !players[i].tackled) { qb = players[i]; break; }
+        }
         if (!qb) return;
 
         if (qb.hasBall) {
@@ -29,8 +33,10 @@ class AIController {
 
             const play = OFFENSIVE_PLAYS[game.cpuPlayChoice];
             if (play && play.isRun) {
-                // Hand off to RB
-                const rb = players.find(p => p.role === 'RB' && !p.tackled);
+                let rb = null;
+                for (let i = 0; i < players.length; i++) {
+                    if (players[i].role === 'RB' && !players[i].tackled) { rb = players[i]; break; }
+                }
                 if (rb && this.decisionTimer > 15) {
                     qb.hasBall = false;
                     rb.hasBall = true;
@@ -43,24 +49,30 @@ class AIController {
             // Passing logic
             if (this.decisionTimer > 40 && !this.passDecisionMade) {
                 this.passDecisionMade = true;
-                // Find best receiver
-                const receivers = players.filter(p => !p.isQB && p.role !== 'OL' && p.role !== 'C' && !p.tackled);
+                // Find best receiver (reuse _receivers buffer)
+                let rc = 0;
+                for (let i = 0; i < players.length; i++) {
+                    const p = players[i];
+                    if (!p.isQB && p.role !== 'OL' && p.role !== 'C' && !p.tackled) {
+                        this._receivers[rc++] = p;
+                    }
+                }
                 let bestReceiver = null;
                 let bestScore = -Infinity;
 
-                receivers.forEach(r => {
-                    // Score based on openness and distance
+                for (let ri = 0; ri < rc; ri++) {
+                    const r = this._receivers[ri];
                     let minDefDist = Infinity;
-                    opponents.forEach(d => {
-                        const dd = dist(r.x, r.y, d.x, d.y);
+                    for (let oi = 0; oi < opponents.length; oi++) {
+                        const dd = dist(r.x, r.y, opponents[oi].x, opponents[oi].y);
                         if (dd < minDefDist) minDefDist = dd;
-                    });
+                    }
                     const score = minDefDist - dist(qb.x, qb.y, r.x, r.y) * 0.3;
                     if (score > bestScore) {
                         bestScore = score;
                         bestReceiver = r;
                     }
-                });
+                }
 
                 if (bestReceiver) {
                     this.targetReceiver = bestReceiver;
@@ -95,7 +107,10 @@ class AIController {
         }
 
         // Non-QB players with ball (RB after handoff)
-        const ballCarrier = players.find(p => p.hasBall && !p.isQB && !p.tackled);
+        let ballCarrier = null;
+        for (let i = 0; i < players.length; i++) {
+            if (players[i].hasBall && !players[i].isQB && !players[i].tackled) { ballCarrier = players[i]; break; }
+        }
         if (ballCarrier) {
             this.runWithBall(ballCarrier, opponents, game);
         }
@@ -113,56 +128,55 @@ class AIController {
     }
 
     updateDefense(defenders, offensePlayers, ball, game) {
-        const ballCarrier = offensePlayers.find(p => p.hasBall && !p.tackled);
+        let ballCarrier = null;
+        for (let i = 0; i < offensePlayers.length; i++) {
+            if (offensePlayers[i].hasBall && !offensePlayers[i].tackled) { ballCarrier = offensePlayers[i]; break; }
+        }
         const defPlay = DEFENSIVE_PLAYS[game.defensePlayChoice];
 
-        defenders.forEach((d, i) => {
-            if (d.tackled) return;
-            if (d.isControlled) return; // player-controlled
+        // Pre-compute receivers once (avoids .filter() per defender)
+        let receiversCount = 0;
+        for (let i = 0; i < offensePlayers.length; i++) {
+            const p = offensePlayers[i];
+            if (!p.isQB && p.role !== 'OL' && p.role !== 'C' && !p.tackled) {
+                this._receivers[receiversCount++] = p;
+            }
+        }
+
+        for (let di = 0; di < defenders.length; di++) {
+            const d = defenders[di];
+            if (d.tackled || d.isControlled) continue;
 
             if (defPlay && defPlay.type === 'blitz') {
-                // Blitz: everyone rushes
                 if (d.role === 'DL' || d.role === 'LB') {
-                    if (ballCarrier) {
-                        d.moveToward(ballCarrier.x, ballCarrier.y, DEFENDER_SPEED * 1.05);
-                    }
-                    return;
+                    if (ballCarrier) d.moveToward(ballCarrier.x, ballCarrier.y, DEFENDER_SPEED * 1.05);
+                    continue;
                 }
             }
 
             if (d.role === 'DL') {
-                // Rush the QB or ball carrier
-                if (ballCarrier) {
-                    d.moveToward(ballCarrier.x, ballCarrier.y, DEFENDER_SPEED * 0.95);
-                }
-                return;
+                if (ballCarrier) d.moveToward(ballCarrier.x, ballCarrier.y, DEFENDER_SPEED * 0.95);
+                continue;
             }
 
-            if (defPlay && defPlay.type === 'zone' && defPlay.zones && defPlay.zones[i]) {
-                // Zone coverage: go to zone, then react to ball
-                const zone = defPlay.zones[i];
+            if (defPlay && defPlay.type === 'zone' && defPlay.zones && defPlay.zones[di]) {
+                const zone = defPlay.zones[di];
                 const zoneWorldX = (FIELD_WORLD_LEFT + FIELD_WORLD_RIGHT) / 2 + zone.x;
                 const zoneWorldY = game.losWorldY + zone.y * (-game.attackDir);
 
                 if (ball && ball.active) {
-                    // React to ball in air
                     d.moveToward(ball.x, ball.y, DEFENDER_SPEED * 1.1);
                 } else if (ballCarrier && !ballCarrier.isQB) {
-                    // Chase ball carrier
                     d.moveToward(ballCarrier.x, ballCarrier.y, DEFENDER_SPEED);
                 } else {
                     d.moveToward(zoneWorldX, zoneWorldY, DEFENDER_SPEED * 0.7);
                 }
-                return;
+                continue;
             }
 
-            // Man coverage / default
             if (defPlay && defPlay.type === 'man') {
-                // Cover nearest eligible receiver
-                const receivers = offensePlayers.filter(p => !p.isQB && p.role !== 'OL' && p.role !== 'C' && !p.tackled);
-                if (receivers.length > 0) {
-                    // Assign each defender a receiver
-                    const target = receivers[i % receivers.length];
+                if (receiversCount > 0) {
+                    const target = this._receivers[di % receiversCount];
                     if (ball && ball.active) {
                         d.moveToward(ball.x, ball.y, DEFENDER_SPEED * 1.1);
                     } else if (ballCarrier && !ballCarrier.isQB) {
@@ -170,15 +184,14 @@ class AIController {
                     } else {
                         d.moveToward(target.x, target.y, DEFENDER_SPEED * 0.9);
                     }
-                    return;
+                    continue;
                 }
             }
 
-            // Goal line / fallback: everyone chases ball carrier
             if (ballCarrier) {
                 d.moveToward(ballCarrier.x, ballCarrier.y, DEFENDER_SPEED);
             }
-        });
+        }
     }
 
     runWithBall(carrier, opponents, game) {

@@ -86,7 +86,8 @@ class Game {
         this.lastTime = performance.now();
         this.accumulator = 0;
         this.frameTime = 1000 / 60;
-        this.loop();
+        this._boundLoop = () => this.loop();
+        this._boundLoop();
     }
 
     get losWorldY() {
@@ -104,7 +105,7 @@ class Game {
             this.accumulator -= this.frameTime;
         }
         this.render();
-        requestAnimationFrame(() => this.loop());
+        requestAnimationFrame(this._boundLoop);
     }
 
     update() {
