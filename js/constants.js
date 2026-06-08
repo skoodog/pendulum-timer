@@ -64,6 +64,7 @@ const STATE_QUARTER_END = 'quarter_end';
 const STATE_GAME_OVER = 'game_over';
 const STATE_KICKOFF = 'kickoff';
 const STATE_TURNOVER = 'turnover';
+const STATE_CONTROLS = 'controls';
 
 // Teams
 const TEAMS = [

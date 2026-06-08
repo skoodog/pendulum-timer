@@ -109,6 +109,7 @@ class Game {
 
     update() {
         this.stateTimer++;
+        this.input.pollGamepad();
 
         switch (this.state) {
             case STATE_TITLE:
@@ -153,6 +154,9 @@ class Game {
             case STATE_GAME_OVER:
                 this.updateGameOver();
                 break;
+            case STATE_CONTROLS:
+                this.updateControls();
+                break;
         }
 
         this.particles.update();
@@ -167,34 +171,40 @@ class Game {
     // =========================================================================
 
     updateTitle() {
-        if (this.input.justPressed('Enter') || this.input.justPressed('Space')) {
+        if (this.input.actionJustPressed('confirm')) {
             this.audio.init();
             this.audio.confirm();
             this.state = STATE_TEAM_SELECT;
             this.stateTimer = 0;
         }
+        // C key or Y button opens controls
+        if (this.input.justPressed('KeyC') || this.input.gamepadButtonsJustPressed[3]) {
+            this.audio.init();
+            this.audio.select();
+            this.state = STATE_CONTROLS;
+            this.stateTimer = 0;
+        }
     }
 
     updateTeamSelect() {
-        // Handle team selection input here (not in draw)
-        if (this.input.justPressed('ArrowLeft') || this.input.justPressed('KeyA')) {
+        if (this.input.actionJustPressed('move_left')) {
             this.ui.selectedTeam1 = (this.ui.selectedTeam1 - 1 + TEAMS.length) % TEAMS.length;
             this.audio.select();
         }
-        if (this.input.justPressed('ArrowRight') || this.input.justPressed('KeyD')) {
+        if (this.input.actionJustPressed('move_right')) {
             this.ui.selectedTeam1 = (this.ui.selectedTeam1 + 1) % TEAMS.length;
             this.audio.select();
         }
-        if (this.input.justPressed('ArrowUp') || this.input.justPressed('KeyW')) {
+        if (this.input.actionJustPressed('move_up')) {
             this.ui.selectedTeam1 = (this.ui.selectedTeam1 - 4 + TEAMS.length) % TEAMS.length;
             this.audio.select();
         }
-        if (this.input.justPressed('ArrowDown') || this.input.justPressed('KeyS')) {
+        if (this.input.actionJustPressed('move_down')) {
             this.ui.selectedTeam1 = (this.ui.selectedTeam1 + 4) % TEAMS.length;
             this.audio.select();
         }
 
-        if (this.input.justPressed('Enter') || this.input.justPressed('Space')) {
+        if (this.input.actionJustPressed('confirm')) {
             this.team1Index = this.ui.selectedTeam1;
             // CPU picks a different team
             this.team2Index = (this.team1Index + randInt(1, TEAMS.length - 1)) % TEAMS.length;
@@ -209,7 +219,7 @@ class Game {
     updateCoinToss() {
         this.coinTossTimer++;
         if (this.coinTossTimer > 120) {
-            if (this.input.justPressed('Enter') || this.input.justPressed('Space') || this.coinTossTimer > 200) {
+            if (this.input.actionJustPressed('confirm') || this.coinTossTimer > 200) {
                 this.audio.confirm();
                 // Set up game
                 this.score = [0, 0];
@@ -246,19 +256,19 @@ class Game {
         let currentSelection = isPlayerOnOffense ? this.offensePlayChoice : this.defensePlayChoice;
         const plays = isPlayerOnOffense ? OFFENSIVE_PLAYS : DEFENSIVE_PLAYS;
 
-        if (this.input.justPressed('ArrowLeft') || this.input.justPressed('KeyA')) {
+        if (this.input.actionJustPressed('move_left')) {
             currentSelection = (currentSelection - 1 + plays.length) % plays.length;
             this.audio.select();
         }
-        if (this.input.justPressed('ArrowRight') || this.input.justPressed('KeyD')) {
+        if (this.input.actionJustPressed('move_right')) {
             currentSelection = (currentSelection + 1) % plays.length;
             this.audio.select();
         }
-        // Number keys for quick select
-        if (this.input.justPressed('Digit1')) { currentSelection = 0; this.audio.select(); }
-        if (this.input.justPressed('Digit2') && plays.length > 1) { currentSelection = 1; this.audio.select(); }
-        if (this.input.justPressed('Digit3') && plays.length > 2) { currentSelection = 2; this.audio.select(); }
-        if (this.input.justPressed('Digit4') && plays.length > 3) { currentSelection = 3; this.audio.select(); }
+        // Number keys / gamepad D-pad for quick select
+        if (this.input.actionJustPressed('pass_1')) { currentSelection = 0; this.audio.select(); }
+        if (this.input.actionJustPressed('pass_2') && plays.length > 1) { currentSelection = 1; this.audio.select(); }
+        if (this.input.actionJustPressed('pass_3') && plays.length > 2) { currentSelection = 2; this.audio.select(); }
+        if (this.input.actionJustPressed('pass_4') && plays.length > 3) { currentSelection = 3; this.audio.select(); }
 
         if (isPlayerOnOffense) {
             this.offensePlayChoice = currentSelection;
@@ -267,7 +277,7 @@ class Game {
         }
 
         // Confirm
-        if (this.input.justPressed('Enter') || this.input.justPressed('Space')) {
+        if (this.input.actionJustPressed('confirm')) {
             this.audio.confirm();
             if (isPlayerOnOffense) {
                 this.offensePlayChoice = currentSelection;
@@ -291,7 +301,7 @@ class Game {
 
         // Allow snap after delay
         if (this.snapTimer > 20) {
-            if (this.input.justPressed('Space') || this.input.justPressed('Enter')) {
+            if (this.input.actionJustPressed('confirm')) {
                 this.startPlay();
             }
             // Auto-snap for CPU offense after delay
@@ -486,9 +496,58 @@ class Game {
     }
 
     updateGameOver() {
-        if (this.input.justPressed('Enter') || this.input.justPressed('Space')) {
+        if (this.input.actionJustPressed('confirm')) {
             this.state = STATE_TITLE;
             this.stateTimer = 0;
+        }
+    }
+
+    updateControls() {
+        // Handled by UI; back button exits
+        if (this.input.justPressed('Escape') || this.input.gamepadButtonsJustPressed[1]) {
+            this.audio.confirm();
+            this.state = STATE_TITLE;
+            this.stateTimer = 0;
+            return;
+        }
+
+        // Navigation
+        if (this.input.actionJustPressed('move_up') && !this.input.rebinding) {
+            this.ui.controlsSelection = Math.max(0, this.ui.controlsSelection - 1);
+            this.audio.select();
+        }
+        if (this.input.actionJustPressed('move_down') && !this.input.rebinding) {
+            const maxItems = Object.keys(ACTION_NAMES).length + 1; // +1 for reset
+            this.ui.controlsSelection = Math.min(maxItems, this.ui.controlsSelection + 1);
+            this.audio.select();
+        }
+
+        // Tab to switch between keyboard/gamepad column
+        if (this.input.justPressed('Tab') && !this.input.rebinding) {
+            this.ui.controlsColumn = this.ui.controlsColumn === 0 ? 1 : 0;
+            this.audio.select();
+        }
+
+        // Confirm to rebind or reset
+        if (this.input.actionJustPressed('confirm') && !this.input.rebinding) {
+            const actions = Object.keys(ACTION_NAMES);
+            if (this.ui.controlsSelection < actions.length) {
+                const action = actions[this.ui.controlsSelection];
+                const source = this.ui.controlsColumn === 0 ? 'keyboard' : 'gamepad';
+                this.input.startRebind(action, source, () => {
+                    this.audio.confirm();
+                });
+            } else if (this.ui.controlsSelection === actions.length) {
+                // Reset to defaults
+                this.input.resetBindings();
+                this.audio.confirm();
+                this.flashText.show('CONTROLS RESET', 60, '#00FF00', 36);
+            } else {
+                // Back
+                this.audio.confirm();
+                this.state = STATE_TITLE;
+                this.stateTimer = 0;
+            }
         }
     }
 
@@ -508,15 +567,15 @@ class Game {
             this.controlledPlayer.isControlled = true;
         }
 
-        // Pass (click or space when QB has ball on offense)
+        // Pass (click, gamepad X, or number keys when QB has ball on offense)
         const isPlayerOnOffense = this.possession === this.playerTeam;
         if (isPlayerOnOffense && this.controlledPlayer.hasBall && this.controlledPlayer.isQB) {
-            // Click to pass
+            const receivers = this.offensePlayers.filter(p => !p.isQB && !p.tackled && p.role !== 'OL' && p.role !== 'C');
+
+            // Click to pass (mouse)
             if (this.input.mouseClicked) {
-                // Find nearest receiver to click position
                 const worldClickX = this.input.mouseX + this.camX;
                 const worldClickY = this.input.mouseY + this.camY;
-                const receivers = this.offensePlayers.filter(p => !p.isQB && !p.tackled && p.role !== 'OL' && p.role !== 'C');
                 let bestR = null;
                 let bestDist = Infinity;
                 receivers.forEach(r => {
@@ -527,16 +586,38 @@ class Game {
                     }
                 });
                 if (bestR) {
-                    // Lead the pass
                     const leadX = bestR.x + bestR.vx * 10;
                     const leadY = bestR.y + bestR.vy * 10;
                     this.throwBall(this.controlledPlayer, leadX, leadY, bestR);
                 }
             }
-            // Number keys to pass to specific receiver
-            const receivers = this.offensePlayers.filter(p => !p.isQB && !p.tackled && p.role !== 'OL' && p.role !== 'C');
-            for (let i = 0; i < receivers.length && i < 5; i++) {
-                if (this.input.justPressed(`Digit${i + 1}`)) {
+
+            // Gamepad pass click (X button) — throw to most open receiver
+            if (this.input.gamepadPassClick && receivers.length > 0) {
+                let bestR = null;
+                let bestOpenness = -Infinity;
+                receivers.forEach(r => {
+                    let minDefDist = Infinity;
+                    this.defensePlayers.forEach(d => {
+                        const dd = dist(r.x, r.y, d.x, d.y);
+                        if (dd < minDefDist) minDefDist = dd;
+                    });
+                    if (minDefDist > bestOpenness) {
+                        bestOpenness = minDefDist;
+                        bestR = r;
+                    }
+                });
+                if (bestR) {
+                    const leadX = bestR.x + bestR.vx * 10;
+                    const leadY = bestR.y + bestR.vy * 10;
+                    this.throwBall(this.controlledPlayer, leadX, leadY, bestR);
+                }
+            }
+
+            // Number keys / gamepad D-pad to pass to specific receiver
+            const passActions = ['pass_1', 'pass_2', 'pass_3', 'pass_4'];
+            for (let i = 0; i < receivers.length && i < passActions.length; i++) {
+                if (this.input.actionJustPressed(passActions[i])) {
                     const r = receivers[i];
                     const leadX = r.x + r.vx * 10;
                     const leadY = r.y + r.vy * 10;
@@ -546,8 +627,8 @@ class Game {
             }
         }
 
-        // Switch player (E key)
-        if (this.input.justPressed('KeyE') && this.switchCooldown <= 0) {
+        // Switch player
+        if (this.input.actionJustPressed('switch_player') && this.switchCooldown <= 0) {
             this.switchControlledPlayer();
             this.switchCooldown = 15;
         }
@@ -1053,6 +1134,10 @@ class Game {
 
             case STATE_GAME_OVER:
                 this.ui.drawGameOver(ctx, this);
+                break;
+
+            case STATE_CONTROLS:
+                this.ui.drawControls(ctx, this.input);
                 break;
         }
 

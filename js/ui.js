@@ -9,6 +9,9 @@ class UIRenderer {
         this.selectedTeam2 = 1;
         this.teamSelectSide = 0; // 0 = player picking, 1 = cpu assigned
         this.selectedPlay = 0;
+        // Controls screen state
+        this.controlsSelection = 0;
+        this.controlsColumn = 0; // 0 = keyboard, 1 = gamepad
     }
 
     drawTitle(ctx, input) {
@@ -67,13 +70,18 @@ class UIRenderer {
         // Controls info
         ctx.font = '18px Arial';
         ctx.fillStyle = '#888';
-        ctx.fillText('WASD/Arrows = Move | Space = Action | Shift = Sprint', GAME_WIDTH / 2, 520);
-        ctx.fillText('Click = Pass to Receiver | E = Switch Player', GAME_WIDTH / 2, 550);
+        ctx.fillText('WASD/Arrows = Move | Space = Action | Shift = Sprint', GAME_WIDTH / 2, 510);
+        ctx.fillText('Click = Pass to Receiver | E = Switch Player', GAME_WIDTH / 2, 540);
+
+        // Controller hint
+        ctx.font = 'bold 20px Arial';
+        ctx.fillStyle = '#00CED1';
+        ctx.fillText('Press C to configure controls (keyboard & gamepad)', GAME_WIDTH / 2, 590);
 
         // Footer
         ctx.font = '14px Arial';
         ctx.fillStyle = '#555';
-        ctx.fillText('A browser-based NFL Blitz tribute', GAME_WIDTH / 2, 650);
+        ctx.fillText('A browser-based NFL Blitz tribute | Xbox controller supported', GAME_WIDTH / 2, 650);
 
         ctx.restore();
     }
@@ -341,11 +349,22 @@ class UIRenderer {
             ctx.font = '14px Arial';
             ctx.fillStyle = 'rgba(255,255,255,0.5)';
             ctx.textAlign = 'center';
-            const hint = game.possession === game.playerTeam ?
-                (game.ballInAir ? 'Wait for catch...' :
-                 game.ballCarrier && game.ballCarrier.isQB ? 'CLICK receiver to pass | WASD move | SHIFT sprint' :
-                 'WASD move | SHIFT sprint | E switch player') :
-                'WASD move defender | SHIFT sprint | E switch player';
+            const gp = game.input && game.input.gamepadConnected;
+            let hint;
+            if (game.possession === game.playerTeam) {
+                if (game.ballInAir) {
+                    hint = 'Wait for catch...';
+                } else if (game.ballCarrier && game.ballCarrier.isQB) {
+                    hint = gp ? 'Y=Smart Pass | D-Pad=Target | RT=Sprint'
+                              : 'CLICK receiver to pass | WASD move | SHIFT sprint';
+                } else {
+                    hint = gp ? 'Stick=Move | RT=Sprint | B=Switch'
+                              : 'WASD move | SHIFT sprint | E switch player';
+                }
+            } else {
+                hint = gp ? 'Stick=Move | RT=Sprint | B=Switch'
+                          : 'WASD move defender | SHIFT sprint | E switch player';
+            }
             ctx.fillText(hint, GAME_WIDTH / 2, GAME_HEIGHT - 15);
         }
     }
@@ -446,6 +465,140 @@ class UIRenderer {
             ctx.textAlign = 'center';
             ctx.fillText(`${i + 1}`, sx, sy - PLAYER_RADIUS - 14);
         });
+    }
+
+    drawControls(ctx, input) {
+        ctx.fillStyle = '#0a0a1a';
+        ctx.fillRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
+
+        // Title
+        ctx.font = 'bold 40px "Arial Black", Arial, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#FFD700';
+        ctx.fillText('CONTROLS', GAME_WIDTH / 2, 55);
+
+        // Column headers
+        const colAction = 200;
+        const colKey = 560;
+        const colPad = 920;
+        const headerY = 95;
+
+        ctx.font = 'bold 18px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#AAA';
+        ctx.fillText('ACTION', colAction, headerY);
+        ctx.fillStyle = this.controlsColumn === 0 ? '#FFD700' : '#AAA';
+        ctx.fillText('KEYBOARD', colKey, headerY);
+        ctx.fillStyle = this.controlsColumn === 1 ? '#FFD700' : '#AAA';
+        ctx.fillText('GAMEPAD', colPad, headerY);
+
+        // Tab hint
+        ctx.font = '14px Arial';
+        ctx.fillStyle = '#666';
+        ctx.textAlign = 'center';
+        ctx.fillText('TAB to switch column', GAME_WIDTH / 2, headerY + 20);
+
+        // Divider
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(80, headerY + 28);
+        ctx.lineTo(GAME_WIDTH - 80, headerY + 28);
+        ctx.stroke();
+
+        const actions = Object.keys(ACTION_NAMES);
+        const startY = headerY + 50;
+        const rowH = 36;
+
+        actions.forEach((action, i) => {
+            const y = startY + i * rowH;
+            const selected = i === this.controlsSelection;
+
+            // Highlight row
+            if (selected) {
+                ctx.fillStyle = 'rgba(255, 215, 0, 0.1)';
+                ctx.fillRect(80, y - rowH / 2 + 2, GAME_WIDTH - 160, rowH - 2);
+            }
+
+            // Action name
+            ctx.font = selected ? 'bold 17px Arial' : '16px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillStyle = selected ? '#FFF' : '#AAA';
+            ctx.fillText(ACTION_NAMES[action], colAction, y + 4);
+
+            // Keyboard binding
+            const keyText = input.getBindingDisplay(action, 'keyboard');
+            ctx.fillStyle = (selected && this.controlsColumn === 0) ? '#FFD700' : '#CCC';
+            ctx.font = selected && this.controlsColumn === 0 ? 'bold 17px Arial' : '16px Arial';
+            if (input.rebinding && input.rebindAction === action && input.rebindSource === 'keyboard') {
+                ctx.fillStyle = '#FF6600';
+                ctx.fillText('[ Press a key... ]', colKey, y + 4);
+            } else {
+                ctx.fillText(keyText, colKey, y + 4);
+            }
+
+            // Gamepad binding
+            const padText = input.getBindingDisplay(action, 'gamepad');
+            ctx.fillStyle = (selected && this.controlsColumn === 1) ? '#FFD700' : '#CCC';
+            ctx.font = selected && this.controlsColumn === 1 ? 'bold 17px Arial' : '16px Arial';
+            if (input.rebinding && input.rebindAction === action && input.rebindSource === 'gamepad') {
+                ctx.fillStyle = '#FF6600';
+                ctx.fillText('[ Press button... ]', colPad, y + 4);
+            } else {
+                ctx.fillText(padText, colPad, y + 4);
+            }
+
+            // Arrow indicator
+            if (selected) {
+                const arrowX = this.controlsColumn === 0 ? colKey : colPad;
+                ctx.fillStyle = '#FFD700';
+                ctx.font = 'bold 14px Arial';
+                ctx.fillText('▶', arrowX - 100, y + 4);
+                ctx.fillText('◀', arrowX + 100, y + 4);
+            }
+        });
+
+        // Reset option
+        const resetY = startY + actions.length * rowH + 10;
+        const resetSelected = this.controlsSelection === actions.length;
+        ctx.font = resetSelected ? 'bold 20px Arial' : '18px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = resetSelected ? '#FF6600' : '#888';
+        ctx.fillText('[ RESET TO DEFAULTS ]', GAME_WIDTH / 2, resetY + 4);
+        if (resetSelected) {
+            ctx.fillStyle = 'rgba(255, 102, 0, 0.1)';
+            ctx.fillRect(80, resetY - 14, GAME_WIDTH - 160, 30);
+        }
+
+        // Back option
+        const backY = resetY + rowH;
+        const backSelected = this.controlsSelection === actions.length + 1;
+        ctx.font = backSelected ? 'bold 20px Arial' : '18px Arial';
+        ctx.fillStyle = backSelected ? '#00CED1' : '#888';
+        ctx.fillText('[ BACK ]', GAME_WIDTH / 2, backY + 4);
+        if (backSelected) {
+            ctx.fillStyle = 'rgba(0, 206, 209, 0.1)';
+            ctx.fillRect(80, backY - 14, GAME_WIDTH - 160, 30);
+        }
+
+        // Bottom hints
+        ctx.font = '14px Arial';
+        ctx.fillStyle = '#555';
+        ctx.textAlign = 'center';
+        ctx.fillText('UP/DOWN = Navigate | ENTER = Rebind | TAB = Switch column | ESC = Back', GAME_WIDTH / 2, GAME_HEIGHT - 30);
+
+        // Gamepad status
+        if (input.gamepadConnected) {
+            ctx.fillStyle = '#00FF00';
+            ctx.font = 'bold 14px Arial';
+            ctx.textAlign = 'right';
+            ctx.fillText('Gamepad Connected', GAME_WIDTH - 30, GAME_HEIGHT - 30);
+        } else {
+            ctx.fillStyle = '#FF4500';
+            ctx.font = '14px Arial';
+            ctx.textAlign = 'right';
+            ctx.fillText('No Gamepad Detected', GAME_WIDTH - 30, GAME_HEIGHT - 30);
+        }
     }
 
     roundRect(ctx, x, y, w, h, r, topOnly) {
