@@ -206,3 +206,65 @@ Title, park select, controls, pause, session results with stat breakdown.
   speed effect above 10 m/s.
 - Silhouette readability: rider always reads against the sky/ground.
 - No z-fighting, no visible tiling repetition, no untextured "programmer grey".
+
+---
+
+# Career structure (THPS-style) — added after the first fan-out
+
+The game is a career of timed 2:00 runs across four levels. This section supersedes
+anything above that assumes a single park.
+
+## `src/world/kit.js` — shared construction kit
+Reusable, correctly-shaped park primitives every level builds from:
+`quarterPipe(opts)`, `bank(opts)`, `spine(opts)`, `halfPipe(opts)`, `bowl(opts)`,
+`funbox(opts)`, `stairSet(opts)`, `handrail(curve, opts)`, `ledge(opts)`,
+`hubba(opts)`, `wallrideWall(opts)`, `dirtDouble(opts)`, `berm(opts)`,
+`rollIn(opts)`, `pyramid(opts)`, `flatRail(opts)`, `copingTube(curve)`.
+Each returns `{ mesh|group, colliders[], rails[] }` with correct arcs, coping at the
+lip, UVs at ~256 px/m, and shadow flags set. Levels compose these, never re-derive them.
+
+## `src/world/levels/*.js` — one module per level
+```js
+export const meta = { id, name, subtitle, order, unlockAt, timeOfDay, ambience }
+export async function build(ctx) -> {
+  group, colliders, rails, spawnPoints, bounds,
+  gaps:    [ { name, points, box: THREE.Box3, requiresAir? } ],
+  letters: [ THREE.Vector3 x5 ],          // B-M-X-E-R letter pickup positions
+  collectibles: [ { id, position, kind } ],// 5 hidden items (level-specific object)
+  smashables:   [ { object3D, points, kind } ],
+  update(dt, ctx), dispose()
+}
+```
+Levels: `cityLot.js` (the original park, order 0), `warehouse.js`, `plaza.js`, `trails.js`.
+
+## `src/world/levelManager.js`
+```js
+createLevelManager(ctx) -> {
+  levels, current, currentId,
+  async load(id),   // dispose old group/collision, build new, rebuild ctx.world.collision,
+                    // re-seat gaps/letters/collectibles/smashables, respawn player
+  update(dt, ctx), dispose()
+}
+```
+Owns `ctx.world.park`, `ctx.world.collision` and `ctx.world.level` lifetime. Loading must
+be safe to call mid-session and must fully dispose GPU resources.
+
+## `src/gameplay/goals.js` — per-level goals + career progression
+Nine goals per level, THPS-shaped:
+High Score / Pro Score / Sick Score, collect B-M-X-E-R, collect the 5 hidden items,
+clear a named gap, land a specified trick on a specified feature, smash 5 objects,
+and a level-specific stunt goal. Tracks live progress from scoring/physics/trick events,
+persists completion per level in localStorage, and unlocks the next level at 5 goals.
+```js
+createGoals(ctx) -> {
+  forLevel(id), active: [ {id, text, done, progress, target} ],
+  onSessionStart(levelId), fixedUpdate(fdt, ctx), completedCount(levelId),
+  isUnlocked(levelId), careerTotal(), reset()
+}
+```
+`scoring.js` keeps score/combo/special/timer and emits the events goals listens to.
+
+## `src/ui/levelSelect.js`
+Career screen: level cards with a rendered thumbnail (a still framed by the level's
+`meta.camera`), goal checklist per level, lock state, career completion %, and the
+per-level high score. Feeds `levelManager.load(id)` and starts a session.
