@@ -1,0 +1,5 @@
+html, body { margin: 0; height: 100%; background: #0b0d12; overflow: hidden; }
+#viewport { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+#ui-root { position: fixed; inset: 0; pointer-events: none; }
+.hud { position: absolute; inset: 0; font-family: system-ui, sans-serif; color: #fff; }
+.hud-score { position: absolute; top: 24px; right: 32px; font-size: 44px; font-weight: 800; text-shadow: 0 2px 12px rgba(0,0,0,.6); }
