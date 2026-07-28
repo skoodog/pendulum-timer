@@ -52,25 +52,31 @@ function makeLattice(f) {
 /** Seamless fBm value-noise field, res² floats in 0..1. */
 function noiseField(res, baseFreq, octaves = 4, gain = 0.5) {
   const out = new Float32Array(res * res);
+  const cell = new Int32Array(res);      // lattice cell per texel (same for rows/cols)
+  const weight = new Float32Array(res);  // smoothstepped interpolant per texel
   let amp = 1, norm = 0, f = baseFreq;
   for (let o = 0; o < octaves; o++) {
     if (f >= res) break;
     const L = makeLattice(f);
     const stride = f + 1;
     const scale = f / res;
+    for (let i = 0; i < res; i++) {
+      const p = i * scale;
+      const p0 = p | 0;
+      const t = p - p0;
+      cell[i] = p0;
+      weight[i] = t * t * (3 - 2 * t);
+    }
     for (let y = 0; y < res; y++) {
-      const fy = y * scale;
-      const y0 = fy | 0;
-      const ty = smoothstep(fy - y0);
-      const r0 = y0 * stride, r1 = (y0 + 1) * stride;
+      const r0 = cell[y] * stride, r1 = r0 + stride;
+      const ty = weight[y];
       const row = y * res;
       for (let x = 0; x < res; x++) {
-        const fx = x * scale;
-        const x0 = fx | 0;
-        const tx = smoothstep(fx - x0);
-        const top = L[r0 + x0] + (L[r0 + x0 + 1] - L[r0 + x0]) * tx;
-        const bot = L[r1 + x0] + (L[r1 + x0 + 1] - L[r1 + x0]) * tx;
-        out[row + x] += amp * (top + (bot - top) * ty);
+        const x0 = cell[x], tx = weight[x];
+        const a = L[r0 + x0], b = L[r0 + x0 + 1];
+        const c = L[r1 + x0], d = L[r1 + x0 + 1];
+        const top = a + (b - a) * tx;
+        out[row + x] += amp * (top + ((c + (d - c) * tx) - top) * ty);
       }
     }
     norm += amp;
@@ -96,32 +102,51 @@ function worleyField(res, cells) {
   const d1 = new Float32Array(res * res);
   const d2 = new Float32Array(res * res);
   const id = new Float32Array(res * res);
-  const cs = res / cells;
+  const cs = res / cells;               // integer: both are powers of two
   const invCs = 1 / cs;
 
-  for (let y = 0; y < res; y++) {
-    const cy = (y * invCs) | 0;
-    const row = y * res;
-    for (let x = 0; x < res; x++) {
-      const cx = (x * invCs) | 0;
-      let b1 = 1e18, b2 = 1e18, bid = 0;
+  // absolute feature-point positions, in texels
+  const fxs = new Float32Array(n), fys = new Float32Array(n);
+  for (let cy = 0; cy < cells; cy++) {
+    for (let cx = 0; cx < cells; cx++) {
+      const k = cy * cells + cx;
+      fxs[k] = (cx + px[k]) * cs;
+      fys[k] = (cy + py[k]) * cs;
+    }
+  }
+
+  // walk cell by cell so the 9 candidate points are hoisted out of the pixel loop
+  const nx = new Float64Array(9), ny = new Float64Array(9), nid = new Float64Array(9);
+  for (let cy = 0; cy < cells; cy++) {
+    for (let cx = 0; cx < cells; cx++) {
+      let c = 0;
       for (let oy = -1; oy <= 1; oy++) {
-        const gy = (((cy + oy) % cells) + cells) % cells;
         for (let ox = -1; ox <= 1; ox++) {
-          const gx = (((cx + ox) % cells) + cells) % cells;
+          let gx = cx + ox, gy = cy + oy, sx = 0, sy = 0;
+          if (gx < 0) { gx += cells; sx = -res; } else if (gx >= cells) { gx -= cells; sx = res; }
+          if (gy < 0) { gy += cells; sy = -res; } else if (gy >= cells) { gy -= cells; sy = res; }
           const k = gy * cells + gx;
-          const fx = (cx + ox + px[k]) * cs;
-          const fy = (cy + oy + py[k]) * cs;
-          const dx = x - fx, dy = y - fy;
-          const d = dx * dx + dy * dy;
-          if (d < b1) { b2 = b1; b1 = d; bid = pid[k]; }
-          else if (d < b2) { b2 = d; }
+          nx[c] = fxs[k] + sx; ny[c] = fys[k] + sy; nid[c] = pid[k];
+          c++;
         }
       }
-      const i = row + x;
-      d1[i] = Math.sqrt(b1) * invCs;
-      d2[i] = Math.sqrt(b2) * invCs;
-      id[i] = bid;
+      const x0 = cx * cs, y0 = cy * cs;
+      for (let y = y0; y < y0 + cs; y++) {
+        const row = y * res;
+        for (let x = x0; x < x0 + cs; x++) {
+          let b1 = 1e18, b2 = 1e18, bid = 0;
+          for (let j = 0; j < 9; j++) {
+            const dx = x - nx[j], dy = y - ny[j];
+            const d = dx * dx + dy * dy;
+            if (d < b1) { b2 = b1; b1 = d; bid = nid[j]; }
+            else if (d < b2) { b2 = d; }
+          }
+          const i = row + x;
+          d1[i] = Math.sqrt(b1) * invCs;
+          d2[i] = Math.sqrt(b2) * invCs;
+          id[i] = bid;
+        }
+      }
     }
   }
   return { d1, d2, id, cells };
@@ -192,13 +217,17 @@ function boxBlurWrap(src, dst, res, r, tmp) {
       sum += src[row + ((x + r + 1) & m)] - src[row + ((x - r) & m)];
     }
   }
-  for (let x = 0; x < res; x++) {
-    let sum = 0;
-    for (let k = -r; k <= r; k++) sum += tmp[(k & m) * res + x];
-    for (let y = 0; y < res; y++) {
-      dst[y * res + x] = sum * inv;
-      sum += tmp[((y + r + 1) & m) * res + x] - tmp[((y - r) & m) * res + x];
-    }
+  // vertical pass with a per-column accumulator, so memory stays row-major
+  const acc = new Float32Array(res);
+  for (let k = -r; k <= r; k++) {
+    const row = (k & m) * res;
+    for (let x = 0; x < res; x++) acc[x] += tmp[row + x];
+  }
+  for (let y = 0; y < res; y++) {
+    const out = y * res;
+    for (let x = 0; x < res; x++) dst[out + x] = acc[x] * inv;
+    const addRow = ((y + r + 1) & m) * res, subRow = ((y - r) & m) * res;
+    for (let x = 0; x < res; x++) acc[x] += tmp[addRow + x] - tmp[subRow + x];
   }
 }
 
@@ -349,7 +378,7 @@ function genConcrete(res, S, bank) {
   const at = makeSampler(res);
   const macro = bank.field(2, 3);
   const blotch = bank.field(6, 4);
-  const swirl = bank.field(8, 3);
+  const swirl = bank.field(12, 4);
   const mid = bank.field(24, 4);
   const fine = bank.field(96, 3);
   const agg = bank.worley(128);
@@ -374,11 +403,12 @@ function genConcrete(res, S, bank) {
       S.H[i] = 0.55 + (sheen - 0.5) * 0.30 + (grain - 0.5) * 0.16 - pore * pore * 0.42;
 
       // warm light grey, cooler and darker where damp
-      const damp = smoothstep(clamp((st - 0.46) * 3.2, 0, 1));
-      const dust = smoothstep(clamp((mc - 0.4) * 2.4, 0, 1));
-      let r = lerp(0.585, 0.505, damp) + (grain - 0.5) * 0.055 + (sheen - 0.5) * 0.05;
-      let g = lerp(0.578, 0.508, damp) + (grain - 0.5) * 0.052 + (sheen - 0.5) * 0.05;
-      let b = lerp(0.548, 0.512, damp) + (grain - 0.5) * 0.048 + (sheen - 0.5) * 0.05;
+      const damp = smoothstep(clamp((st - 0.42) * 2.4, 0, 1));
+      const dust = smoothstep(clamp((mc - 0.42) * 2.4, 0, 1));
+      const tone = (mc - 0.5) * 0.09 + (st - 0.5) * 0.05;
+      let r = lerp(0.530, 0.408, damp) + tone + (grain - 0.5) * 0.060 + (sheen - 0.5) * 0.055;
+      let g = lerp(0.522, 0.406, damp) + tone + (grain - 0.5) * 0.057 + (sheen - 0.5) * 0.055;
+      let b = lerp(0.495, 0.404, damp) + tone * 0.85 + (grain - 0.5) * 0.053 + (sheen - 0.5) * 0.055;
       r = lerp(r, r * 1.06 + 0.030, dust * 0.5);
       g = lerp(g, g * 1.04 + 0.028, dust * 0.5);
       b = lerp(b, b * 0.99 + 0.020, dust * 0.5);
@@ -398,11 +428,12 @@ function genConcreteWorn(res, S, bank) {
   const at = makeSampler(res);
   const m = res - 1;
   const macro = bank.field(2, 3);
-  const blotch = bank.field(5, 4);
+  const blotch = bank.field(6, 4);
   const streak = bank.field(12, 4);
   const mid = bank.field(24, 4);
   const fine = bank.field(96, 3);
   const agg = bank.worley(128);
+  const netF = bank.worley(32);
   const patch = bank.worley(8);
   const [ox1, oy1] = offs(res), [ox2, oy2] = offs(res), [ox3, oy3] = offs(res);
   const amp = res * 0.05;
@@ -417,32 +448,36 @@ function genConcreteWorn(res, S, bank) {
       const mc = at(macro, x, y);
       const st = at(blotch, x + ox3, y + oy1);
 
-      // repair patches: whole cells of a different mix, with a seam line
+      // repair patches: a handful of cells are a different mix, outlined by the
+      // saw-cut seam. Untouched cells get no seam at all, so no honeycomb.
       const pid = patch.id[i];
-      const seam = clamp(1 - (patch.d2[i] - patch.d1[i]) * 7, 0, 1);
-      const patchTone = (pid - 0.5) * 0.085;
-      const patchRough = (pid - 0.5) * 0.18;
+      const isPatch = smoothstep(clamp((pid - 0.62) * 5.5, 0, 1));
+      const seam = clamp(1 - (patch.d2[i] - patch.d1[i]) * 11, 0, 1) * isPatch;
+      const patchTone = (pid - 0.72) * 0.16 * isPatch;
+      const patchRough = (pid - 0.72) * 0.34 * isPatch;
 
       // crack network: warped Worley edges, thin and deep
       const cwx = (x + (((at(streak, x + ox2, y) - 0.5) * res * 0.02) | 0)) & m;
       const cwy = (y + (((at(streak, x, y + oy2) - 0.5) * res * 0.02) | 0)) & m;
       const ci = cwy * res + cwx;
-      let crack = clamp(1 - (agg.d2[ci] - agg.d1[ci]) * 9, 0, 1);
-      crack *= smoothstep(clamp((at(blotch, x + ox1, y + ox2) - 0.34) * 2.6, 0, 1));
+      let crack = clamp(1 - (netF.d2[ci] - netF.d1[ci]) * 20, 0, 1);
+      // only a few joints have actually opened up, and they fade along their length
+      crack *= smoothstep(clamp((at(blotch, x + ox1, y + ox2) - 0.66) * 7.0, 0, 1))
+        * smoothstep(clamp((at(streak, (x + oy2) * 2, y + ox1) - 0.30) * 3.0, 0, 1));
       crack = crack * crack;
 
       // spalling: aggregate exposed where the cream has worn through
-      const spallMask = smoothstep(clamp((mc - 0.56) * 3.4, 0, 1));
-      const stone = agg.d1[i] < 0.32 ? 1 - agg.d1[i] / 0.32 : 0;
-      const spall = spallMask * stone;
+      const spallMask = smoothstep(clamp((mc - 0.62) * 3.2, 0, 1));
+      const stone = agg.d1[i] < 0.40 ? 1 - agg.d1[i] / 0.40 : 0;
+      const spall = spallMask * stone * 0.7;
 
       S.H[i] = 0.58 + (sheen - 0.5) * 0.22 + (grain - 0.5) * 0.18
         + patchTone * 0.6 + spall * 0.18 - crack * 0.55 - seam * 0.14;
 
       const damp = smoothstep(clamp((st - 0.5) * 3.0, 0, 1));
-      let r = 0.575 + patchTone + (grain - 0.5) * 0.070 - damp * 0.075;
-      let g = 0.566 + patchTone + (grain - 0.5) * 0.068 - damp * 0.073;
-      let b = 0.540 + patchTone + (grain - 0.5) * 0.064 - damp * 0.060;
+      let r = 0.455 + patchTone + (mc - 0.5) * 0.105 + (grain - 0.5) * 0.055 - damp * 0.095;
+      let g = 0.447 + patchTone + (mc - 0.5) * 0.100 + (grain - 0.5) * 0.053 - damp * 0.092;
+      let b = 0.427 + patchTone + (mc - 0.5) * 0.088 + (grain - 0.5) * 0.050 - damp * 0.076;
 
       // exposed aggregate reads warmer and speckled
       const sid = agg.id[i];
@@ -481,7 +516,7 @@ function genAsphalt(res, S, bank, opts = {}) {
   const m = res - 1;
   const macro = bank.field(2, 3);
   const blotch = bank.field(6, 4);
-  const mid = bank.field(20, 4);
+  const mid = bank.field(24, 4);
   const fine = bank.field(96, 3);
   const grit = bank.field(128, 2);
   const agg = bank.worley(128);
@@ -508,8 +543,9 @@ function genAsphalt(res, S, bank, opts = {}) {
       const wIdx = (y * res) + ((x + ((((at(mid, x + ox1, y * 3) - 0.5) * res * 0.012) | 0))) & m);
       const edgeA = seams.d2[i] - seams.d1[i];
       const edgeB = seams.d2[wIdx] - seams.d1[wIdx];
-      const tar = clamp(1 - Math.min(edgeA, edgeB) * 5.5, 0, 1);
-      const tarS = tar * tar * smoothstep(clamp((bl - 0.25) * 2.2, 0, 1));
+      const tar = clamp(1 - Math.min(edgeA, edgeB) * 11, 0, 1);
+      // only ~1 joint in 4 was ever crack-sealed
+      const tarS = tar * tar * smoothstep(clamp((bl - 0.60) * 5.0, 0, 1));
 
       let h = 0.42 + stone * proud * 0.34 + (fn - 0.5) * 0.22 + (gr - 0.5) * 0.14
         + (md - 0.5) * 0.10 + tarS * 0.30;
@@ -517,10 +553,10 @@ function genAsphalt(res, S, bank, opts = {}) {
 
       // stone chips: granite / limestone speckle
       const chip = agg.id[i];
-      const chipMix = stone * proud * (0.55 + fn * 0.5);
-      r = lerp(r, lerp(0.30, 0.56, chip), chipMix);
-      g = lerp(g, lerp(0.30, 0.55, chip), chipMix);
-      b = lerp(b, lerp(0.31, 0.53, chip), chipMix);
+      const chipMix = clamp(stone * (0.35 + proud * 0.85) * (0.55 + fn * 0.6), 0, 1);
+      r = lerp(r, lerp(0.235, 0.60, chip), chipMix);
+      g = lerp(g, lerp(0.235, 0.59, chip), chipMix);
+      b = lerp(b, lerp(0.245, 0.57, chip), chipMix);
 
       // sun-bleached patches
       const bleach = smoothstep(clamp((mc - 0.5) * 2.6, 0, 1));
@@ -558,17 +594,17 @@ function genAsphalt(res, S, bank, opts = {}) {
 // --- plywood / skatelite ramp sheet -----------------------------------------
 function genSheet(res, S, bank, opts = {}) {
   const at = makeSampler(res);
-  const macro = bank.field(3, 3);
-  const grainF = bank.field(6, 4);
-  const ringF = bank.field(16, 3);
+  const macro = bank.field(2, 3);
+  const grainF = bank.field(2, 3);
+  const ringF = bank.field(6, 4);
   const fine = bank.field(96, 3);
-  const scuffF = bank.field(10, 4);
-  const dust = bank.worley(64);
+  const scuffF = bank.field(12, 4);
+  const dust = bank.worley(32);
   const [ox1, oy1] = offs(res), [ox2, oy2] = offs(res), [ox3, oy3] = offs(res);
 
   const dark = opts.skatelite === true;
-  const c0 = dark ? [0.115, 0.098, 0.090] : [0.560, 0.400, 0.238];
-  const c1 = dark ? [0.052, 0.045, 0.043] : [0.395, 0.252, 0.135];
+  const c0 = dark ? [0.115, 0.098, 0.090] : [0.575, 0.492, 0.372];
+  const c1 = dark ? [0.052, 0.045, 0.043] : [0.372, 0.288, 0.208];
   const seamPx = res * 0.006;
   const half = res >> 1;
 
@@ -576,9 +612,9 @@ function genSheet(res, S, bank, opts = {}) {
     for (let x = 0; x < res; x++) {
       const i = y * res + x;
       // grain runs along V; stretch the field across U for long fibres
-      const wob = ((at(grainF, x + ox1, y + oy1) - 0.5) * res * 0.03) | 0;
-      const gv = at(grainF, (x + wob) * 7 + ox2, y + oy2);
-      const rv = at(ringF, (x + wob) * 5 + ox3, y);
+      const wob = ((at(scuffF, x + ox1, y + oy1) - 0.5) * res * 0.03) | 0;
+      const gv = at(grainF, (x + wob) * 12 + ox2, y + oy2);
+      const rv = at(ringF, (x + wob) * 4 + ox3, y);
       const fn = at(fine, x * 3, y + oy3);
       const mc = at(macro, x, y);
 
@@ -643,43 +679,44 @@ function genSheet(res, S, bank, opts = {}) {
 // --- rough sawn lumber (kicker frames, bleachers, hoardings) ----------------
 function genLumber(res, S, bank) {
   const at = makeSampler(res);
-  const grainF = bank.field(6, 4);
-  const ringF = bank.field(14, 3);
+  const grainF = bank.field(2, 3);      // stretched hard -> long fibres
+  const ringF = bank.field(6, 4);
+  const fibre = bank.field(24, 4);
   const fine = bank.field(96, 3);
-  const macro = bank.field(3, 3);
+  const macro = bank.field(2, 3);
   const knots = bank.worley(8);
   const [ox1, oy1] = offs(res), [ox2, oy2] = offs(res);
 
   for (let y = 0; y < res; y++) {
     for (let x = 0; x < res; x++) {
       const i = y * res + x;
-      const wob = ((at(grainF, x + ox1, y + oy1) - 0.5) * res * 0.05) | 0;
-      const gv = at(grainF, (x + wob) * 6, y + ox2);
+      const wob = ((at(ringF, x + ox1, y + oy1) - 0.5) * res * 0.05) | 0;
+      const gv = at(grainF, (x + wob) * 14, y + ox2);
       const rv = at(ringF, (x + wob) * 4, y + oy2);
-      const fn = at(fine, x * 4, y);
+      const fn = at(fibre, (x + wob) * 3, y) * 0.6 + at(fine, x, y) * 0.4;
       const mc = at(macro, x, y);
 
-      let ring = Math.abs(((gv * 0.7 + rv * 0.3) * 11) % 1 - 0.5) * 2;
-      ring = smoothstep(clamp(ring * 1.2 - 0.1, 0, 1));
+      let ring = Math.abs(((gv * 0.62 + rv * 0.38) * 7) % 1 - 0.5) * 2;
+      ring = smoothstep(clamp(ring * 1.25 - 0.16, 0, 1));
 
       // knots where a branch was
       const knot = knots.id[i] > 0.72 ? clamp(1 - knots.d1[i] / 0.30, 0, 1) : 0;
       const knotS = knot * knot;
 
-      const mix = clamp(ring * 0.7 + (fn - 0.5) * 0.5 + 0.18 + knotS * 0.9, 0, 1);
-      let r = lerp(0.485, 0.235, mix);
-      let g = lerp(0.415, 0.170, mix);
-      let b = lerp(0.330, 0.125, mix);
+      const mix = clamp(ring * 0.62 + (fn - 0.5) * 0.34 + 0.20 + knotS * 0.9, 0, 1);
+      let r = lerp(0.470, 0.205, mix);
+      let g = lerp(0.395, 0.148, mix);
+      let b = lerp(0.300, 0.108, mix);
 
       // weathered silver-grey on the exposed faces
-      const grey = smoothstep(clamp((mc - 0.38) * 2.2, 0, 1));
+      const grey = smoothstep(clamp((mc - 0.30) * 1.8, 0, 1));
       r = lerp(r, lerp(0.440, 0.300, mix), grey * 0.7);
       g = lerp(g, lerp(0.425, 0.290, mix), grey * 0.7);
       b = lerp(b, lerp(0.400, 0.280, mix), grey * 0.7);
 
       // saw marks: shallow regular ridges across the board
       const saw = Math.abs(((y / res) * 46 + (fn - 0.5) * 0.7) % 1 - 0.5) * 2;
-      const sawH = (1 - saw) * 0.10 * (0.4 + grey * 0.8);
+      const sawH = (1 - saw) * 0.22 * (0.4 + grey * 0.8);
 
       S.H[i] = 0.5 + (mix - 0.5) * 0.22 + (fn - 0.5) * 0.28 + sawH - knotS * 0.18;
       S.R[i] = r; S.G[i] = g; S.B[i] = b;
@@ -692,9 +729,10 @@ function genLumber(res, S, bank) {
 // --- coping: polished-worn steel tube ---------------------------------------
 function genCoping(res, S, bank) {
   const at = makeSampler(res);
-  const scratchF = bank.field(24, 3);
+  const scratchF = bank.field(24, 4);
+  const microF = bank.field(24, 4);
   const fineF = bank.field(96, 3);
-  const macro = bank.field(3, 3);
+  const macro = bank.field(2, 3);
   const pits = bank.worley(64);
   const [ox1, oy1] = offs(res), [ox2, oy2] = offs(res);
 
@@ -705,7 +743,7 @@ function genCoping(res, S, bank) {
       const i = y * res + x;
       // circumferential scratches: stretched hard along U
       const s1 = at(scratchF, x + ox1, (y + oy1) * 9);
-      const micro = at(fineF, x * 2 + ox2, (y + oy2) * 6) - 0.5;
+      const micro = at(microF, x * 2 + ox2, (y + oy2) * 5) - 0.5;
       const line = clamp(1 - Math.abs(s1 - 0.5) * 2 * 5.5, 0, 1);
       const mc = at(macro, x, y);
 
@@ -713,7 +751,7 @@ function genCoping(res, S, bank) {
       const pit = clamp(1 - pits.d1[i] / 0.22, 0, 1);
       const rust = pit * smoothstep(clamp((mc - 0.55) * 3.2, 0, 1)) * (1 - wear * 0.85);
 
-      const base = 0.62 + micro * 0.10 - line * 0.10 + wear * 0.10;
+      const base = 0.495 + micro * 0.07 - line * 0.07 + wear * 0.055;
       let r = base, g = base * 1.005, b = base * 1.03;
       r = lerp(r, 0.34, rust * 0.85); g = lerp(g, 0.185, rust * 0.85); b = lerp(b, 0.105, rust * 0.85);
 
@@ -731,9 +769,9 @@ function genRailSteel(res, S, bank) {
   const at = makeSampler(res);
   const spangle = bank.worley(16);
   const micro = bank.worley(64);
-  const scratchF = bank.field(32, 3);
+  const scratchF = bank.field(24, 4);
   const fineF = bank.field(96, 3);
-  const macro = bank.field(3, 3);
+  const macro = bank.field(2, 3);
   const [ox1, oy1] = offs(res), [ox2, oy2] = offs(res);
 
   for (let y = 0; y < res; y++) {
@@ -743,7 +781,7 @@ function genRailSteel(res, S, bank) {
       // spangle: the crystalline flower pattern of hot-dip galvanising
       const cell = spangle.id[i];
       const facet = clamp(1 - (spangle.d2[i] - spangle.d1[i]) * 3.2, 0, 1);
-      const sh = 0.60 + (cell - 0.5) * 0.11 + facet * 0.05;
+      const sh = 0.500 + (cell - 0.5) * 0.028 + facet * 0.018;
 
       const s1 = at(scratchF, x + ox1, (y + oy1) * 8);
       const line = clamp(1 - Math.abs(s1 - 0.5) * 2 * 6.0, 0, 1);
@@ -752,13 +790,13 @@ function genRailSteel(res, S, bank) {
       const pit = clamp(1 - micro.d1[i] / 0.18, 0, 1);
       const rust = pit * smoothstep(clamp((mc - 0.66) * 4.0, 0, 1)) * (1 - wear * 0.9);
 
-      const base = sh + fn * 0.08 - line * 0.06 + wear * 0.14;
+      const base = sh + fn * 0.045 - line * 0.045 + wear * 0.055;
       let r = base * 0.99, g = base, b = base * 1.045;
       r = lerp(r, 0.33, rust * 0.8); g = lerp(g, 0.18, rust * 0.8); b = lerp(b, 0.11, rust * 0.8);
 
       S.H[i] = 0.5 + fn * 0.30 - line * 0.30 + facet * 0.12 - pit * 0.35;
       S.R[i] = r; S.G[i] = g; S.B[i] = b;
-      S.Q[i] = clamp(0.38 - wear * 0.26 + facet * 0.10 + line * 0.18 + fn * 0.14 + rust * 0.5, 0.05, 1);
+      S.Q[i] = clamp(0.44 - wear * 0.30 + facet * 0.08 + line * 0.18 + fn * 0.14 + rust * 0.5, 0.07, 1);
       S.M[i] = 1 - rust * 0.7;
       S.O[i] = 1 - pit * 0.2;
     }
@@ -768,9 +806,9 @@ function genRailSteel(res, S, bank) {
 // --- painted metal: chipped enamel over red-oxide primer --------------------
 function genPaintedMetal(res, S, bank) {
   const at = makeSampler(res);
-  const peel = bank.field(64, 2);
-  const macro = bank.field(3, 3);
-  const wearF = bank.field(8, 4);
+  const peel = bank.field(128, 2);
+  const macro = bank.field(2, 3);
+  const wearF = bank.field(12, 4);
   const fineF = bank.field(96, 3);
   const chips = bank.worley(32);
   const dots = bank.worley(128);
@@ -831,7 +869,7 @@ function genPaintedMetal(res, S, bank) {
 function genChainlink(res, S, bank) {
   const at = makeSampler(res);
   const fineF = bank.field(96, 3);
-  const macro = bank.field(4, 3);
+  const macro = bank.field(2, 3);
   const [ox1, oy1] = offs(res);
   const T = 5;                    // diamonds across the tile
   const halfW = 0.155;            // wire half-width in cell units
@@ -885,10 +923,10 @@ function genChainlink(res, S, bank) {
 // --- brick: running bond, recessed mortar, soot and efflorescence -----------
 function genBrick(res, S, bank) {
   const at = makeSampler(res);
-  const faceF = bank.field(48, 3);
+  const faceF = bank.field(24, 4);
   const fineF = bank.field(96, 3);
-  const macro = bank.field(3, 3);
-  const streak = bank.field(10, 4);
+  const macro = bank.field(2, 3);
+  const streak = bank.field(12, 4);
   const sand = bank.worley(128);
   const [ox1, oy1] = offs(res), [ox2, oy2] = offs(res);
 
@@ -908,6 +946,7 @@ function genBrick(res, S, bank) {
       const lv = y - cy * bh;
 
       const bid = hash2(cx + 7, cy + 13);
+      const grime = hash2(cx + 41, cy + 97);
       const jx = (bid * 977) | 0, jy = (bid * 613) | 0;
       const face = at(faceF, x + jx, y + jy);
       const fn = at(fineF, x + jx, y + jy) - 0.5;
@@ -922,26 +961,29 @@ function genBrick(res, S, bank) {
 
       // brick colour family from the per-brick id
       let br, bg, bb;
-      if (bid < 0.14) { br = 0.235; bg = 0.165; bb = 0.150; }                              // clinker
-      else if (bid < 0.55) { br = 0.415 + bid * 0.14; bg = 0.205 + bid * 0.06; bb = 0.163 + bid * 0.05; }
-      else if (bid < 0.85) { br = 0.505; bg = 0.290; bb = 0.230; }
-      else { br = 0.560; bg = 0.395; bb = 0.315; }                                          // sand-struck
-      const shade = 0.86 + face * 0.28 + fn * 0.10;
+      if (bid < 0.16) { br = 0.215; bg = 0.168; bb = 0.158; }                              // clinker
+      else if (bid < 0.55) { br = 0.360 + bid * 0.12; bg = 0.218 + bid * 0.07; bb = 0.188 + bid * 0.06; }
+      else if (bid < 0.85) { br = 0.428; bg = 0.288; bb = 0.248; }
+      else { br = 0.492; bg = 0.378; bb = 0.322; }                                          // sand-struck
+      const shade = 0.72 + face * 0.50 + fn * 0.14 + (bid - 0.5) * 0.22
+        - clamp(1 - lv / bh, 0, 1) * 0.10;
       br *= shade; bg *= shade; bb *= shade;
 
       // mortar: pale, sandy, matte
       const sandy = clamp(1 - sand.d1[i] / 0.5, 0, 1);
-      const mr = 0.590 + fn * 0.10 - sandy * 0.060;
-      const mg = 0.578 + fn * 0.10 - sandy * 0.060;
-      const mb = 0.545 + fn * 0.10 - sandy * 0.055;
+      const mr = 0.475 + fn * 0.11 - sandy * 0.065;
+      const mg = 0.462 + fn * 0.11 - sandy * 0.065;
+      const mb = 0.432 + fn * 0.11 - sandy * 0.060;
 
       let r = lerp(br, mr, mortarS), g = lerp(bg, mg, mortarS), b = lerp(bb, mb, mortarS);
+      const grimeK = 1 - grime * 0.30 * (1 - mortarS * 0.5);
+      r *= grimeK; g *= grimeK * 0.995; b *= grimeK * 0.99;
       let q = lerp(0.78 + fn * 0.12, 0.94 + fn * 0.08, mortarS);
       const h = lerp(0.66 + (face - 0.5) * 0.14 + fn * 0.10, 0.28 + fn * 0.16, mortarS) - chip * 0.22;
 
       // soot settling on the upper edge of every course
-      const soot = clamp(1 - lv / (bh * 0.35), 0, 1) * smoothstep(clamp((mc - 0.30) * 2.0, 0, 1));
-      r *= 1 - soot * 0.24; g *= 1 - soot * 0.24; b *= 1 - soot * 0.22;
+      const soot = clamp(1 - lv / (bh * 0.45), 0, 1) * smoothstep(clamp((mc - 0.22) * 1.8, 0, 1));
+      r *= 1 - soot * 0.34; g *= 1 - soot * 0.35; b *= 1 - soot * 0.33;
 
       // efflorescence: pale salt bloom running down the wall
       const eff = smoothstep(clamp((at(streak, (x + ox2) * 2, y + oy2) - 0.62) * 4.0, 0, 1))
@@ -961,10 +1003,10 @@ function genBrick(res, S, bank) {
 // --- corrugated metal: painted, rust-streaked, bolted -----------------------
 function genCorrugated(res, S, bank) {
   const at = makeSampler(res);
-  const macro = bank.field(3, 3);
-  const streak = bank.field(8, 4);
+  const macro = bank.field(2, 3);
+  const streak = bank.field(12, 4);
   const fineF = bank.field(96, 3);
-  const dent = bank.field(12, 3);
+  const dent = bank.field(12, 4);
   const pits = bank.worley(128);
   const [ox1, oy1] = offs(res), [ox2, oy2] = offs(res);
   const ribs = 6;
@@ -981,7 +1023,7 @@ function genCorrugated(res, S, bank) {
       const pit = clamp(1 - pits.d1[i] / 0.28, 0, 1);
       const streakV = at(streak, (x + ox2) * 3, y + oy1);
       const rust = clamp(smoothstep(clamp((mc - 0.42) * 2.6, 0, 1))
-        * (0.35 + smoothstep(clamp((streakV - 0.45) * 3.2, 0, 1)) * 0.9) + pit * 0.35, 0, 1);
+        * (0.30 + smoothstep(clamp((streakV - 0.52) * 3.6, 0, 1)) * 0.85) + pit * 0.14, 0, 1);
 
       // faded industrial blue-grey paint, chalked by the sun
       let r = 0.300 + fn * 0.05 + p * 0.012;
@@ -1013,8 +1055,8 @@ function genCorrugated(res, S, bank) {
 // --- glass: float ripple, dust film, smears ---------------------------------
 function genGlass(res, S, bank) {
   const at = makeSampler(res);
-  const ripple = bank.field(4, 3);
-  const smear = bank.field(10, 4);
+  const ripple = bank.field(2, 3);
+  const smear = bank.field(12, 4);
   const fineF = bank.field(96, 3);
   const dots = bank.worley(128);
   const [ox1, oy1] = offs(res);
@@ -1040,9 +1082,9 @@ function genGlass(res, S, bank) {
 // --- dry city-lot grass -----------------------------------------------------
 function genGrass(res, S, bank) {
   const at = makeSampler(res);
-  const clump = bank.field(5, 4);
+  const clump = bank.field(6, 4);
   const macro = bank.field(2, 3);
-  const bladeF = bank.field(48, 2);
+  const bladeF = bank.field(24, 4);
   const fineF = bank.field(96, 3);
   const bald = bank.worley(16);
   const [ox1, oy1] = offs(res), [ox2, oy2] = offs(res);
@@ -1118,16 +1160,16 @@ function genDirt(res, S, bank) {
       S.H[i] = 0.52 + (md - 0.5) * 0.18 + fn * 0.22 + loose * 0.30
         - packed * 0.10 - crackS * 0.45 + stone * 0.30;
 
-      let r = 0.335 + (md - 0.5) * 0.060 + fn * 0.050;
-      let g = 0.245 + (md - 0.5) * 0.050 + fn * 0.045;
-      let b = 0.163 + (md - 0.5) * 0.040 + fn * 0.040;
+      let r = 0.325 + (md - 0.5) * 0.105 + (mc - 0.5) * 0.075 + fn * 0.050;
+      let g = 0.238 + (md - 0.5) * 0.090 + (mc - 0.5) * 0.062 + fn * 0.045;
+      let b = 0.158 + (md - 0.5) * 0.072 + (mc - 0.5) * 0.048 + fn * 0.040;
 
       const dustAmt = (1 - packed) * smoothstep(clamp((mc - 0.30) * 2.0, 0, 1));
       r = lerp(r, 0.470, dustAmt * 0.55); g = lerp(g, 0.380, dustAmt * 0.55); b = lerp(b, 0.275, dustAmt * 0.55);
       r = lerp(r, 0.230, packed * 0.55); g = lerp(g, 0.168, packed * 0.55); b = lerp(b, 0.118, packed * 0.55);
-      r = lerp(r, 0.400 + stones.id[i] * 0.14, stone * 0.8);
-      g = lerp(g, 0.385 + stones.id[i] * 0.13, stone * 0.8);
-      b = lerp(b, 0.360 + stones.id[i] * 0.12, stone * 0.8);
+      r = lerp(r, 0.300 + stones.id[i] * 0.10, stone * 0.65);
+      g = lerp(g, 0.286 + stones.id[i] * 0.09, stone * 0.65);
+      b = lerp(b, 0.264 + stones.id[i] * 0.08, stone * 0.65);
       r *= 1 - crackS * 0.45; g *= 1 - crackS * 0.45; b *= 1 - crackS * 0.42;
 
       S.R[i] = r; S.G[i] = g; S.B[i] = b;
@@ -1141,8 +1183,8 @@ function genDirt(res, S, bank) {
 function genRubber(res, S, bank) {
   const at = makeSampler(res);
   const fineF = bank.field(96, 3);
-  const midF = bank.field(24, 3);
-  const macro = bank.field(4, 3);
+  const midF = bank.field(24, 4);
+  const macro = bank.field(2, 3);
   const pores = bank.worley(128);
   const [ox1, oy1] = offs(res);
 
@@ -1168,7 +1210,7 @@ function genRubber(res, S, bank) {
 function genCloth(res, S, bank) {
   const at = makeSampler(res);
   const fuzz = bank.field(96, 3);
-  const macro = bank.field(6, 3);
+  const macro = bank.field(6, 4);
   const [ox1, oy1] = offs(res);
   const threads = 42;
 
@@ -1199,9 +1241,9 @@ function genCloth(res, S, bank) {
 // --- glossy injection-moulded plastic (helmet, pads, litter) ----------------
 function genPlastic(res, S, bank) {
   const at = makeSampler(res);
-  const peel = bank.field(48, 2);
+  const peel = bank.field(24, 4);
   const fineF = bank.field(96, 3);
-  const macro = bank.field(4, 3);
+  const macro = bank.field(2, 3);
   const [ox1, oy1] = offs(res);
 
   for (let y = 0; y < res; y++) {
@@ -1210,7 +1252,7 @@ function genPlastic(res, S, bank) {
       const op = at(peel, x + ox1, y + oy1) - 0.5;
       const fn = at(fineF, x, y) - 0.5;
       const mc = at(macro, x, y) - 0.5;
-      const scr = clamp(1 - Math.abs(at(fineF, x * 4, (y + ox1) * 2) - 0.5) * 2 * 9, 0, 1);
+      const scr = clamp(1 - Math.abs(at(fineF, x * 2, (y + ox1) * 2) - 0.5) * 2 * 9, 0, 1);
 
       const base = 0.80 + op * 0.05 + mc * 0.03;
       S.H[i] = 0.5 + op * 0.6 + fn * 0.1 - scr * 0.3;
@@ -1224,9 +1266,9 @@ function genPlastic(res, S, bank) {
 // --- anodised / brushed bike-part metal -------------------------------------
 function genAnodised(res, S, bank) {
   const at = makeSampler(res);
-  const brush = bank.field(32, 3);
+  const brush = bank.field(24, 4);
   const fineF = bank.field(96, 3);
-  const macro = bank.field(6, 3);
+  const macro = bank.field(6, 4);
   const dings = bank.worley(32);
   const [ox1, oy1] = offs(res);
 
@@ -1235,12 +1277,12 @@ function genAnodised(res, S, bank) {
       const i = y * res + x;
       // fine brushed streaks along U, plus stray deeper scratches
       const br = at(brush, x + ox1, (y + oy1) * 12) - 0.5;
-      const fn = at(fineF, x, y * 6) - 0.5;
+      const fn = at(fineF, x, y * 3) - 0.5;
       const mc = at(macro, x, y) - 0.5;
       const scratch = clamp(1 - Math.abs(at(fineF, x * 2 + oy1, (y + ox1) * 5) - 0.5) * 2 * 8, 0, 1);
       const ding = clamp(1 - dings.d1[i] / 0.10, 0, 1) * (dings.id[i] > 0.86 ? 1 : 0);
 
-      const base = 0.80 + br * 0.16 + fn * 0.08 + mc * 0.04 + scratch * 0.16;
+      const base = 0.700 + br * 0.15 + fn * 0.075 + mc * 0.04 + scratch * 0.14;
       S.H[i] = 0.5 + br * 0.35 + fn * 0.25 - scratch * 0.25 - ding * 0.5;
       S.R[i] = base; S.G[i] = base; S.B[i] = base;
       S.Q[i] = clamp(0.24 + br * 0.10 + fn * 0.07 + scratch * 0.22 + ding * 0.30, 0.04, 1);
@@ -1364,9 +1406,9 @@ function drawDecalCell(g, index, x0, y0, cw) {
       g.closePath();
       g.fill();
       g.globalCompositeOperation = 'destination-out';
-      for (let k = 0; k < 26; k++) {
+      for (let k = 0; k < 70; k++) {
         g.beginPath();
-        g.arc(rand(-cw * 0.34, cw * 0.36), rand(-cw * 0.22, cw * 0.22), rand(2, 9), 0, TAU);
+        g.arc(rand(-cw * 0.34, cw * 0.36), rand(-cw * 0.22, cw * 0.22), rand(0.8, 3.6), 0, TAU);
         g.fill();
       }
       g.globalCompositeOperation = 'source-over';
@@ -1389,9 +1431,9 @@ function drawDecalCell(g, index, x0, y0, cw) {
       g.closePath();
       g.fill();
       g.globalCompositeOperation = 'destination-out';
-      for (let k = 0; k < 40; k++) {
+      for (let k = 0; k < 120; k++) {
         g.beginPath();
-        g.arc(rand(-cw * 0.35, cw * 0.35), rand(-cw * 0.35, cw * 0.35), rand(2, 8), 0, TAU);
+        g.arc(rand(-cw * 0.35, cw * 0.35), rand(-cw * 0.35, cw * 0.35), rand(0.8, 3.2), 0, TAU);
         g.fill();
       }
       g.globalCompositeOperation = 'source-over';
@@ -1412,7 +1454,7 @@ function drawDecalCell(g, index, x0, y0, cw) {
         branch(nx, ny, ang + rand(-0.5, 0.5), len * rand(0.55, 0.85), w * 0.72, depth + 1);
         if (rng() > 0.45) branch(nx, ny, ang + rand(-1.2, 1.2), len * rand(0.35, 0.6), w * 0.5, depth + 1);
       };
-      for (let k = 0; k < 3; k++) {
+      for (let k = 0; k < 5; k++) {
         branch(rand(-cw * 0.30, cw * 0.30), rand(-cw * 0.30, cw * 0.30), rand(0, TAU), cw * 0.16, 4.5, 0);
       }
       g.restore();
@@ -1468,10 +1510,10 @@ function drawDecalCell(g, index, x0, y0, cw) {
       g.fillStyle = 'rgba(236,232,214,0.92)';
       g.fillRect(x0 + cw * 0.36, y0, cw * 0.28, cw);
       g.globalCompositeOperation = 'destination-out';
-      for (let k = 0; k < 260; k++) {
+      for (let k = 0; k < 520; k++) {
         g.globalAlpha = rand(0.2, 0.9);
         g.beginPath();
-        g.arc(rand(x0 + cw * 0.34, x0 + cw * 0.66), rand(y0, y0 + cw), rand(1.5, 7), 0, TAU);
+        g.arc(rand(x0 + cw * 0.34, x0 + cw * 0.66), rand(y0, y0 + cw), rand(0.8, 3.4), 0, TAU);
         g.fill();
       }
       g.globalAlpha = 1;
@@ -1485,10 +1527,10 @@ function drawDecalCell(g, index, x0, y0, cw) {
       g.fillRect(x0 + cw * 0.56, y0 + cw * 0.06, cw * 0.16, cw * 0.36);
       g.fillRect(x0 + cw * 0.56, y0 + cw * 0.58, cw * 0.16, cw * 0.36);
       g.globalCompositeOperation = 'destination-out';
-      for (let k = 0; k < 220; k++) {
+      for (let k = 0; k < 420; k++) {
         g.globalAlpha = rand(0.15, 0.8);
         g.beginPath();
-        g.arc(rand(x0 + cw * 0.28, x0 + cw * 0.74), rand(y0, y0 + cw), rand(1.5, 6), 0, TAU);
+        g.arc(rand(x0 + cw * 0.28, x0 + cw * 0.74), rand(y0, y0 + cw), rand(0.8, 3.0), 0, TAU);
         g.fill();
       }
       g.globalAlpha = 1;
@@ -1550,9 +1592,9 @@ function drawDecalCell(g, index, x0, y0, cw) {
       g.font = `900 ${cw * 0.30}px "Arial Black", Impact, sans-serif`;
       g.fillText('D.I.Y.', 0, 0);
       g.globalCompositeOperation = 'destination-out';
-      for (let k = 0; k < 70; k++) {
+      for (let k = 0; k < 150; k++) {
         g.beginPath();
-        g.arc(rand(-cw * 0.40, cw * 0.40), rand(-cw * 0.20, cw * 0.20), rand(1, 6), 0, TAU);
+        g.arc(rand(-cw * 0.40, cw * 0.40), rand(-cw * 0.20, cw * 0.20), rand(0.7, 2.8), 0, TAU);
         g.fill();
       }
       g.globalCompositeOperation = 'source-over';
@@ -1644,6 +1686,12 @@ float macroNoise( vec3 p ) {
 }
 `;
 
+/** Compiled macro uniforms per material — kept off userData (see ownTextures). */
+const macroUniforms = new WeakMap();
+
+/** Shared no-op so macro-free clones keep sharing one program cache key. */
+function noMacro() {}
+
 /** One shared function object => one program cache key => one compiled program. */
 function macroOnBeforeCompile(shader) {
   const cfg = this.userData.macro;
@@ -1673,7 +1721,7 @@ function macroOnBeforeCompile(shader) {
       roughnessFactor = clamp( roughnessFactor * ( 1.0 + macroV * uMacro.z ), 0.035, 1.0 );
     `);
 
-  this.userData.macroUniforms = shader.uniforms;
+  macroUniforms.set(this, shader.uniforms);
 }
 
 /**
@@ -1750,25 +1798,33 @@ export function uvScaleGeometry(geometry, su, sv = su, ou = 0, ov = 0) {
   return geometry;
 }
 
+const ownedTextures = new WeakMap();
+
 const MAP_SLOTS = ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'alphaMap', 'emissiveMap'];
 
-/** Give a material its own Texture objects (GPU data stays shared via Source). */
-function ownTextures(material) {
-  if (material.userData.ownsTextures) return material;
+/**
+ * Give a material its own Texture objects so its repeat/offset can differ from
+ * the library original. Clones share `.source`, so there is no extra VRAM and
+ * no second upload — only the uv transform differs.
+ * `sink` collects the clones for dispose(). Bookkeeping must stay off userData:
+ * three's Material.copy() deep-clones userData through JSON.
+ */
+function ownTextures(material, sink) {
+  if (ownedTextures.has(material)) return material;
   const seen = new Map();
   for (const slot of MAP_SLOTS) {
     const t = material[slot];
     if (!t) continue;
     let c = seen.get(t.uuid);
     if (!c) {
-      c = t.clone();          // shares .source => no extra VRAM, no re-upload
+      c = t.clone();
       c.needsUpdate = false;
       seen.set(t.uuid, c);
+      if (sink) sink.add(c);
     }
     material[slot] = c;
   }
-  material.userData.ownsTextures = true;
-  material.userData.clonedTextures = [...seen.values()];
+  ownedTextures.set(material, [...seen.values()]);
   return material;
 }
 
@@ -1801,7 +1857,7 @@ const RECIPES = [
     base: { roughness: 1, metalness: 0 }, normalScale: 0.85,
     macro: { scale: 0.035, colour: 0.13, rough: 0.16, warm: 0.14 } },
 
-  { key: 'skatelite', res: 1024, tile: 2.44, height: 0.004,
+  { key: 'skatelite', res: 512, tile: 2.44, height: 0.004,
     gen: (r, S, b) => genSheet(r, S, b, { skatelite: true }),
     base: { roughness: 1, metalness: 0 }, normalScale: 0.7,
     macro: { scale: 0.035, colour: 0.10, rough: 0.18, warm: 0.06 } },
@@ -1817,7 +1873,10 @@ const RECIPES = [
     base: { roughness: 1, metalness: 1, envMapIntensity: 1.1 }, metalMap: true, normalScale: 0.6 },
 
   { key: 'paintedMetal', res: 512, tile: 1.0, height: 0.0016, gen: genPaintedMetal,
-    base: { roughness: 1, metalness: 1, envMapIntensity: 1.0 }, metalMap: true, normalScale: 0.8 },
+    // the enamel layer is authored near-white so `tint()` gives clean colourways;
+    // the default is a municipal grey-blue so it never renders as bare paper
+    base: { color: 0x8d949c, roughness: 1, metalness: 1, envMapIntensity: 1.0 },
+    metalMap: true, normalScale: 0.8 },
 
   { key: 'chainlink', res: 512, tile: 1.15, height: 0.0042, gen: genChainlink,
     base: {
@@ -1826,7 +1885,7 @@ const RECIPES = [
     },
     metalMap: true, normalScale: 1.0 },
 
-  { key: 'brick', res: 1024, tile: 2.0, height: 0.014, gen: genBrick,
+  { key: 'brick', res: 512, tile: 2.0, height: 0.014, gen: genBrick,
     base: { roughness: 1, metalness: 0 }, normalScale: 1.0,
     macro: { scale: 0.030, colour: 0.16, rough: 0.14, warm: 0.10 } },
 
@@ -1845,7 +1904,7 @@ const RECIPES = [
     base: { roughness: 1, metalness: 0 }, normalScale: 1.0,
     macro: { scale: 0.050, colour: 0.20, rough: 0.10, warm: 0.16 } },
 
-  { key: 'dirt', res: 1024, tile: 3.0, height: 0.022, gen: genDirt,
+  { key: 'dirt', res: 1024, tile: 4.0, height: 0.022, gen: genDirt,
     base: { roughness: 1, metalness: 0 }, normalScale: 1.0,
     macro: { scale: 0.030, colour: 0.18, rough: 0.16, warm: 0.14 } },
 
@@ -1853,10 +1912,10 @@ const RECIPES = [
     base: { roughness: 1, metalness: 0, envMapIntensity: 0.55 }, normalScale: 0.7 },
 
   { key: 'cloth', res: 512, tile: 0.34, height: 0.0011, gen: genCloth,
-    base: { roughness: 1, metalness: 0, envMapIntensity: 0.7 }, normalScale: 0.8 },
+    base: { color: 0x6f7480, roughness: 1, metalness: 0, envMapIntensity: 0.7 }, normalScale: 0.8 },
 
   { key: 'plasticGloss', res: 256, tile: 0.5, height: 0.0005, gen: genPlastic,
-    base: { roughness: 1, metalness: 0, envMapIntensity: 1.2 }, normalScale: 0.5 },
+    base: { color: 0x9aa0a8, roughness: 1, metalness: 0, envMapIntensity: 1.2 }, normalScale: 0.5 },
 
   { key: 'anodised', res: 512, tile: 0.40, height: 0.0004, gen: genAnodised,
     base: { roughness: 1, metalness: 1, envMapIntensity: 1.25 }, metalMap: true, normalScale: 0.55 },
@@ -1908,7 +1967,9 @@ export async function createMaterials(ctx) {
   const materials = new Map();
   const textures = new Set();
   const variants = new Map();
+  const clonedTextures = new Set();
   let texCount = 0;
+  let lastYield = t0;
 
   for (const rec of RECIPES) {
     const res = Math.max(128, (rec.res * resScale) | 0);
@@ -1942,7 +2003,6 @@ export async function createMaterials(ctx) {
     mat.normalScale.set(rec.normalScale ?? 1, rec.normalScale ?? 1);
     mat.userData.tileMeters = { x: tileU, y: tileV };
     mat.userData.libName = rec.key;
-    mat.userData.maps = maps;
     if (rec.macro) applyMacroVariation(mat, rec.macro);
 
     lib[rec.key] = mat;
@@ -1950,7 +2010,8 @@ export async function createMaterials(ctx) {
     textures.add(maps.map); textures.add(maps.normal); textures.add(maps.orm);
     texCount += 3;
 
-    await nextTick();     // keep the main thread responsive during load
+    // keep the main thread responsive without paying a timer per material
+    if (now() - lastYield > 60) { await nextTick(); lastYield = now(); }
   }
 
   // --- decal / graffiti atlas ----------------------------------------------
@@ -1987,7 +2048,7 @@ export async function createMaterials(ctx) {
     m.envMapIntensity = cw.env;
     m.metalness = 1;
     m.normalScale = anod.normalScale.clone();
-    m.userData = { ...anod.userData, libName: `bike_${name}`, ownsTextures: false, clonedTextures: null };
+    m.userData = { ...anod.userData, libName: `bike_${name}` };
     bikePaint[name] = m;
     materials.set(`bike_${name}`, m);
   }
@@ -2008,7 +2069,7 @@ export async function createMaterials(ctx) {
   function setUvScale(material, metresPerTile) {
     const mx = Array.isArray(metresPerTile) ? metresPerTile[0] : metresPerTile;
     const my = Array.isArray(metresPerTile) ? metresPerTile[1] : metresPerTile;
-    ownTextures(material);
+    ownTextures(material, clonedTextures);
     const done = new Set();
     for (const slot of MAP_SLOTS) {
       const t = material[slot];
@@ -2036,7 +2097,7 @@ export async function createMaterials(ctx) {
     if (cached) return cached;
 
     const m = base.clone();
-    m.userData = { ...base.userData, ownsTextures: false, clonedTextures: null };
+    m.userData = { ...base.userData };
     m.normalScale = base.normalScale.clone();
     if (opts.tile !== undefined) setUvScale(m, opts.tile);
     if (opts.color !== undefined) m.color = new THREE.Color(opts.color);
@@ -2050,7 +2111,7 @@ export async function createMaterials(ctx) {
     if (opts.opacity !== undefined) m.opacity = opts.opacity;
     if (opts.emissive !== undefined) m.emissive = new THREE.Color(opts.emissive);
     if (opts.emissiveIntensity !== undefined) m.emissiveIntensity = opts.emissiveIntensity;
-    if (opts.macro === false) { m.onBeforeCompile = () => {}; m.userData.macro = null; }
+    if (opts.macro === false) { m.onBeforeCompile = noMacro; m.userData.macro = null; }
     else if (opts.macro) applyMacroVariation(m, opts.macro);
     m.name = opts.name || `${name}_v${variants.size}`;
 
@@ -2082,8 +2143,8 @@ export async function createMaterials(ctx) {
     if (cached) return cached;
 
     const m = decalBase.clone();
-    m.userData = { ...decalBase.userData, ownsTextures: false, clonedTextures: null };
-    ownTextures(m);
+    m.userData = { ...decalBase.userData };
+    ownTextures(m, clonedTextures);
     const { offset, repeat } = decalUV(i);
     m.map.offset.copy(offset);
     m.map.repeat.copy(repeat);
@@ -2115,6 +2176,8 @@ export async function createMaterials(ctx) {
     variant,
     tint,
     setUvScale,
+    /** Live uniforms of a macro-variation material (null until first render). */
+    macroUniformsOf(material) { return macroUniforms.get(material) || null; },
     applyMacroVariation,
     uvFromPlane,
     uvBox,
@@ -2132,13 +2195,12 @@ export async function createMaterials(ctx) {
 
     dispose() {
       for (const m of materials.values()) m.dispose();
-      for (const m of variants.values()) {
-        for (const t of m.userData.clonedTextures || []) t.dispose();
-      }
+      for (const t of clonedTextures) t.dispose();
       for (const t of textures) t.dispose();
       materials.clear();
       variants.clear();
       textures.clear();
+      clonedTextures.clear();
       scratchPool.clear();
     },
   };

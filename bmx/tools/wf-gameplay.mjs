@@ -31,6 +31,14 @@ NON-NEGOTIABLE RULES
 
 FEEL TARGET: instantly readable arcade trick game. Inputs land within 2 frames, tricks read clearly in
 silhouette, combos escalate, the HUD sells the score. A harsh critic agent will play and screenshot this.
+
+SCOPE: this is a SINGLE-MAP demo - one level (City Lot), the full trick vocabulary, 2:00 timed runs,
+persistent high scores, achievements, challenges and collectibles. Read the "DEMO SCOPE", "ART
+DIRECTION TARGET" and "HUD LAYOUT" sections at the end of ARCHITECTURE.md.
+
+ART REFERENCE: /home/user/pendulum-timer/bmx/reference/target-look.png is the exact visual and HUD
+target. READ IT WITH THE READ TOOL before you design anything user-facing - it renders as an image.
+All branding must be invented; never reproduce real trademarks, event names or real rider names.
 `
 
 const SCHEMA = {
@@ -143,7 +151,17 @@ Deliver:
 - Session flow: 120 s timer, countdown audio cue in the last 10 s via ctx.audio, then a results state
   (emit an event with best combo, longest grind, biggest air, tricks landed, goals completed, final
   score) that src/ui/screens.js renders. Expose restart().
-- Persist a high score and completed goals in localStorage under a namespaced key.
+- Competition leaderboard: five invented rival riders with fixed target scores (e.g. 100k / 85k /
+  75k / 60k) that the player's live score is ranked against during the run. Expose the sorted table
+  and the player's current rank for the HUD, and fire an event when the player passes a rival.
+- Trick list tracking: record which trick ids have been landed at least once (persisted), and expose
+  landedCount / totalCount for the HUD's "12 / 46" counter.
+- Achievements: a persistent set of ~15 named achievements independent of the per-run goals
+  (e.g. first 100k run, a 20-trick combo, a 10 s grind, land every grind type, collect all letters
+  in one run, 5 m air, bail 25 times, perfect-land 10 in a row, all challenges cleared). Track them
+  from gameplay events, persist unlocks, and emit an event so the HUD can flash an unlock toast.
+- Persist a top-5 high score table with dates, per-run best stats, completed goals and achievements
+  in localStorage under a namespaced key, with a safe migration if the stored shape changes.
 Everything the HUD needs must be readable from the returned object each frame without allocating.`,
   },
   {
@@ -186,17 +204,27 @@ NOTE: hud.css also carries the page-level reset (html/body/#viewport/#ui-root ru
 
 Implement createHUD(ctx) per ARCHITECTURE.md.
 
-Deliver a HUD that looks like a modern extreme-sports game, not a browser demo:
-- Score readout with animated count-up (odometer roll), a live combo string on the left/centre-bottom
-  ("TABLETOP + 360 + FEEBLE GRIND x4  12,400") that builds as tricks land and slams/fades out when
-  banked or lost, with a draining combo timer bar attached to it.
-- Session timer, goal tracker panel (goal text, tick when complete, a subtle flash on completion),
-  special/Mirra meter (a vertical or arced bar that pulses and changes colour when full),
-  balance meter for grinds and manuals (horizontal for grinds, vertical for manuals, with a critical
-  red zone and shake when near the edge) that appears/disappears smoothly.
-- Big centred flashes for gaps, goal completions, special activation, and bails ("BAIL!" with a
-  screen-edge red pulse).
-- Speed/air-time readouts are optional but a small air-time counter while airborne is a nice touch.
+MATCH THE REFERENCE FRAME. Read reference/target-look.png and the "HUD LAYOUT" section of
+ARCHITECTURE.md, and reproduce that layout (with invented branding and invented rival names):
+- TOP-LEFT: "SCORE:" label in white condensed caps with a large gold/amber numeral beside it,
+  animated count-up (odometer roll). Directly beneath it a horizontal SPECIAL meter - dark segmented
+  track with an orange-to-yellow gradient fill, a shine sweep when full, and a pulse when armed.
+- BELOW THAT: a five-row competition leaderboard - rank number, a divider bar, rival name, score
+  right-aligned - with the player's row highlighted in the accent colour and the table re-sorting
+  live (with a smooth row-swap animation) as the player's score climbs past each rival.
+- TOP-CENTRE: the run timer, large, clean, tabular numerals (1:24), turning amber under 30 s and
+  red with a pulse under 10 s.
+- TOP-RIGHT: "TRICK LIST" with a key/button hint chip, and beneath it the landed-trick counter
+  ("12 / 46") plus a difficulty tag. Opening the trick list shows a scrollable panel of every trick
+  with its input recipe, greyed until landed once.
+- BOTTOM-CENTRE: the trick callout - gold points line ("2,350 X 2") with the trick chain beneath in
+  white italics ("No Footed Can Can + Barspin"), sliding in on each trick, ticking the multiplier up,
+  and slamming out when the combo banks or is lost, with a draining combo timer bar under it.
+- Balance meter for grinds and manuals (horizontal for grinds, vertical for manuals, critical red
+  zone, shake near the edge), appearing and disappearing smoothly.
+- Goal/challenge tracker panel that can collapse to a compact strip, big centred flashes for gaps,
+  goal completions, achievements unlocked, special activation, and bails ("BAIL!" with a screen-edge
+  red pulse). Air-time counter while airborne.
 - All type set in a strong condensed sans (use a CSS font stack of system condensed faces plus
   synthetic transform fallback - no webfont downloads), with tight tracking, subtle text shadows,
   slight italic slant for the score, and a consistent accent colour palette. Everything must remain

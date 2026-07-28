@@ -268,3 +268,56 @@ createGoals(ctx) -> {
 Career screen: level cards with a rendered thumbnail (a still framed by the level's
 `meta.camera`), goal checklist per level, lock state, career completion %, and the
 per-level high score. Feeds `levelManager.load(id)` and starts a session.
+
+---
+
+# DEMO SCOPE (supersedes the four-level career plan)
+
+The deliverable is a **single-map demo**, complete and polished, not a multi-level career:
+
+- **One level**: City Lot (`src/world/park.js`), art-directed to the reference frame below.
+- **Full trick vocabulary** — every air, grind, manual, lip and flatland trick in the trick table,
+  with a trick-list counter showing how many of the total the player has landed.
+- **2:00 timed runs**, restartable, with a results screen.
+- **Persistent high scores** (top 5, localStorage), plus a competition leaderboard the player
+  climbs during a run.
+- **Achievements, challenges and collectibles**: nine per-run goals, a persistent achievement
+  set, B-M-X-E-R letters and 5 hidden items.
+
+The other three levels stay designed in the section above but are NOT built for this demo.
+
+# ART DIRECTION TARGET
+
+`reference/target-look.png` (local, git-ignored) is the exact visual target. Read it before making
+any look decision. What it establishes:
+
+- **Sky**: heavy overcast/dusk cloud deck with warm break-through light near the horizon, not a
+  clear blue sky. High dynamic range between cloud tops and shadowed ground.
+- **Ground**: weathered concrete with large **wet patches and standing puddles that mirror the sky
+  and skyline** — the single strongest element of the frame. Puddles need real reflection
+  (a reflector pass or planar/SSR-flavoured trick), darkened wet-edge borders and rippled roughness.
+- **Surfaces**: graffiti on nearly every vertical face — tags, throw-ups, pieces — plus event
+  banners and painted logos on the flat bank faces. Nothing is clean.
+- **Park**: interconnected concrete bowls, banks, quarterpipes, flat rails and pyramids in an open
+  plaza, with spectator areas and a scaffold/stage structure at the edge.
+- **Backdrop**: a real city — mid-rise blocks, an elevated freeway, palm trees, floodlight masts,
+  distant cranes — sitting in atmospheric haze behind the park.
+- **Rider**: reads large in frame from a close, slightly low chase camera; casual clothing
+  (tee, jeans, cap), dark anodised bike, strong silhouette against the bright sky.
+- **Grade**: cool shadows, warm highlights, gentle bloom on the sky, film-grade contrast.
+
+All branding in our version must be invented — no real trademarks, logos, event names or real
+rider names anywhere.
+
+# HUD LAYOUT (match the reference)
+
+- **Top-left**: `SCORE:` label with a large gold numeral; directly beneath, a horizontal
+  **SPECIAL** meter with an orange gradient fill and a segmented outline.
+- **Below that**: a five-row **competition leaderboard** — rank, invented rival name, score,
+  with the player's row highlighted and re-sorting live as the score climbs.
+- **Top-centre**: the run timer in a large clean numeral (`1:24`).
+- **Top-right**: `TRICK LIST` with a button hint, and beneath it `12 / 46` plus a difficulty tag.
+- **Bottom-centre**: the trick callout — gold `2,350 X 2` on the first line, the trick chain in
+  white italics beneath (`No Footed Can Can + Barspin`), animating in on each trick and slamming
+  out when the combo banks or is lost.
+- **Bottom-right**: an optional controller/keys hint.

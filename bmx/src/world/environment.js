@@ -112,7 +112,7 @@ const SkyShader = {
 
     uCloudDrift: { value: new THREE.Vector2(0, 0) },
     uCloudCover: { value: 0.42 },
-    uCloudScale: { value: 0.30 },
+    uCloudScale: { value: 1.10 },
     uCloudOpacity: { value: 0.95 },
     uCloudGain: { value: 1.35 },
     uCirrusCover: { value: 0.42 },
@@ -123,6 +123,8 @@ const SkyShader = {
     uHazeStrength: { value: 0.18 },
     uGroundColor: { value: new THREE.Color(0.19, 0.16, 0.13) },
     uGroundGain: { value: 1.6 },
+    uTwilightColor: { value: new THREE.Color(0.014, 0.033, 0.096) },
+    uTwilightStrength: { value: 0.0 },
     uNight: { value: 0.0 },
   },
 
@@ -180,6 +182,11 @@ const SkyShader = {
       float sunZenith = acos( clamp( max( vSunDirection.y, 0.0 ), -1.0, 1.0 ) );
       float sunInv = 1.0 / ( cos( sunZenith ) + 0.15 * pow( 93.885 - ( ( sunZenith * 180.0 ) / pi ), -1.253 ) );
       vec3 sunFex = exp( -( vBetaR * 8.4E3 * sunInv + vBetaM * 1.25E3 * sunInv ) );
+      // Preetham over-extinguishes the short wavelengths at grazing sun angles —
+      // by 6 degrees blue is three orders down and cloud tops go pure red. Floor
+      // each channel against the strongest so a low sun stays orange, not scarlet.
+      float sunFexMax = max( sunFex.r, max( sunFex.g, sunFex.b ) );
+      sunFex = max( sunFex, vec3( sunFexMax * 0.20 ) );
       // sun disc solid angle (~6.8e-5 sr) folded in, then the shared 0.04 scale
       vSunIrradiance = vSunE * 1.22 * sunFex * 0.04;
     }
@@ -213,6 +220,8 @@ const SkyShader = {
     uniform float uHazeStrength;
     uniform vec3 uGroundColor;
     uniform float uGroundGain;
+    uniform vec3 uTwilightColor;
+    uniform float uTwilightStrength;
     uniform float uNight;
 
     const float pi = 3.141592653589793;
@@ -254,24 +263,28 @@ const SkyShader = {
 
     const mat2 M2 = mat2( 0.86, 0.51, -0.51, 0.86 );
 
+    // Both fbm variants are normalised to 0..1 so the coverage thresholds below
+    // behave the same however many octaves are used.
     float fbm4( vec2 p ) {
-      float v = 0.0, a = 0.5;
+      float v = 0.0, a = 0.5, n = 0.0;
       for ( int i = 0; i < 4; i ++ ) {
         v += a * vnoise( p );
+        n += a;
         p = M2 * p * 2.06 + 11.3;
         a *= 0.5;
       }
-      return v;
+      return v / n;
     }
 
     float fbm6( vec2 p ) {
-      float v = 0.0, a = 0.5;
+      float v = 0.0, a = 0.5, n = 0.0;
       for ( int i = 0; i < 6; i ++ ) {
         v += a * vnoise( p );
+        n += a;
         p = M2 * p * 2.03 + 7.1;
         a *= 0.52;
       }
-      return v;
+      return v / n;
     }
 
     void main() {
@@ -290,12 +303,15 @@ const SkyShader = {
       vec3 betaMTheta = vBetaM * hgPhase( cosTheta, uMieDirectionalG );
       vec3 betaSum = vBetaR + vBetaM;
 
-      vec3 Lin = pow( vSunE * ( ( betaRTheta + betaMTheta ) / betaSum ) * ( 1.0 - Fex ), vec3( 1.5 ) );
-      Lin *= mix(
-        vec3( 1.0 ),
-        pow( vSunE * ( ( betaRTheta + betaMTheta ) / betaSum ) * Fex, vec3( 0.5 ) ),
-        clamp( pow( 1.0 - dot( up, vSunDirection ), 5.0 ), 0.0, 1.0 )
-      );
+      vec3 ratio = ( betaRTheta + betaMTheta ) / betaSum;
+      vec3 Lin = pow( vSunE * ratio * ( 1.0 - Fex ), vec3( 1.5 ) );
+
+      // Preetham's low-sun correction term goes green on the anti-sun horizon.
+      // Keep its luminance falloff, but only 45% of its chroma.
+      vec3 corr = pow( vSunE * ratio * Fex, vec3( 0.5 ) );
+      float corrL = dot( corr, vec3( 0.2126, 0.7152, 0.0722 ) );
+      float corrW = clamp( pow( 1.0 - dot( up, vSunDirection ), 5.0 ), 0.0, 0.6 );
+      Lin *= mix( vec3( 1.0 ), mix( vec3( corrL ), corr, 0.45 ), corrW );
 
       vec3 col = ( Lin + vec3( 0.09 ) * Fex ) * 0.04;
 
@@ -303,9 +319,12 @@ const SkyShader = {
       // extinguished colour in proportion to the Mie share of the scattering,
       // which is what actually makes a low sun glow orange.
       float mieShare = dot( betaMTheta, vec3( 1.0 ) ) / max( dot( betaRTheta + betaMTheta, vec3( 1.0 ) ), 1e-9 );
-      float aureoleW = pow( max( cosTheta, 0.0 ), 6.0 );
-      vec3 sunHue = vSunIrradiance / max( dot( vSunIrradiance, vec3( 0.3333 ) ), 1e-4 );
-      col = mix( col, col * sunHue, clamp( mieShare * 0.6 + aureoleW * 0.78, 0.0, 0.92 ) );
+      float aureoleW = pow( max( cosTheta, 0.0 ), 3.0 );
+      vec3 sunHue = clamp( vSunIrradiance / max( dot( vSunIrradiance, vec3( 0.2126, 0.7152, 0.0722 ) ), 1e-4 ), 0.0, 2.6 );
+      sunHue = mix( vec3( 1.0 ), sunHue, 0.88 );   // never fully kill a channel
+      // forward hemisphere only — the anti-sun sky must stay blue
+      float tintW = clamp( aureoleW * 0.9 + mieShare * 0.4 * max( cosTheta, 0.0 ), 0.0, 0.9 );
+      col = mix( col, col * sunHue, tintW );
 
       // direct sunlight reaching the cloud deck, already scaled to sky units
       vec3 sunIrr = vSunIrradiance;
@@ -324,25 +343,27 @@ const SkyShader = {
         vec2 warp = vec2( fbm4( cuv * 0.42 + 3.1 ), fbm4( cuv * 0.42 + 17.7 ) ) - 0.5;
         vec2 puv = cuv + warp * 1.35;
 
-        float base = fbm6( puv );
+        // value-noise fbm clusters around 0.5; stretch it before thresholding or
+        // the coverage control does nothing
+        float base = smoothstep( 0.36, 0.70, fbm6( puv ) );
         float thr = 1.0 - uCloudCover;
-        float shape = smoothstep( thr - 0.02, thr + 0.26, base );
+        float density = smoothstep( thr, thr + 0.22 * uCloudCover + 0.06, base );
 
         // erode the edges with a higher-frequency pass so silhouettes are wispy
-        float detail = fbm4( puv * 3.7 + 21.0 );
-        float density = clamp( shape - ( 1.0 - shape ) * detail * 0.55, 0.0, 1.0 );
-        density *= smoothstep( 0.0, 0.11, direction.y );
+        float detail = fbm4( puv * 3.4 + 21.0 );
+        density = clamp( density - ( 1.0 - density ) * ( detail - 0.34 ) * 1.1, 0.0, 1.0 );
+        density *= smoothstep( 0.0, 0.10, direction.y );
 
         if ( density > 0.002 ) {
           // fake self-shadowing: look up-sun through the field
           vec2 sunStep = normalize( vSunDirection.xz + vec2( 1e-4, 1e-4 ) ) * 0.55;
-          float upSun = fbm6( puv + sunStep );
-          float lit = smoothstep( -0.16, 0.20, upSun - base + 0.06 );
-          lit = mix( 0.32, 1.0, lit );
+          float upSun = smoothstep( 0.36, 0.70, fbm6( puv + sunStep ) );
+          float lit = smoothstep( -0.30, 0.16, upSun - base + 0.05 );
+          lit = mix( 0.30, 1.0, lit );
 
           // bases stay in shadow, tops catch the warm key
-          float tops = smoothstep( 0.10, 0.72, base );
-          lit = clamp( lit * ( 0.58 + 0.42 * tops ), 0.0, 1.0 );
+          float tops = smoothstep( 0.05, 0.85, base );
+          lit = clamp( lit * ( 0.55 + 0.45 * tops ), 0.0, 1.0 );
 
           // shadowed side is lit by the sky dome plus a little bounced sun
           float skyLum = dot( col, vec3( 0.2126, 0.7152, 0.0722 ) );
@@ -365,8 +386,8 @@ const SkyShader = {
       if ( direction.y > 0.02 && uCirrusCover > 0.001 ) {
         vec2 huv = direction.xz / ( direction.y + 0.09 ) * ( uCloudScale * 0.42 ) + uCloudDrift * 0.42;
         huv.x *= 0.30;                       // stretched, wind-combed streaks
-        float h = fbm4( huv * 1.9 + 41.0 );
-        float ha = smoothstep( 0.52, 0.86, h ) * uCirrusCover;
+        float h = smoothstep( 0.38, 0.68, fbm4( huv * 1.9 + 41.0 ) );
+        float ha = smoothstep( 0.55, 0.95, h ) * uCirrusCover;
         ha *= smoothstep( 0.02, 0.30, direction.y );
         vec3 hc = cloudLit * 1.18 + cloudLit * hgPhase( cosTheta, 0.62 ) * 0.9;
         col = mix( col, mix( col, hc, 0.72 ), ha * 0.55 );
@@ -376,6 +397,20 @@ const SkyShader = {
       float hz = pow( 1.0 - abs( direction.y ), 7.0 );
       float sunSide = 0.30 + 0.70 * pow( max( dot( normalize( direction.xz + 1e-5 ), normalize( vSunDirection.xz + 1e-5 ) ) * 0.5 + 0.5, 0.0 ), 2.2 );
       col += uHazeTint * hz * uHazeStrength * sunSide * ( 0.35 + 0.55 * sunLumV );
+
+      // --- twilight ----------------------------------------------------------
+      // Preetham's earth-shadow hack drops to zero the moment the sun sets, so
+      // hand back the residual scattered light that makes blue hour readable.
+      float twilight = smoothstep( 0.11, -0.15, vSunDirection.y ) * uTwilightStrength;
+      if ( twilight > 0.001 ) {
+        float azim = dot( normalize( direction.xz + 1e-5 ), normalize( vSunDirection.xz + 1e-5 ) ) * 0.5 + 0.5;
+        vec3 tw = uTwilightColor * ( 0.42 + 0.58 * pow( 1.0 - abs( direction.y ), 2.4 ) );
+        tw *= 0.55 + 0.85 * pow( azim, 2.0 );
+        // low warm afterglow hugging the horizon on the sun side
+        tw += uHazeTint * uTwilightColor.b * 2.6 * pow( azim, 5.0 ) * pow( max( 1.0 - abs( direction.y ) * 3.4, 0.0 ), 2.0 );
+        // specified in post-exposure units so the presets stay readable
+        col += tw * twilight / max( uSkyIntensity, 1e-3 );
+      }
 
       // --- ground bounce hemisphere (drives the lower half of the IBL) -------
       if ( direction.y < 0.02 ) {
@@ -497,25 +532,25 @@ function srgb(hex) { return new THREE.Color().setHex(hex, THREE.SRGBColorSpace);
 const TOD_STOPS = [
   { // 0.00 — dawn
     t: 0.00, elev: 1.2, azim: 84,
-    turbidity: 4.2, rayleigh: 3.3, mie: 0.0075, mieG: 0.9, skyIntensity: 0.19, skyRolloff: 0.46, sunDisc: 20, cloudGain: 2.0, groundGain: 1.5,
+    turbidity: 4.2, rayleigh: 3.3, mie: 0.0075, mieG: 0.9, skyIntensity: 0.28, skyRolloff: 0.5, sunDisc: 20, cloudGain: 4.5, groundGain: 1.5,
     sun: srgb(0xff9a58), sunIntensity: 0.9,
-    hemiSky: srgb(0x5d7196), hemiGround: srgb(0x4a3a2e), hemiIntensity: 0.55,
+    hemiSky: srgb(0x5d7196), hemiGround: srgb(0x4a3a2e), hemiIntensity: 0.30,
     rim: srgb(0x7f9ecb), rimIntensity: 0.22, bounce: srgb(0x8a6a4a), bounceIntensity: 0.16,
-    fog: srgb(0xb08a76), fogDensity: 0.0092,
+    fog: srgb(0x6e5347), fogDensity: 0.0092,
     haze: srgb(0xff8a4a), hazeStrength: 0.3, ground: srgb(0x3a3028),
-    cloudCover: 0.46, cirrus: 0.50, cloudLit: srgb(0xffc79a), cloudShadow: srgb(0x5a5a78),
-    exposure: 0.98, envIntensity: 1.0, practical: 0.55, night: 0.28, hazeGlow: 0.9,
+    cloudCover: 0.4, cirrus: 0.34, cloudLit: srgb(0xffd9b8), cloudShadow: srgb(0x5a5a78),
+    exposure: 0.98, envIntensity: 1.0, practical: 0.55, night: 0.28, hazeGlow: 0.9, twilight: srgb(0x22345c), twilightStrength: 1.05,
   },
   { // 0.14 — morning
     t: 0.14, elev: 15, azim: 95,
-    turbidity: 3.2, rayleigh: 2.5, mie: 0.0052, mieG: 0.885, skyIntensity: 0.17, skyRolloff: 0.44, sunDisc: 44, cloudGain: 1.3, groundGain: 1.6,
+    turbidity: 3.2, rayleigh: 2.5, mie: 0.0052, mieG: 0.885, skyIntensity: 0.17, skyRolloff: 0.44, sunDisc: 44, cloudGain: 1.5, groundGain: 1.6,
     sun: srgb(0xffc78d), sunIntensity: 2.35,
     hemiSky: srgb(0x8fb0dd), hemiGround: srgb(0x5c4b3a), hemiIntensity: 0.45,
     rim: srgb(0x9dbde8), rimIntensity: 0.26, bounce: srgb(0x9a7a55), bounceIntensity: 0.18,
     fog: srgb(0xc7b3a2), fogDensity: 0.0082,
     haze: srgb(0xffb27a), hazeStrength: 0.2, ground: srgb(0x4a4038),
     cloudCover: 0.43, cirrus: 0.44, cloudLit: srgb(0xfff0dc), cloudShadow: srgb(0x6c7896),
-    exposure: 1.00, envIntensity: 1.0, practical: 0.08, night: 0.0, hazeGlow: 0.55,
+    exposure: 1.00, envIntensity: 1.0, practical: 0.08, night: 0.0, hazeGlow: 0.55, twilight: srgb(0x22345c), twilightStrength: 0.0,
   },
   { // 0.33 — noon
     t: 0.33, elev: 66, azim: 176,
@@ -526,7 +561,7 @@ const TOD_STOPS = [
     fog: srgb(0xb9c8da), fogDensity: 0.0048,
     haze: srgb(0xd8dbe0), hazeStrength: 0.13, ground: srgb(0x565049),
     cloudCover: 0.36, cirrus: 0.34, cloudLit: srgb(0xffffff), cloudShadow: srgb(0x7c8aa8),
-    exposure: 1.00, envIntensity: 1.0, practical: 0.0, night: 0.0, hazeGlow: 0.35,
+    exposure: 1.00, envIntensity: 1.0, practical: 0.0, night: 0.0, hazeGlow: 0.35, twilight: srgb(0x2a3a60), twilightStrength: 0.0,
   },
   { // 0.52 — afternoon
     t: 0.52, elev: 43, azim: 226,
@@ -537,51 +572,51 @@ const TOD_STOPS = [
     fog: srgb(0xc2c6c9), fogDensity: 0.0055,
     haze: srgb(0xeccfa8), hazeStrength: 0.16, ground: srgb(0x554d43),
     cloudCover: 0.39, cirrus: 0.38, cloudLit: srgb(0xfff6e8), cloudShadow: srgb(0x74809c),
-    exposure: 1.02, envIntensity: 1.0, practical: 0.0, night: 0.0, hazeGlow: 0.5,
+    exposure: 1.02, envIntensity: 1.0, practical: 0.0, night: 0.0, hazeGlow: 0.5, twilight: srgb(0x2a3a60), twilightStrength: 0.0,
   },
   { // 0.68 — GOLDEN HOUR (default boot state, sun ~22 degrees)
     t: 0.68, elev: 22, azim: 252,
     turbidity: 3.1, rayleigh: 2.7, mie: 0.0046, mieG: 0.895, skyIntensity: 0.15, skyRolloff: 0.4, sunDisc: 40, cloudGain: 1.35, groundGain: 1.7,
-    sun: srgb(0xffcf9a), sunIntensity: 3.05,
+    sun: srgb(0xffdcb4), sunIntensity: 3.05,
     hemiSky: srgb(0x8fb4e8), hemiGround: srgb(0x7a5a3a), hemiIntensity: 0.42,
     rim: srgb(0x8fb2e6), rimIntensity: 0.30, bounce: srgb(0xc08d54), bounceIntensity: 0.28,
-    fog: srgb(0xd2b28c), fogDensity: 0.0056,
+    fog: srgb(0xc6a583), fogDensity: 0.0046,
     haze: srgb(0xffb069), hazeStrength: 0.24, ground: srgb(0x4e4237),
     cloudCover: 0.42, cirrus: 0.42, cloudLit: srgb(0xffd8a8), cloudShadow: srgb(0x5b6688),
-    exposure: 1.05, envIntensity: 1.0, practical: 0.0, night: 0.0, hazeGlow: 1.0,
+    exposure: 1.05, envIntensity: 1.0, practical: 0.0, night: 0.0, hazeGlow: 1.0, twilight: srgb(0x243a66), twilightStrength: 0.0,
   },
   { // 0.84 — low sun
     t: 0.84, elev: 6, azim: 268,
-    turbidity: 4.2, rayleigh: 3.4, mie: 0.0065, mieG: 0.905, skyIntensity: 0.18, skyRolloff: 0.45, sunDisc: 28, cloudGain: 1.95, groundGain: 1.7,
+    turbidity: 4.2, rayleigh: 3.4, mie: 0.0065, mieG: 0.905, skyIntensity: 0.18, skyRolloff: 0.45, sunDisc: 28, cloudGain: 3.6, groundGain: 1.7,
     sun: srgb(0xff9f61), sunIntensity: 1.95,
-    hemiSky: srgb(0x7a94c8), hemiGround: srgb(0x7d5334), hemiIntensity: 0.46,
+    hemiSky: srgb(0x7a94c8), hemiGround: srgb(0x7d5334), hemiIntensity: 0.30,
     rim: srgb(0x8098d0), rimIntensity: 0.30, bounce: srgb(0xc07a42), bounceIntensity: 0.26,
-    fog: srgb(0xd9996c), fogDensity: 0.0076,
+    fog: srgb(0xcc8f66), fogDensity: 0.0066,
     haze: srgb(0xff8a44), hazeStrength: 0.34, ground: srgb(0x453a31),
-    cloudCover: 0.47, cirrus: 0.48, cloudLit: srgb(0xffb173), cloudShadow: srgb(0x545e84),
-    exposure: 1.06, envIntensity: 1.0, practical: 0.22, night: 0.0, hazeGlow: 1.35,
+    cloudCover: 0.38, cirrus: 0.3, cloudLit: srgb(0xffdcc0), cloudShadow: srgb(0x545e84),
+    exposure: 1.06, envIntensity: 1.0, practical: 0.22, night: 0.0, hazeGlow: 1.35, twilight: srgb(0x243a66), twilightStrength: 0.06,
   },
   { // 0.93 — dusk
     t: 0.93, elev: -1.6, azim: 276,
-    turbidity: 5.2, rayleigh: 3.7, mie: 0.008, mieG: 0.91, skyIntensity: 0.195, skyRolloff: 0.5, sunDisc: 13, cloudGain: 2.6, groundGain: 1.6,
+    turbidity: 5.2, rayleigh: 3.7, mie: 0.008, mieG: 0.91, skyIntensity: 0.195, skyRolloff: 0.5, sunDisc: 13, cloudGain: 6.5, groundGain: 1.6,
     sun: srgb(0xff7a4e), sunIntensity: 0.52,
-    hemiSky: srgb(0x5a6a9c), hemiGround: srgb(0x5c4030), hemiIntensity: 0.48,
+    hemiSky: srgb(0x5a6a9c), hemiGround: srgb(0x5c4030), hemiIntensity: 0.24,
     rim: srgb(0x6d80b8), rimIntensity: 0.26, bounce: srgb(0x9a6038), bounceIntensity: 0.18,
-    fog: srgb(0x936d6c), fogDensity: 0.0108,
+    fog: srgb(0x4a3d48), fogDensity: 0.0108,
     haze: srgb(0xff6f3c), hazeStrength: 0.3, ground: srgb(0x332c27),
-    cloudCover: 0.48, cirrus: 0.50, cloudLit: srgb(0xff9d68), cloudShadow: srgb(0x424c70),
-    exposure: 1.10, envIntensity: 1.05, practical: 0.85, night: 0.35, hazeGlow: 1.1,
+    cloudCover: 0.4, cirrus: 0.32, cloudLit: srgb(0xffcbb0), cloudShadow: srgb(0x424c70),
+    exposure: 1.10, envIntensity: 1.05, practical: 0.85, night: 0.35, hazeGlow: 1.1, twilight: srgb(0x27406e), twilightStrength: 0.95,
   },
   { // 1.00 — blue hour
     t: 1.00, elev: -8, azim: 284,
-    turbidity: 4.2, rayleigh: 3.0, mie: 0.007, mieG: 0.9, skyIntensity: 0.2, skyRolloff: 0.56, sunDisc: 4, cloudGain: 3.0, groundGain: 1.5,
+    turbidity: 4.2, rayleigh: 3.0, mie: 0.007, mieG: 0.9, skyIntensity: 0.2, skyRolloff: 0.56, sunDisc: 4, cloudGain: 5.0, groundGain: 1.5,
     sun: srgb(0x6f83b4), sunIntensity: 0.10,
-    hemiSky: srgb(0x3f4e77), hemiGround: srgb(0x3b2c22), hemiIntensity: 0.42,
+    hemiSky: srgb(0x3f4e77), hemiGround: srgb(0x3b2c22), hemiIntensity: 0.18,
     rim: srgb(0x4c5e90), rimIntensity: 0.20, bounce: srgb(0x6a4630), bounceIntensity: 0.12,
-    fog: srgb(0x41506b), fogDensity: 0.0125,
+    fog: srgb(0x1e2740), fogDensity: 0.0125,
     haze: srgb(0x8a6a86), hazeStrength: 0.18, ground: srgb(0x22201f),
-    cloudCover: 0.45, cirrus: 0.46, cloudLit: srgb(0x8a90b4), cloudShadow: srgb(0x2c3450),
-    exposure: 1.16, envIntensity: 1.15, practical: 1.0, night: 1.0, hazeGlow: 0.5,
+    cloudCover: 0.4, cirrus: 0.34, cloudLit: srgb(0x9aa4c8), cloudShadow: srgb(0x2c3450),
+    exposure: 1.16, envIntensity: 1.15, practical: 1.0, night: 1.0, hazeGlow: 0.5, twilight: srgb(0x1d3260), twilightStrength: 1.05,
   },
 ];
 
@@ -592,9 +627,9 @@ const _numericKeys = [
   'skyRolloff', 'sunDisc', 'cloudGain', 'groundGain',
   'sunIntensity', 'hemiIntensity', 'rimIntensity', 'bounceIntensity',
   'fogDensity', 'hazeStrength', 'cloudCover', 'cirrus',
-  'exposure', 'envIntensity', 'practical', 'night', 'hazeGlow',
+  'exposure', 'envIntensity', 'practical', 'night', 'hazeGlow', 'twilightStrength',
 ];
-const _colorKeys = ['sun', 'hemiSky', 'hemiGround', 'rim', 'bounce', 'fog', 'haze', 'ground', 'cloudLit', 'cloudShadow'];
+const _colorKeys = ['sun', 'hemiSky', 'hemiGround', 'rim', 'bounce', 'fog', 'haze', 'ground', 'cloudLit', 'cloudShadow', 'twilight'];
 
 function makeBlankPreset() {
   const p = {};
@@ -633,7 +668,7 @@ const FALLBACK_UP = new THREE.Vector3(0, 0, 1);
 
 const SHADOW_HALF_EXTENT = 28;   // metres — 56 m across, ~13.7 mm/texel at 4096
 const SHADOW_DISTANCE = 72;
-const MAX_PRACTICALS = 10;
+const MAX_PRACTICALS = 8;
 
 export function createEnvironment(ctx) {
   const { scene, renderer, engine } = ctx;
@@ -649,7 +684,7 @@ export function createEnvironment(ctx) {
     fragmentShader: SkyShader.fragmentShader,
     side: THREE.BackSide,
     depthWrite: false,
-    depthTest: false,
+    depthTest: true,
     fog: false,
   });
   const SU = skyMaterial.uniforms;
@@ -658,7 +693,10 @@ export function createEnvironment(ctx) {
   sky.name = 'SkyDome';
   sky.scale.setScalar(6000);
   sky.frustumCulled = false;
-  sky.renderOrder = -1000;
+  // Drawn last among the opaques with depth test on: the dome sits exactly on
+  // the far plane, so it only shades pixels no geometry claimed. That keeps the
+  // (expensive) scattering + cloud shader off ~60% of the frame.
+  sky.renderOrder = 1000;
   sky.matrixAutoUpdate = false;
   sky.updateMatrix();
   scene.add(sky);
@@ -684,7 +722,9 @@ export function createEnvironment(ctx) {
 
   function regenerateEnvironment() {
     const prevDisc = SU.uShowSunDisc.value;
-    SU.uShowSunDisc.value = 0;         // a 18000x disc turns into PMREM ringing
+    // The disc is 40x brighter than the sky; leaving it in produces ringing in
+    // the roughness mips. The DirectionalLight already carries that energy.
+    SU.uShowSunDisc.value = 0;
     const prevRT = envRT;
     envRT = pmrem.fromScene(envScene, 0.02, 1, 20000);
     SU.uShowSunDisc.value = prevDisc;
@@ -696,7 +736,7 @@ export function createEnvironment(ctx) {
 
   // --- sun -----------------------------------------------------------------
   const shadowSize = clamp((engine.tier?.shadowMap ?? 2048) * 2, 1024, 4096);
-  const sun = new THREE.DirectionalLight(0xffcf9a, 3.05);
+  const sun = new THREE.DirectionalLight(0xffdcb4, 3.05);
   sun.name = 'SunLight';
   sun.castShadow = true;
   sun.shadow.mapSize.set(shadowSize, shadowSize);
@@ -773,7 +813,7 @@ export function createEnvironment(ctx) {
   scene.add(bulbs);
 
   for (let i = 0; i < MAX_PRACTICALS; i++) {
-    const l = new THREE.PointLight(0xffab63, 0, 30, 2);
+    const l = new THREE.PointLight(0xffab63, 0, 34, 2);
     l.name = `Practical${i}`;
     l.visible = false;
     l.castShadow = false;
@@ -867,6 +907,8 @@ export function createEnvironment(ctx) {
     SU.uHazeTint.value.copy(preset.haze);
     SU.uHazeStrength.value = preset.hazeStrength;
     SU.uGroundColor.value.copy(preset.ground);
+    SU.uTwilightColor.value.copy(preset.twilight);
+    SU.uTwilightStrength.value = preset.twilightStrength;
     SU.uNight.value = preset.night;
 
     // key light
@@ -993,7 +1035,7 @@ export function createEnvironment(ctx) {
       if (!lit || i >= bulbs.count) { p.light.visible = false; continue; }
       p.light.visible = true;
       const flick = 1 + Math.sin(cloudTime * p.rate + p.phase) * p.amp;
-      p.light.intensity = 26 * pf * flick;
+      p.light.intensity = 42 * pf * flick;
     }
 
     // deferred IBL refresh — never more than once every quarter second
@@ -1014,6 +1056,7 @@ export function createEnvironment(ctx) {
     bulbMaterial.dispose();
     bulbs.dispose();
 
+    sun.shadow.dispose();
     if (envRT) { envRT.dispose(); envRT = null; }
     pmrem.dispose();
 

@@ -33,7 +33,19 @@ const OWNED_FILES = [
 ]
 
 const REFERENCE = `
-REFERENCE STANDARD - what you are judging against.
+THE REFERENCE FRAME: /home/user/pendulum-timer/bmx/reference/target-look.png
+READ IT WITH THE READ TOOL FIRST - it renders as an image. It is a frame from a released commercial
+BMX game and it is the exact bar this project must meet. Study it before you look at our frames:
+the overcast dusk cloud deck, the wet concrete with puddles mirroring the skyline, the graffiti on
+every vertical face, the interconnected bowls and banks, the city backdrop with an elevated freeway
+and palms, the close low chase camera with the rider large in frame, and the HUD layout.
+
+THE BLIND A/B YOU MUST PERFORM: for each of our frames, ask whether a stranger shown our frame and
+the reference frame side by side, with no labels, would say ours or theirs is the better-looking
+game. Answer honestly and say exactly which visual property decided it. Do not grade on a curve for
+"it is procedural" or "it is WebGL".
+
+REFERENCE STANDARD - the wider bar.
 
 (a) Dave Mirra Freestyle BMX 2 (Acclaim, 2001, PS2/GameCube/Xbox). From memory of that title:
     chunky readable park geometry at real-world scale; solid warm outdoor lighting with baked-in
@@ -77,7 +89,7 @@ const FINDING_SCHEMA = {
   properties: {
     lens: { type: 'string' },
     score: { type: 'number', description: '0-10, 7 = shippable' },
-    blindAB: { type: 'string', enum: ['ours', 'theirs', 'toss-up'] },
+    blindAB: { type: 'string', enum: ['ours', 'theirs', 'toss-up'], description: 'blind side-by-side against reference/target-look.png' },
     blindABWhy: { type: 'string' },
     verdict: { type: 'string', enum: ['PASS', 'FAIL'] },
     findings: {
