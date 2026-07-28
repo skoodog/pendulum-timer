@@ -297,6 +297,23 @@ function capsule2(len, ra, rb, opts = {}) {
   return geo;
 }
 
+/** A muscle belly: a gaussian swell centred at `at` along a limb's 0..1 axis. */
+const bulge = (t, at, width, amt) => 1 + amt * Math.exp(-(((t - at) / width) ** 2));
+
+/**
+ * An orthonormal frame from a primary direction and a hint, used by every part
+ * that has to be built in the space of something else (a hand on a bar, a shoe
+ * on an ankle).
+ */
+function frameOf(dir, upHint) {
+  const y = dir.clone().normalize();
+  const z = upHint.clone().addScaledVector(y, -upHint.dot(y));
+  if (z.lengthSq() < 1e-9) z.set(0, 0, 1).addScaledVector(y, -y.z);
+  z.normalize();
+  const x = new THREE.Vector3().crossVectors(y, z).normalize();
+  return { x, y, z };
+}
+
 const _m4 = new THREE.Matrix4();
 const _q = new THREE.Quaternion();
 const _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3(), _v3 = new THREE.Vector3();
@@ -467,6 +484,20 @@ function mixc(a, b, t) {
 function lumOf(c) {
   const [r, g, b] = RGB(c);
   return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+}
+
+/**
+ * Cloth albedo floor. A "black" tee picked in the creator is 0x24262b — under
+ * 2 % reflectance, which crushes to pure black the moment the rider turns away
+ * from the sun and takes the fold and seam detail with it. Real black cotton
+ * sits nearer 5 %, so anything darker is lifted to that floor, keeping its hue.
+ * This is why the rider still reads as a rider in shadow.
+ */
+function fabricAlbedo(c, floor = 0.215) {
+  const l = lumOf(c);
+  if (l >= floor) return c;
+  const k = clamp((floor - l) / Math.max(1 - l, 1e-3), 0, 1);
+  return mixc(c, 0xf4f2ef, k * 0.94);
 }
 
 /** Ink that stays readable on `c` — used for every printed graphic. */
@@ -1375,50 +1406,119 @@ function hairSpeckle(c, x, y, rx, ry, colour, density, alpha) {
   c.restore();
 }
 
-function drawEye(c, x, y, ew, eh, iris, skin) {
-  const lid = shade(skin, -0.28);
-  // socket
-  blob(c, x, y + eh * 0.30, ew * 1.5, eh * 2.0, rgba(shade(skin, -0.30), 0.30), 0.9);
-  // sclera
+/**
+ * One eye, drawn at real scale: `sx`/`sy` are pixels per millimetre so the almond,
+ * the iris and the lids all keep their proportions whatever the atlas aspect is.
+ * `out` is +1 toward the outer canthus.
+ */
+function drawEye(c, x, y, sx, sy, out, iris, skin) {
+  const W = 15.5 * sx, H = 5.4 * sy;             // half opening: 31 mm × 11 mm
+  const inner = x - out * W, outer = x + out * W;
+  const irisR = 5.9;                             // 11.8 mm iris
+  const cxi = x + out * 0.6 * sx, cyi = y - 0.4 * sy;
+
+  // the lid opening as a path, reused for the fill, the clip and the lash line
+  const openPath = () => {
+    c.beginPath();
+    c.moveTo(inner, y + 0.9 * sy);
+    c.bezierCurveTo(x - out * W * 0.55, y - H * 1.30, x + out * W * 0.35, y - H * 1.24,
+      outer, y - 0.9 * sy);
+    c.bezierCurveTo(x + out * W * 0.42, y + H * 1.02, x - out * W * 0.45, y + H * 1.10,
+      inner, y + 0.9 * sy);
+    c.closePath();
+  };
+
   c.save();
-  c.beginPath();
-  c.moveTo(x - ew, y);
-  c.quadraticCurveTo(x - ew * 0.35, y - eh * 1.25, x + ew * 0.55, y - eh * 0.60);
-  c.quadraticCurveTo(x + ew, y - eh * 0.30, x + ew, y);
-  c.quadraticCurveTo(x + ew * 0.35, y + eh * 1.15, x - ew * 0.50, y + eh * 0.55);
-  c.quadraticCurveTo(x - ew * 0.92, y + eh * 0.30, x - ew, y);
-  c.closePath();
-  c.fillStyle = '#e9e5df'; c.fill();
+  openPath();
+  // sclera: never white — it is a wet grey that darkens into both corners
+  const scl = c.createLinearGradient(inner, y, outer, y);
+  scl.addColorStop(0.00, '#9a938c');
+  scl.addColorStop(0.22, '#d9d2c9');
+  scl.addColorStop(0.55, '#e6dfd5');
+  scl.addColorStop(1.00, '#a9a29a');
+  c.fillStyle = scl; c.fill();
   c.clip();
-  // iris + pupil
-  c.fillStyle = HEX(iris);
-  c.beginPath(); c.arc(x, y - eh * 0.04, eh * 0.92, 0, TAU); c.fill();
-  c.fillStyle = rgba(shade(iris, -0.55), 0.7);
-  c.beginPath(); c.arc(x, y - eh * 0.04, eh * 0.92, 0, TAU); c.lineWidth = eh * 0.22;
-  c.strokeStyle = rgba(shade(iris, -0.6), 0.8); c.stroke();
-  c.fillStyle = '#0d0e11';
-  c.beginPath(); c.arc(x, y - eh * 0.04, eh * 0.40, 0, TAU); c.fill();
-  c.fillStyle = 'rgba(255,255,255,0.85)';
-  c.beginPath(); c.arc(x - eh * 0.28, y - eh * 0.40, eh * 0.20, 0, TAU); c.fill();
-  // upper lid shadow inside the eye
-  c.fillStyle = rgba(lid, 0.42);
-  c.fillRect(x - ew, y - eh * 1.4, ew * 2, eh * 0.72);
+
+  // iris
+  const irx = irisR * sx, iry = irisR * sy;
+  const ig = c.createRadialGradient(cxi - irx * 0.25, cyi - iry * 0.3, irx * 0.1, cxi, cyi, irx);
+  ig.addColorStop(0, HEX(shade(iris, 0.42)));
+  ig.addColorStop(0.55, HEX(iris));
+  ig.addColorStop(1, HEX(shade(iris, -0.45)));
+  c.fillStyle = ig;
+  c.beginPath(); c.ellipse(cxi, cyi, irx, iry, 0, 0, TAU); c.fill();
+  // fibres
+  c.save();
+  c.beginPath(); c.ellipse(cxi, cyi, irx, iry, 0, 0, TAU); c.clip();
+  c.lineWidth = Math.max(1, irx * 0.10);
+  for (let i = 0; i < 26; i++) {
+    const a = (i / 26) * TAU + 0.13;
+    c.strokeStyle = rgba(i % 2 ? shade(iris, 0.5) : shade(iris, -0.5), 0.35);
+    c.beginPath();
+    c.moveTo(cxi + Math.cos(a) * irx * 0.30, cyi + Math.sin(a) * iry * 0.30);
+    c.lineTo(cxi + Math.cos(a) * irx * 1.0, cyi + Math.sin(a) * iry * 1.0);
+    c.stroke();
+  }
   c.restore();
-  // lash line
-  c.strokeStyle = rgba(0x14100e, 0.88);
-  c.lineWidth = Math.max(1.4, eh * 0.24);
+  // limbal ring, pupil, the light that bounces up into the bottom of the iris
+  c.strokeStyle = 'rgba(24,20,18,0.72)';
+  c.lineWidth = Math.max(1.2, irx * 0.16);
+  c.beginPath(); c.ellipse(cxi, cyi, irx * 0.94, iry * 0.94, 0, 0, TAU); c.stroke();
+  c.fillStyle = '#0a0b0e';
+  c.beginPath(); c.ellipse(cxi, cyi, irx * 0.42, iry * 0.42, 0, 0, TAU); c.fill();
+  c.fillStyle = rgba(shade(iris, 0.75), 0.30);
+  c.beginPath(); c.ellipse(cxi, cyi + iry * 0.42, irx * 0.52, iry * 0.36, 0, 0, TAU); c.fill();
+  // upper lid shadow across the top third of the eye
+  const ls = c.createLinearGradient(0, y - H * 1.5, 0, y + H * 0.35);
+  ls.addColorStop(0, 'rgba(28,20,16,0.62)');
+  ls.addColorStop(1, 'rgba(28,20,16,0)');
+  c.fillStyle = ls; c.fillRect(inner - W, y - H * 1.6, W * 3, H * 2.2);
+  // catchlight last, so nothing dulls it
+  c.fillStyle = 'rgba(255,253,247,0.92)';
+  c.beginPath();
+  c.ellipse(cxi - out * irx * 0.34, cyi - iry * 0.40, irx * 0.20, iry * 0.16, -0.4, 0, TAU);
+  c.fill();
+  c.fillStyle = 'rgba(255,253,247,0.34)';
+  c.beginPath();
+  c.ellipse(cxi + out * irx * 0.40, cyi + iry * 0.30, irx * 0.11, iry * 0.09, 0, 0, TAU);
+  c.fill();
+  c.restore();
+
+  // lash line: thin at the inner corner, heavy over the outer half
+  c.save();
   c.lineCap = 'round';
+  c.strokeStyle = 'rgba(20,15,13,0.92)';
+  c.lineWidth = Math.max(1.6, 1.05 * sy);
   c.beginPath();
-  c.moveTo(x - ew, y);
-  c.quadraticCurveTo(x - ew * 0.35, y - eh * 1.25, x + ew * 0.55, y - eh * 0.60);
-  c.quadraticCurveTo(x + ew * 0.86, y - eh * 0.34, x + ew, y);
+  c.moveTo(inner + out * 0.6 * sx, y + 0.6 * sy);
+  c.bezierCurveTo(x - out * W * 0.55, y - H * 1.34, x + out * W * 0.35, y - H * 1.28,
+    outer, y - 0.9 * sy);
   c.stroke();
-  // lower lid
-  c.strokeStyle = rgba(lid, 0.5);
-  c.lineWidth = Math.max(1, eh * 0.14);
+  c.strokeStyle = 'rgba(20,15,13,0.55)';
+  c.lineWidth = Math.max(1, 0.55 * sy);
   c.beginPath();
-  c.moveTo(x - ew * 0.9, y + eh * 0.12);
-  c.quadraticCurveTo(x, y + eh * 1.05, x + ew * 0.9, y + eh * 0.06);
+  c.moveTo(outer - out * 1.5 * sx, y - 0.6 * sy);
+  c.quadraticCurveTo(x + out * W * 0.35, y + H * 0.95, x - out * W * 0.35, y + H * 0.95);
+  c.stroke();
+  c.restore();
+  // wet rim under the eye, then the shadow the lid casts on the cheek
+  c.strokeStyle = rgba(shade(skin, 0.40), 0.55);
+  c.lineWidth = Math.max(1, 0.5 * sy);
+  c.beginPath();
+  c.moveTo(inner + out * 1.2 * sx, y + 1.4 * sy);
+  c.quadraticCurveTo(x, y + H * 1.35, outer - out * 1.2 * sx, y + 0.8 * sy);
+  c.stroke();
+  blob(c, x, y + H * 1.9, W * 0.95, 2.4 * sy, rgba(shade(skin, -0.42), 0.20), 0.9);
+  // tear duct
+  blob(c, inner + out * 1.0 * sx, y + 0.8 * sy, 1.7 * sx, 1.5 * sy,
+    rgba(mixc(skin, 0xa04a44, 0.55), 0.75), 0.95);
+  // upper lid crease and the lid skin above it
+  c.strokeStyle = rgba(shade(skin, -0.34), 0.45);
+  c.lineWidth = Math.max(1, 0.55 * sy);
+  c.beginPath();
+  c.moveTo(inner + out * 1.5 * sx, y - H * 1.05);
+  c.bezierCurveTo(x - out * W * 0.3, y - H * 2.55, x + out * W * 0.45, y - H * 2.35,
+    outer + out * 1.5 * sx, y - H * 0.65);
   c.stroke();
 }
 
@@ -1436,39 +1536,40 @@ function drawFacialHair(c, w, h, X) {
   };
   if (s === 'stubble') {
     c.save(); c.globalAlpha = 0.55;
-    hairSpeckle(c, fx(0.5), fy(0.375), w * 0.115, h * 0.085, col, 1500, 0.7);
+    hairSpeckle(c, fx(0.5), fy(0.150), w * 0.135, h * 0.105, col, 1800, 0.65);
+    hairSpeckle(c, fx(0.5), fy(0.272), w * 0.075, h * 0.030, col, 400, 0.6);
     c.restore();
   }
   if (s === 'moustache' || s === 'goatee' || s === 'shortBeard' || s === 'fullBeard' || s === 'horseshoe') {
-    put(0.5, 0.452, 0.052, 0.020, 0.95, 220);
+    put(0.5, 0.276, 0.055, 0.024, 0.95, 240);
   }
   if (s === 'soulPatch' || s === 'goatee' || s === 'shortBeard' || s === 'fullBeard') {
-    put(0.5, 0.345, 0.026, 0.024, 0.95, 160);
+    put(0.5, 0.132, 0.028, 0.026, 0.95, 160);
   }
   if (s === 'goatee' || s === 'shortBeard' || s === 'fullBeard') {
-    put(0.5, 0.315, 0.048, 0.045, 0.9, 320);
+    put(0.5, 0.090, 0.050, 0.050, 0.9, 340);
   }
   if (s === 'chinstrap' || s === 'shortBeard' || s === 'fullBeard' || s === 'muttonChops') {
     // along the jaw, both sides
     for (const sgn of [-1, 1]) {
       for (let i = 0; i <= 8; i++) {
         const t = i / 8;
-        const u = 0.5 + sgn * lerp(0.055, 0.235, t);
-        const v = lerp(0.300, 0.470, t * t);
-        const rv = s === 'fullBeard' ? 0.055 : s === 'muttonChops' ? 0.048 : 0.030;
+        const u = 0.5 + sgn * lerp(0.055, 0.245, t);
+        const v = lerp(0.075, 0.520, t * t);
+        const rv = s === 'fullBeard' ? 0.060 : s === 'muttonChops' ? 0.052 : 0.032;
         put(u, v, 0.030, rv, 0.88, 90);
       }
     }
   }
   if (s === 'fullBeard') {
-    put(0.5, 0.270, 0.085, 0.062, 0.92, 500);
-    put(0.5, 0.215, 0.060, 0.045, 0.85, 300);
+    put(0.5, 0.075, 0.090, 0.070, 0.92, 520);
+    put(0.5, 0.150, 0.070, 0.050, 0.85, 320);
   }
   if (s === 'horseshoe') {
     for (const sgn of [-1, 1]) {
       for (let i = 0; i <= 4; i++) {
         const t = i / 4;
-        put(0.5 + sgn * 0.052, lerp(0.440, 0.320, t), 0.020, 0.028, 0.9, 80);
+        put(0.5 + sgn * 0.055, lerp(0.262, 0.105, t), 0.021, 0.030, 0.9, 80);
       }
     }
   }
@@ -1481,23 +1582,42 @@ function riderRegions() {
     {
       key: 'SKIN', u: 2, sig: skinSig,
       colour: (c, w, h, X) => {
-        fill(c, w, h, HEX(X.skin));
+        const skin = X.skin;
+        fill(c, w, h, HEX(skin));
+        // blood under the surface: limbs are warm on their outer face and cooler
+        // where the light never reaches
+        const warm = mixc(skin, 0xc05a44, 0.22);
+        const cool = mixc(skin, 0x8b93ad, 0.18);
+        for (let i = 0; i < 70; i++) {
+          const up = rng() < 0.5;
+          blob(c, rand(0, w), rand(0, h), w * rand(0.05, 0.16), h * rand(0.03, 0.10),
+            rgba(up ? warm : cool, rand(0.05, 0.14)), 0.9);
+        }
         overlay(c, w, h, 0.09, 4);
-        chips(c, w, h, 46, rgba(shade(X.skin, -0.20), 0.45), 0.5, 1.8);
-        chips(c, w, h, 28, rgba(shade(X.skin, 0.22), 0.45), 0.6, 2.2);
+        chips(c, w, h, 70, rgba(shade(skin, -0.20), 0.35), 0.5, 1.8);
+        chips(c, w, h, 40, rgba(shade(skin, 0.22), 0.35), 0.6, 2.2);
+        // a few body hairs and freckles so bare skin is not a plastic surface
+        c.lineCap = 'round';
+        for (let i = 0; i < 130; i++) {
+          const x = rand(0, w), y = rand(0, h), a = rand(-0.6, 0.6);
+          c.strokeStyle = rgba(mixc(skin, 0x3a2418, 0.75), rand(0.05, 0.16));
+          c.lineWidth = rand(0.8, 1.6);
+          c.beginPath(); c.moveTo(x, y); c.lineTo(x + Math.sin(a) * 7, y + Math.cos(a) * 9); c.stroke();
+        }
         const sh = c.createLinearGradient(0, 0, 0, h);
-        sh.addColorStop(0, rgba(shade(X.skin, -0.42), 0.16));
-        sh.addColorStop(0.5, 'rgba(0,0,0,0)');
-        sh.addColorStop(1, rgba(shade(X.skin, -0.42), 0.16));
+        sh.addColorStop(0, rgba(shade(skin, -0.45), 0.26));       // into the sleeve
+        sh.addColorStop(0.35, 'rgba(0,0,0,0)');
+        sh.addColorStop(0.82, rgba(warm, 0.16));                  // warm at the extremity
+        sh.addColorStop(1, rgba(shade(skin, -0.40), 0.22));
         c.fillStyle = sh; c.fillRect(0, 0, w, h);
         // the sides of a limb catch less light than its front
         const side = c.createLinearGradient(0, 0, w, 0);
-        side.addColorStop(0, rgba(shade(X.skin, -0.5), 0.20));
+        side.addColorStop(0, rgba(shade(skin, -0.55), 0.34));
         side.addColorStop(0.25, 'rgba(0,0,0,0)');
-        side.addColorStop(0.5, rgba(shade(X.skin, -0.5), 0.20));
+        side.addColorStop(0.5, rgba(shade(skin, -0.55), 0.34));
         side.addColorStop(0.75, 'rgba(0,0,0,0)');
-        side.addColorStop(0.999, rgba(shade(X.skin, -0.5), 0.20));
-        side.addColorStop(1, rgba(shade(X.skin, -0.5), 0.20));
+        side.addColorStop(0.999, rgba(shade(skin, -0.55), 0.34));
+        side.addColorStop(1, rgba(shade(skin, -0.55), 0.34));
         c.fillStyle = side; c.fillRect(0, 0, w, h);
       },
       rough: (c, w, h) => { fill(c, w, h, '#b4b4b4'); overlay(c, w, h, 0.3, 5); },
@@ -1506,135 +1626,257 @@ function riderRegions() {
     },
     // ---------------------------------------------------------------- face
     {
-      key: 'FACE', u: 3,
+      key: 'FACE', u: 4,
       sig: (X) => `${X.skin}|${X.beard.style}|${X.beard.colour}|${X.hair.colour}|${X.hair.style}|${X.eye}`,
       colour: (c, w, h, X) => {
         const fx = (u) => u * w, fy = (v) => (1 - v) * h;
         const skin = X.skin;
+        const sx = w / 492.6, sy = h / 221;                 // pixels per millimetre
+        const mx = (mm) => w * 0.5 + mm * sx;
+        // Three tones drive the whole face: a cool forehead, a warm mid-face
+        // (blood is close to the surface across the nose and cheeks) and a
+        // desaturated jaw. Painting those first is what stops the head reading
+        // as a single flat swatch.
+        const warm = mixc(skin, 0xc85a48, 0.20);
+        const cool = mixc(skin, 0x8d94b0, 0.16);
+        const deep = shade(skin, -0.30);
         fill(c, w, h, HEX(skin));
-        // tonal map: warmer cheeks, cooler temples, darker under the jaw and at the back
+        blob(c, fx(0.5), fy(0.66), w * 0.150, h * 0.115, rgba(cool, 0.42), 0.95);
+        blob(c, fx(0.5), fy(0.40), w * 0.135, h * 0.115, rgba(warm, 0.40), 0.95);
+        blob(c, fx(0.5), fy(0.150), w * 0.115, h * 0.090, rgba(cool, 0.30), 0.95);
+        for (const sgn of [-1, 1]) {
+          blob(c, fx(0.5 + sgn * 0.105), fy(0.395), w * 0.075, h * 0.070, rgba(warm, 0.34), 0.95);
+          blob(c, fx(0.5 + sgn * FL.earU), fy(FL.earMid), w * 0.040, h * 0.070, rgba(warm, 0.45), 0.95);
+        }
+        // large-scale mottling — real skin is never one value
+        for (let i = 0; i < 46; i++) {
+          const u = rand(0.16, 0.84), v = rand(0.05, 0.95);
+          const up = rng() < 0.45;
+          blob(c, fx(u), fy(v), w * rand(0.02, 0.055), h * rand(0.02, 0.05),
+            rgba(up ? shade(skin, 0.16) : mixc(skin, 0x9a5a44, 0.30), rand(0.05, 0.13)), 0.9);
+        }
+        // the sides of the head turn away from every light
         const back = c.createLinearGradient(0, 0, w, 0);
-        back.addColorStop(0.00, rgba(shade(skin, -0.34), 0.55));
-        back.addColorStop(0.22, rgba(shade(skin, -0.16), 0.25));
+        back.addColorStop(0.00, rgba(shade(skin, -0.40), 0.62));
+        back.addColorStop(0.20, rgba(shade(skin, -0.20), 0.30));
         back.addColorStop(0.50, 'rgba(0,0,0,0)');
-        back.addColorStop(0.78, rgba(shade(skin, -0.16), 0.25));
-        back.addColorStop(1.00, rgba(shade(skin, -0.34), 0.55));
+        back.addColorStop(0.80, rgba(shade(skin, -0.20), 0.30));
+        back.addColorStop(1.00, rgba(shade(skin, -0.40), 0.62));
         c.fillStyle = back; c.fillRect(0, 0, w, h);
-        const vert = c.createLinearGradient(0, 0, 0, h);
-        vert.addColorStop(0, rgba(shade(skin, -0.30), 0.30));       // crown falls into hair
-        vert.addColorStop(0.35, 'rgba(0,0,0,0)');
-        vert.addColorStop(0.85, rgba(shade(skin, -0.40), 0.45));    // under the chin
-        c.fillStyle = vert; c.fillRect(0, 0, w, h);
-        blob(c, fx(0.42), fy(0.50), w * 0.055, h * 0.045, rgba(mixc(skin, 0xc4585a, 0.35), 0.22), 0.9);
-        blob(c, fx(0.58), fy(0.50), w * 0.055, h * 0.045, rgba(mixc(skin, 0xc4585a, 0.35), 0.22), 0.9);
-        overlay(c, w, h, 0.07, 6);
-        chips(c, w, h, 90, rgba(shade(skin, -0.22), 0.30), 0.6, 1.8);
 
-        // scalp under the hair mesh, so a thin cut never shows bare skin
-        // scalp: hair growing out of skin, not a wig — mixed toward the skin tone so
-        // a shaved side or a thin cut reads as stubble instead of paint
+        // --- baked occlusion: every crease and overhang the sun cannot reach ---
+        const ao = (u, v, ru, rv, a, rot = 0) =>
+          blob(c, fx(u), fy(v), w * ru, h * rv, rgba(deep, a), 0.92, rot);
+        ao(0.5, 0.02, 0.30, 0.070, 0.55);                    // under the jaw
+        ao(0.5, FL.chinCrease, 0.055, 0.016, 0.34);          // mentolabial crease
+        ao(0.5, FL.lipLow - 0.020, 0.055, 0.013, 0.40);      // under the lower lip
+        ao(0.5, FL.noseBase - 0.012, 0.030, 0.011, 0.45);    // under the nose
+        for (const sgn of [-1, 1]) {
+          ao(0.5 + sgn * 0.030, 0.412, 0.016, 0.055, 0.30, sgn * 0.10);   // side of the nose
+          ao(0.5 + sgn * 0.078, 0.265, 0.018, 0.045, 0.24, sgn * 0.35);   // nasolabial
+          ao(0.5 + sgn * 0.065, 0.548, 0.055, 0.017, 0.20);               // under the brow
+          ao(0.5 + sgn * 0.222, 0.632, 0.038, 0.045, 0.16);               // temple
+          ao(0.5 + sgn * (FL.earU - 0.035), FL.earMid, 0.022, 0.070, 0.34);  // in front of the ear
+          ao(0.5 + sgn * 0.150, 0.180, 0.045, 0.055, 0.30);               // jaw shadow
+        }
+        // the hair casts onto the forehead
+        const hairAO = c.createLinearGradient(0, fy(FL.hairline + 0.03), 0, fy(FL.hairline - 0.075));
+        hairAO.addColorStop(0, rgba(deep, 0.55));
+        hairAO.addColorStop(1, rgba(deep, 0));
+        c.fillStyle = hairAO;
+        c.fillRect(w * 0.18, fy(FL.hairline + 0.05), w * 0.64, h * 0.13);
+
+        overlay(c, w, h, 0.06, 7);
+        chips(c, w, h, 140, rgba(shade(skin, -0.20), 0.22), 0.5, 1.5);
+        chips(c, w, h, 60, rgba(mixc(skin, 0x8a4a30, 0.5), 0.22), 0.6, 2.0);
+
+        // --- scalp + sideburns ------------------------------------------------
         const scalpC = mixc(X.hair.colour, skin, 0.34);
-        const scalp = c.createLinearGradient(0, fy(0.80), 0, fy(0.66));
+        const scalp = c.createLinearGradient(0, fy(0.86), 0, fy(FL.hairline - 0.012));
         scalp.addColorStop(0, rgba(scalpC, X.hair.style === 'bald' ? 0.0 : 0.95));
         scalp.addColorStop(1, rgba(scalpC, 0.0));
-        c.fillStyle = scalp; c.fillRect(0, 0, w, fy(0.68));
+        c.fillStyle = scalp; c.fillRect(0, 0, w, fy(FL.hairline - 0.02));
         if (X.hair.style !== 'bald') {
-          // temples + sideburns
           for (const sgn of [-1, 1]) {
-            blob(c, fx(0.5 + sgn * 0.185), fy(0.660), w * 0.055, h * 0.075, rgba(X.hair.colour, 0.85), 0.9);
-            blob(c, fx(0.5 + sgn * 0.205), fy(0.560), w * 0.028, h * 0.055, rgba(X.hair.colour, 0.6), 0.8);
+            // sideburn: tight in front of the ear, fading out level with the tragus
+            blob(c, fx(0.5 + sgn * 0.252), fy(0.672), w * 0.042, h * 0.055, rgba(X.hair.colour, 0.80), 0.9);
+            blob(c, fx(0.5 + sgn * 0.266), fy(0.600), w * 0.020, h * 0.045, rgba(X.hair.colour, 0.50), 0.85);
+            hairSpeckle(c, fx(0.5 + sgn * 0.268), fy(0.578), w * 0.015, h * 0.030, X.hair.colour, 200, 0.40);
           }
-          hairSpeckle(c, fx(0.5), fy(0.735), w * 0.20, h * 0.035, X.hair.colour, 900, 0.5);
+          hairSpeckle(c, fx(0.5), fy(FL.hairline - 0.004), w * 0.185, h * 0.013, X.hair.colour, 700, 0.34);
         }
 
-        // brows
+        // --- brows ------------------------------------------------------------
+        const browC = mixc(X.beard.colour, X.hair.colour, 0.5);
+        for (const sgn of [-1, 1]) {
+          const x0 = mx(sgn * 5), x1 = mx(sgn * 22), x2 = mx(sgn * 36);
+          const y0 = fy(FL.brow - 0.008), y1 = fy(FL.brow + 0.016), y2 = fy(FL.brow + 0.002);
+          c.save();
+          c.globalAlpha = 0.55;
+          c.strokeStyle = HEX(shade(browC, -0.15));
+          c.lineWidth = 4.6 * sy; c.lineCap = 'round';
+          c.beginPath(); c.moveTo(x0, y0); c.quadraticCurveTo(x1, y1, x2, y2); c.stroke();
+          c.restore();
+          // individual hairs, sweeping up from the inner end and down at the tail
+          c.lineCap = 'round';
+          for (let i = 0; i < 120; i++) {
+            const t = i / 119;
+            const bx = x0 + (x2 - x0) * t;
+            const by = y0 + (y1 - y0) * 4 * t * (1 - t) + (y2 - y0) * t * t;
+            const jx = rand(-1.4, 1.4) * sx, jy = rand(-2.2, 2.2) * sy;
+            const len = lerp(4.2, 6.5, 1 - t) * sy;
+            const ang = lerp(-1.15, -0.15, t) * (sgn > 0 ? 1 : -1);
+            c.strokeStyle = rgba(rng() < 0.5 ? shade(browC, 0.22) : shade(browC, -0.30), rand(0.45, 0.9));
+            c.lineWidth = rand(0.7, 1.5) * sy;
+            c.beginPath();
+            c.moveTo(bx + jx, by + jy);
+            c.lineTo(bx + jx + Math.cos(ang) * len * sgn * 0.9, by + jy - Math.abs(Math.sin(ang)) * len * 0.55);
+            c.stroke();
+          }
+        }
+
+        // --- eyes -------------------------------------------------------------
+        drawEye(c, fx(0.5 - FL.eyeDX), fy(FL.eye), sx, sy, -1, X.eye, skin);
+        drawEye(c, fx(0.5 + FL.eyeDX), fy(FL.eye), sx, sy, +1, X.eye, skin);
+
+        // --- nose -------------------------------------------------------------
+        // The ridge is geometry; paint only adds the wing shadow, the tip
+        // highlight and the nostrils.
         for (const sgn of [-1, 1]) {
           c.save();
-          c.strokeStyle = rgba(mixc(X.beard.colour, X.hair.colour, 0.5), 0.9);
-          c.lineWidth = h * 0.019; c.lineCap = 'round';
+          c.globalAlpha = 0.26;
+          c.strokeStyle = HEX(shade(skin, -0.40));
+          c.lineWidth = 2.2 * sx; c.lineCap = 'round';
           c.beginPath();
-          c.moveTo(fx(0.5 + sgn * 0.018), fy(0.645));
-          c.quadraticCurveTo(fx(0.5 + sgn * 0.054), fy(0.668), fx(0.5 + sgn * 0.088), fy(0.646));
+          c.moveTo(mx(sgn * 4), fy(FL.noseRoot - 0.01));
+          c.quadraticCurveTo(mx(sgn * 5.5), fy(0.45), mx(sgn * 10), fy(FL.noseTip + 0.006));
           c.stroke();
           c.restore();
-          hairSpeckle(c, fx(0.5 + sgn * 0.053), fy(0.653), w * 0.034, h * 0.011,
-            mixc(X.beard.colour, X.hair.colour, 0.5), 340, 0.75);
-        }
-        // eyes
-        drawEye(c, fx(0.5 - 0.052), fy(0.606), w * 0.030, h * 0.019, X.eye, skin);
-        drawEye(c, fx(0.5 + 0.052), fy(0.606), w * 0.030, h * 0.019, X.eye, skin);
-
-        // nose: shading only — the ridge itself is real geometry
-        c.save();
-        c.globalAlpha = 0.30;
-        c.strokeStyle = HEX(shade(skin, -0.36)); c.lineWidth = h * 0.010; c.lineCap = 'round';
-        c.beginPath();
-        c.moveTo(fx(0.4805), fy(0.620)); c.quadraticCurveTo(fx(0.4775), fy(0.545), fx(0.4855), fy(0.492));
-        c.stroke();
-        c.beginPath();
-        c.moveTo(fx(0.5195), fy(0.620)); c.quadraticCurveTo(fx(0.5225), fy(0.545), fx(0.5145), fy(0.492));
-        c.stroke();
-        c.restore();
-        blob(c, fx(0.5), fy(0.470), w * 0.030, h * 0.014, rgba(shade(skin, -0.34), 0.32), 0.9);
-        blob(c, fx(0.5), fy(0.452), w * 0.026, h * 0.010, rgba(shade(skin, -0.55), 0.34), 0.9);
-        blob(c, fx(0.5), fy(0.498), w * 0.016, h * 0.016, rgba(shade(skin, 0.30), 0.22), 0.9);
-        c.fillStyle = rgba(shade(skin, -0.72), 0.75);
-        for (const sgn of [-1, 1]) {
+          blob(c, mx(sgn * 15), fy(FL.noseTip - 0.008), 5.0 * sx, 4.4 * sy,
+            rgba(shade(skin, -0.34), 0.36), 0.92);          // ala shadow
+          c.fillStyle = rgba(0x1a1210, 0.82);
           c.beginPath();
-          c.ellipse(fx(0.5 + sgn * 0.0155), fy(0.4705), w * 0.0055, h * 0.0055, sgn * 0.5, 0, TAU);
+          c.ellipse(mx(sgn * 8.4), fy(FL.noseBase - 0.004), 3.0 * sx, 2.1 * sy, sgn * 0.55, 0, TAU);
+          c.fill();
+          c.fillStyle = rgba(shade(skin, 0.30), 0.30);
+          c.beginPath();
+          c.ellipse(mx(sgn * 12.4), fy(FL.noseBase + 0.004), 3.6 * sx, 2.6 * sy, sgn * 0.4, 0, TAU);
           c.fill();
         }
-        // philtrum + mouth
-        c.save(); c.globalAlpha = 0.22; c.strokeStyle = HEX(shade(skin, -0.3)); c.lineWidth = h * 0.006;
-        c.beginPath(); c.moveTo(fx(0.5), fy(0.462)); c.lineTo(fx(0.5), fy(0.432)); c.stroke();
+        blob(c, fx(0.5), fy(FL.noseTip + 0.004), 6.0 * sx, 5.0 * sy, rgba(shade(skin, 0.34), 0.32), 0.9);
+        blob(c, fx(0.5), fy(FL.noseTip + 0.028), 3.0 * sx, 8.0 * sy, rgba(shade(skin, 0.24), 0.20), 0.9);
+
+        // --- mouth ------------------------------------------------------------
+        const lip = mixc(skin, 0xa8514a, 0.34);
+        const mw = FL.mouthW * w, my = fy(FL.mouth);
+        const lipTopY = fy(FL.lipTop), lipLowY = fy(FL.lipLow);
+        c.save();
+        c.beginPath();                                        // vermillion outline
+        c.moveTo(fx(0.5) - mw, my);
+        c.quadraticCurveTo(fx(0.5) - mw * 0.52, lipTopY - 1.0 * sy, fx(0.5) - mw * 0.17, lipTopY);
+        c.quadraticCurveTo(fx(0.5), lipTopY + 2.0 * sy, fx(0.5) + mw * 0.17, lipTopY);
+        c.quadraticCurveTo(fx(0.5) + mw * 0.52, lipTopY - 1.0 * sy, fx(0.5) + mw, my);
+        c.quadraticCurveTo(fx(0.5) + mw * 0.55, lipLowY, fx(0.5), lipLowY);
+        c.quadraticCurveTo(fx(0.5) - mw * 0.55, lipLowY, fx(0.5) - mw, my);
+        c.closePath();
+        const lg = c.createLinearGradient(0, lipTopY, 0, lipLowY);
+        lg.addColorStop(0.00, rgba(shade(lip, -0.22), 0.72));
+        lg.addColorStop(0.48, rgba(shade(lip, -0.30), 0.78));
+        lg.addColorStop(0.62, rgba(lip, 0.80));
+        lg.addColorStop(1.00, rgba(shade(lip, 0.10), 0.72));
+        c.fillStyle = lg; c.fill();
+        c.clip();
+        for (let i = 0; i < 60; i++) {                        // lip creases
+          const lx = fx(0.5) + rand(-mw, mw);
+          c.strokeStyle = rgba(shade(lip, -0.45), rand(0.10, 0.28));
+          c.lineWidth = rand(0.6, 1.4) * sx;
+          c.beginPath(); c.moveTo(lx, lipTopY); c.lineTo(lx + rand(-1, 1) * sx, lipLowY); c.stroke();
+        }
         c.restore();
-        const lip = mixc(skin, 0xa8443f, 0.42);
-        blob(c, fx(0.5), fy(0.417), w * 0.048, h * 0.020, rgba(lip, 0.55), 0.9);
-        c.strokeStyle = rgba(shade(lip, -0.55), 0.85);
-        c.lineWidth = h * 0.009; c.lineCap = 'round';
+        c.strokeStyle = rgba(shade(lip, -0.68), 0.70);        // the mouth line itself
+        c.lineWidth = 1.1 * sy; c.lineCap = 'round';
         c.beginPath();
-        c.moveTo(fx(0.4585), fy(0.418));
-        c.quadraticCurveTo(fx(0.5), fy(0.409), fx(0.5415), fy(0.418));
+        c.moveTo(fx(0.5) - mw * 0.96, my + 0.7 * sy);
+        c.quadraticCurveTo(fx(0.5) - mw * 0.45, my - 1.4 * sy, fx(0.5), my);
+        c.quadraticCurveTo(fx(0.5) + mw * 0.45, my - 1.4 * sy, fx(0.5) + mw * 0.96, my + 0.7 * sy);
         c.stroke();
-        // chin + jaw definition
-        blob(c, fx(0.5), fy(0.330), w * 0.048, h * 0.028, rgba(shade(skin, 0.18), 0.22), 0.8);
-        blob(c, fx(0.5), fy(0.372), w * 0.035, h * 0.014, rgba(shade(skin, -0.28), 0.22), 0.8);
-        // ears: shading only, the ear shells are separate geometry
-        for (const u of [0.245, 0.755]) {
-          blob(c, fx(u), fy(0.545), w * 0.026, h * 0.055, rgba(shade(skin, -0.30), 0.35), 0.9);
+        blob(c, fx(0.5), fy(FL.lipLow + 0.012), mw * 0.42, 2.0 * sy,
+          rgba(shade(lip, 0.65), 0.30), 0.9);                 // lower-lip highlight
+        for (const sgn of [-1, 1]) {                          // mouth corners
+          blob(c, fx(0.5) + sgn * mw * 0.98, my + 0.4 * sy, 2.2 * sx, 1.6 * sy,
+            rgba(shade(skin, -0.45), 0.26), 0.92);
+        }
+        c.save(); c.globalAlpha = 0.18;                       // philtrum
+        c.strokeStyle = HEX(shade(skin, -0.35)); c.lineWidth = 1.6 * sx;
+        c.beginPath();
+        c.moveTo(mx(-3.2), fy(FL.noseBase - 0.006)); c.lineTo(mx(-2.4), fy(FL.lipTop + 0.004));
+        c.moveTo(mx(3.2), fy(FL.noseBase - 0.006)); c.lineTo(mx(2.4), fy(FL.lipTop + 0.004));
+        c.stroke();
+        c.restore();
+
+        // --- chin, cheekbones, ears ------------------------------------------
+        blob(c, fx(0.5), fy(FL.chin + 0.016), w * 0.042, h * 0.026, rgba(shade(skin, 0.20), 0.22), 0.85);
+        for (const sgn of [-1, 1]) {
+          blob(c, fx(0.5 + sgn * 0.120), fy(0.455), w * 0.055, h * 0.035,
+            rgba(shade(skin, 0.16), 0.20), 0.85);             // cheekbone catch
+          blob(c, fx(0.5 + sgn * FL.earU), fy(FL.earMid - 0.05), w * 0.022, h * 0.030,
+            rgba(shade(skin, -0.34), 0.30), 0.9);             // behind the lobe
         }
         drawFacialHair(c, w, h, X);
+        overlay(c, w, h, 0.05, 3, _speck);
       },
       rough: (c, w, h, X) => {
         const fx = (u) => u * w, fy = (v) => (1 - v) * h;
-        fill(c, w, h, '#b0b0b0');
-        overlay(c, w, h, 0.3, 6);
+        const sx = w / 492.6, sy = h / 221;
+        fill(c, w, h, '#b8b8b8');
+        overlay(c, w, h, 0.28, 6);
         // sheen sits on the forehead, the nose ridge and the cheekbones — soft
         // falloffs only: any hard-edged rectangle here shows up as a visible
         // glossy patch on the face under a moving light.
-        blob(c, fx(0.5), fy(0.700), w * 0.115, h * 0.045, 'rgba(86,86,86,0.55)', 0.9);
-        blob(c, fx(0.5), fy(0.530), w * 0.030, h * 0.070, 'rgba(70,70,70,0.60)', 0.9);
+        blob(c, fx(0.5), fy(0.660), w * 0.120, h * 0.055, 'rgba(126,126,126,0.55)', 0.9);
+        blob(c, fx(0.5), fy(0.430), w * 0.022, h * 0.090, 'rgba(104,104,104,0.60)', 0.9);
+        blob(c, fx(0.5), fy(FL.noseTip), w * 0.016, h * 0.020, 'rgba(84,84,84,0.75)', 0.9);
         for (const sgn of [-1, 1]) {
-          blob(c, fx(0.5 + sgn * 0.088), fy(0.545), w * 0.045, h * 0.035, 'rgba(96,96,96,0.40)', 0.9);
+          blob(c, fx(0.5 + sgn * 0.115), fy(0.455), w * 0.050, h * 0.040, 'rgba(136,136,136,0.45)', 0.9);
+          blob(c, fx(0.5 + sgn * FL.eyeDX), fy(FL.eye), 12 * sx, 8 * sy, 'rgba(30,30,30,0.85)', 0.95);
         }
-        blob(c, fx(0.5), fy(0.415), w * 0.050, h * 0.020, 'rgba(60,60,60,0.55)', 0.9);
+        blob(c, fx(0.5), fy(FL.mouth), w * 0.048, h * 0.024, 'rgba(58,58,58,0.70)', 0.9);
+        blob(c, fx(0.5), fy(FL.chin + 0.02), w * 0.040, h * 0.024, 'rgba(150,150,150,0.35)', 0.9);
         if (X.hair.style !== 'bald') {
-          const g = c.createLinearGradient(0, fy(0.80), 0, fy(0.66));
-          g.addColorStop(0, 'rgba(214,214,214,0.65)');
-          g.addColorStop(1, 'rgba(214,214,214,0)');
-          c.fillStyle = g; c.fillRect(0, 0, w, fy(0.66));
+          const g = c.createLinearGradient(0, fy(0.88), 0, fy(FL.hairline - 0.01));
+          g.addColorStop(0, 'rgba(216,216,216,0.70)');
+          g.addColorStop(1, 'rgba(216,216,216,0)');
+          c.fillStyle = g; c.fillRect(0, 0, w, fy(FL.hairline - 0.01));
+        }
+        if (X.beard.coverage > 0.2) {
+          c.save(); c.globalAlpha = 0.6;
+          drawFacialHair(c, w, h, { ...X, beard: { ...X.beard, colour: 0xdcdcdc } });
+          c.restore();
         }
       },
-      hsig: (X) => `${X.beard.style}`,
+      hsig: (X) => `${X.beard.style}|${X.hair.style}`,
       height: (c, w, h, X) => {
         const fx = (u) => u * w, fy = (v) => (1 - v) * h;
+        const sx = w / 492.6, sy = h / 221;
         fill(c, w, h, '#808080');
-        overlay(c, w, h, 0.26, 10, _speck);
-        // lips and brows push out a touch, eye sockets sink
-        blob(c, fx(0.5), fy(0.417), w * 0.045, h * 0.018, 'rgba(190,190,190,0.9)', 0.9);
+        overlay(c, w, h, 0.22, 12, _speck);
+        // The skull already carries the big forms; the height map only adds what
+        // is too fine to tessellate — lash lines, lip edges, nostril rims, pores.
+        blob(c, fx(0.5), fy(FL.lipTop - 0.010), w * 0.044, h * 0.014, 'rgba(178,178,178,0.85)', 0.9);
+        blob(c, fx(0.5), fy(FL.lipLow + 0.012), w * 0.042, h * 0.013, 'rgba(184,184,184,0.85)', 0.9);
+        c.strokeStyle = 'rgba(66,66,66,0.9)'; c.lineWidth = 2.0 * sy; c.lineCap = 'round';
+        c.beginPath();
+        c.moveTo(fx(0.5) - FL.mouthW * w, fy(FL.mouth));
+        c.quadraticCurveTo(fx(0.5), fy(FL.mouth + 0.006), fx(0.5) + FL.mouthW * w, fy(FL.mouth));
+        c.stroke();
         for (const sgn of [-1, 1]) {
-          blob(c, fx(0.5 + sgn * 0.053), fy(0.658), w * 0.036, h * 0.012, 'rgba(178,178,178,0.9)', 0.9);
-          blob(c, fx(0.5 + sgn * 0.052), fy(0.606), w * 0.032, h * 0.016, 'rgba(96,96,96,0.9)', 0.9);
+          blob(c, fx(0.5 + sgn * 0.055), fy(FL.brow + 0.004), w * 0.038, h * 0.011, 'rgba(172,172,172,0.9)', 0.9);
+          blob(c, fx(0.5 + sgn * FL.eyeDX), fy(FL.eye + 0.012), 14 * sx, 4 * sy, 'rgba(96,96,96,0.8)', 0.9);
+          blob(c, fx(0.5 + sgn * FL.eyeDX), fy(FL.eye - 0.014), 14 * sx, 3 * sy, 'rgba(168,168,168,0.7)', 0.9);
+          c.fillStyle = 'rgba(52,52,52,0.9)';
+          c.beginPath();
+          c.ellipse(fx(0.5) + sgn * 8.4 * sx, fy(FL.noseBase - 0.004), 3.0 * sx, 2.1 * sy, sgn * 0.55, 0, TAU);
+          c.fill();
         }
         if (X.beard.coverage > 0.15) {
           c.save(); c.globalAlpha = clamp(X.beard.coverage, 0, 1);
@@ -1712,20 +1954,34 @@ function riderRegions() {
         c.fillStyle = HEX(T.body);
         c.fillRect(0, 0, w, yv(hem));
         overlay(c, w, h, 0.10, 3, _weaveTile);
-        // hem trim
-        c.fillStyle = HEX(T.trim);
-        c.fillRect(0, yv(hem), w, h * 0.016);
+        // hem: a turned-and-stitched band in the garment's own colour, and only a
+        // contrast band on the styles that actually have one
+        if (T.trimCuff) {
+          c.fillStyle = HEX(T.trim);
+          c.fillRect(0, yv(hem), w, h * 0.016);
+        } else {
+          c.fillStyle = rgba(shade(T.body, 0.10), 0.9);
+          c.fillRect(0, yv(hem) - h * 0.014, w, h * 0.014);
+          stitchLine(c, 0, yv(hem) - h * 0.016, w, yv(hem) - h * 0.016,
+            rgba(shade(T.body, 0.35), 0.5), 2, [6, 7]);
+        }
         c.fillStyle = rgba(shade(T.body, -0.5), 0.55);
-        c.fillRect(0, yv(hem) + h * 0.016, w, h * 0.010);
+        c.fillRect(0, yv(hem) + (T.trimCuff ? h * 0.016 : 0), w, h * 0.010);
         if (T.style === 'jersey') {
           c.fillStyle = rgba(T.trim, 0.85);
           c.fillRect(0, yv(hem + 0.030), w, h * 0.012);
         }
-        // collar
-        c.fillStyle = HEX(T.trim);
-        c.fillRect(0, 0, w, h * 0.030);
+        // Collar. v = 1 is also where the torso's own shoulder cap lands, so a
+        // contrast band up here shows as a pale patch behind the neck on a tee —
+        // only the styles with a real contrast collar get one.
+        c.fillStyle = T.trimCuff ? HEX(T.trim) : HEX(shade(T.body, 0.13));
+        c.fillRect(0, 0, w, h * 0.026);
+        for (let i = 0; i < 120; i++) {                      // rib knit
+          c.fillStyle = rgba(shade(T.body, i % 2 ? 0.24 : -0.16), 0.45);
+          c.fillRect((i / 120) * w, 0, w / 240, h * 0.026);
+        }
         c.fillStyle = rgba(shade(T.body, -0.45), 0.5);
-        c.fillRect(0, h * 0.030, w, h * 0.012);
+        c.fillRect(0, h * 0.026, w, h * 0.012);
         if (T.style === 'tank') {
           // bare shoulders: fade the garment out toward the armholes and the top
           const g2 = c.createLinearGradient(0, 0, 0, yv(0.74));
@@ -1755,21 +2011,47 @@ function riderRegions() {
             c.stroke();
           }
         }
-        folds(c, w, yv(hem), 16, rgba(shade(T.body, -0.65), 0.34), 0.55);
-        folds(c, w, yv(hem), 8, rgba(shade(T.body, 0.5), 0.14), 0.5);
-        // chest graphic at u = 0.25, back graphic at u = 0.75
+        // Print first, cloth shading second: a screen print sits IN the weave, so
+        // every fold and every shadow has to run across it, not under it.
         const ink = separate(T.trim, T.body, 0.20);
-        drawMark(c, w * 0.75, yv(0.615), h * 0.185, T.graphic, ink, T.body);
+        // Prints are flipped in the atlas. Measured, not assumed: type painted
+        // left-to-right here comes out right-to-left on the garment at BOTH the
+        // chest and the back, so every printed mark is drawn through a mirror
+        // about its own centre.
+        const printed = (fn, ux) => {
+          c.save();
+          c.translate(w * ux, 0); c.scale(-1, 1); c.translate(-w * ux, 0);
+          fn();
+          c.restore();
+        };
+        printed(() => drawMark(c, w * 0.75, yv(0.615), h * 0.185, T.graphic, ink, T.body), 0.75);
         if (T.graphic.mark !== 'none') {
-          drawMark(c, w * 0.25, yv(0.66), h * 0.180, T.graphic, ink, T.body);
-          text(c, 'MIRRA CITY', w * 0.25, yv(0.50), h * 0.030, rgba(ink, 0.8),
-            { spacing: h * 0.006, maxWidth: w * 0.22 });
+          printed(() => {
+            drawMark(c, w * 0.25, yv(0.66), h * 0.180, T.graphic, ink, T.body);
+            text(c, 'MIRRA CITY', w * 0.25, yv(0.50), h * 0.030, rgba(ink, 0.8),
+              { spacing: h * 0.006, maxWidth: w * 0.22 });
+          }, 0.25);
+        }
+        overlay(c, w, yv(hem), 0.14, 3, _weaveTile);
+        folds(c, w, yv(hem), 16, rgba(shade(T.body, -0.65), 0.38), 0.55);
+        folds(c, w, yv(hem), 8, rgba(shade(T.body, 0.5), 0.16), 0.5);
+        // the garment pulls into the armpits and drapes off the shoulders
+        for (const u0 of [0.02, 0.48]) {
+          const g3 = c.createLinearGradient(w * u0, 0, w * (u0 + 0.10), 0);
+          g3.addColorStop(0, rgba(shade(T.body, -0.55), 0.30));
+          g3.addColorStop(1, rgba(shade(T.body, -0.55), 0));
+          c.fillStyle = g3; c.fillRect(w * u0, 0, w * 0.10, yv(hem + 0.25));
         }
         overlay(c, w, h, 0.10, 4);
       },
       rough: (c, w, h, X) => {
         fill(c, w, h, X.top.style === 'jersey' ? '#d2d2d2' : '#f0f0f0');
         overlay(c, w, h, 0.25, 4);
+        // cloth is not uniformly matte: fold crests and the printed panel take a
+        // slightly tighter sheen than the flat weave around them
+        folds(c, w, h, 14, 'rgba(176,176,176,0.45)', 0.5);
+        blob(c, w * 0.75, h * 0.40, w * 0.10, h * 0.10, 'rgba(150,150,150,0.55)', 0.9);
+        blob(c, w * 0.25, h * 0.36, w * 0.10, h * 0.10, 'rgba(150,150,150,0.55)', 0.9);
       },
       hsig: (X) => `${X.top.style}|${X.top.graphic.mark}`,
       height: (c, w, h, X) => {
@@ -1784,7 +2066,9 @@ function riderRegions() {
     },
     // ---------------------------------------------------------------- sleeve
     {
-      key: 'SLEEVE', u: 1,
+      // 2 units, not 1: a 160 px band bleeds its neighbours into the lower mips
+      // and small parts mapped into it pick up the white trim next door.
+      key: 'SLEEVE', u: 2,
       sig: (X) => `${X.top.sleeve}|${X.top.trim}|${X.top.style}`,
       colour: (c, w, h, X) => {
         const T = X.top;
@@ -1803,12 +2087,17 @@ function riderRegions() {
         folds(c, w, h, 10, rgba(shade(T.sleeve, -0.6), 0.32), 0.55);
         overlay(c, w, h, 0.10, 3);
       },
-      rough: (c, w, h) => { fill(c, w, h, '#f0f0f0'); overlay(c, w, h, 0.25, 3); },
+      rough: (c, w, h) => {
+        fill(c, w, h, '#f0f0f0');
+        overlay(c, w, h, 0.25, 3);
+        folds(c, w, h, 10, 'rgba(180,180,180,0.45)', 0.5);
+      },
       hsig: () => 'k',
       height: (c, w, h) => {
         fill(c, w, h, '#808080');
         overlay(c, w, h, 0.5, 6, _weaveTile);
         folds(c, w, h, 12, '#4e4e4e', 0.6);
+        folds(c, w, h, 7, '#b8b8b8', 0.5);
       },
     },
     // ---------------------------------------------------------------- trim
@@ -1870,7 +2159,13 @@ function riderRegions() {
         overlay(c, w, h, 0.12, 4);
         chips(c, w, h, 30, rgba(shade(col, 0.6), 0.10), 2, 7);
       },
-      rough: (c, w, h) => { fill(c, w, h, '#efefef'); overlay(c, w, h, 0.3, 4); },
+      rough: (c, w, h, X) => {
+        fill(c, w, h, X.bottom.style === 'jeans' ? '#e6e6e6' : '#efefef');
+        overlay(c, w, h, 0.3, 4);
+        // denim polishes where it rubs: the crest of every fold and the knee
+        folds(c, w, h, 20, 'rgba(168,168,168,0.45)', 0.5);
+        blob(c, w * 0.25, h * 0.52, w * 0.16, h * 0.10, 'rgba(150,150,150,0.40)', 0.9);
+      },
       hsig: (X) => `${X.bottom.style}`,
       height: (c, w, h, X) => {
         fill(c, w, h, '#808080');
@@ -1889,27 +2184,54 @@ function riderRegions() {
         const col = X.shoe.colour;
         fill(c, w, h, HEX(col));
         overlay(c, w, h, 0.18, 4);
+        // Suede breaks up: the shoe is never one flat value, and the wear runs
+        // along the toe and the outside edge where a rider drags it.
+        for (let i = 0; i < 60; i++) {
+          blob(c, rand(0, w), rand(0, h), w * rand(0.03, 0.10), h * rand(0.02, 0.07),
+            rgba(rng() < 0.5 ? shade(col, 0.16) : shade(col, -0.20), rand(0.06, 0.16)), 0.9);
+        }
         // the shoe capsule runs heel(v=0) → toe(v=1); u = 0.5 is the top of the foot
         c.fillStyle = HEX(shade(col, -0.28));
         c.fillRect(0, 0, w, h * 0.14);                       // toe cap
+        c.fillStyle = rgba(shade(col, 0.30), 0.28);
+        c.fillRect(0, h * 0.03, w, h * 0.04);                // scuffed toe
         stitchLine(c, 0, h * 0.16, w, h * 0.16, rgba(shade(col, 0.45), 0.7), 2, [5, 5]);
-        // laces down the instep
+        stitchLine(c, 0, h * 0.60, w, h * 0.60, rgba(shade(col, 0.35), 0.5), 2, [6, 7]);
+        // eyestay panels either side of the instep
+        c.fillStyle = rgba(shade(col, -0.30), 0.85);
+        c.fillRect(w * 0.355, h * 0.22, w * 0.055, h * 0.62);
+        c.fillRect(w * 0.590, h * 0.22, w * 0.055, h * 0.62);
+        // tongue, under the laces
+        c.fillStyle = rgba(shade(col, 0.20), 0.55);
+        c.fillRect(w * 0.42, h * 0.22, w * 0.16, h * 0.62);
+        // laces down the instep. The strip at u ∈ [0.465, 0.535] is also what the
+        // lace GEOMETRY samples, so it stays pure lace colour.
         const lace = X.shoe.laces;
-        c.strokeStyle = HEX(lace); c.lineWidth = h * 0.030; c.lineCap = 'round';
+        c.fillStyle = HEX(lace);
+        c.fillRect(w * 0.462, h * 0.14, w * 0.078, h * 0.76);
+        c.save();
+        c.beginPath(); c.rect(w * 0.462, 0, w * 0.078, h); c.clip();
+        c.strokeStyle = rgba(shade(lace, -0.45), 0.5); c.lineWidth = 2;
+        for (let i = 0; i < 40; i++) {
+          const y = h * (0.14 + i * 0.019);
+          c.beginPath(); c.moveTo(w * 0.462, y); c.lineTo(w * 0.540, y + h * 0.010); c.stroke();
+        }
+        c.restore();
+        c.strokeStyle = HEX(lace); c.lineWidth = h * 0.028; c.lineCap = 'round';
         for (let i = 0; i < 5; i++) {
           const y = h * (0.28 + i * 0.115);
-          c.beginPath(); c.moveTo(w * 0.40, y); c.lineTo(w * 0.60, y + h * 0.045); c.stroke();
-          c.beginPath(); c.moveTo(w * 0.40, y + h * 0.045); c.lineTo(w * 0.60, y); c.stroke();
+          c.beginPath(); c.moveTo(w * 0.385, y); c.lineTo(w * 0.615, y + h * 0.045); c.stroke();
+          c.beginPath(); c.moveTo(w * 0.385, y + h * 0.045); c.lineTo(w * 0.615, y); c.stroke();
         }
-        c.fillStyle = HEX(shade(col, -0.55));
+        c.fillStyle = HEX(shade(col, -0.62));
         for (let i = 0; i < 5; i++) {
           const y = h * (0.28 + i * 0.115);
-          c.beginPath(); c.ellipse(w * 0.393, y, w * 0.010, h * 0.016, 0, 0, TAU); c.fill();
-          c.beginPath(); c.ellipse(w * 0.607, y, w * 0.010, h * 0.016, 0, 0, TAU); c.fill();
+          c.beginPath(); c.ellipse(w * 0.383, y, w * 0.010, h * 0.016, 0, 0, TAU); c.fill();
+          c.beginPath(); c.ellipse(w * 0.617, y, w * 0.010, h * 0.016, 0, 0, TAU); c.fill();
         }
-        // tongue + collar padding
-        c.fillStyle = rgba(shade(col, 0.20), 0.5);
-        c.fillRect(w * 0.44, h * 0.24, w * 0.12, h * 0.52);
+        // collar padding at the heel end
+        c.fillStyle = rgba(shade(col, 0.16), 0.45);
+        c.fillRect(0, h * 0.90, w, h * 0.10);
         // invented side stripe on both flanks
         for (const u0 of [0.18, 0.82]) {
           c.save();
@@ -2234,9 +2556,9 @@ function buildContext(profile, materials) {
     eye: eyeColourFor(P.hair.colour),
     top: {
       style: P.top.style,
-      body: P.top.colour,
-      sleeve: twoTone ? trim : P.top.colour,
-      trim,
+      body: fabricAlbedo(P.top.colour),
+      sleeve: fabricAlbedo(twoTone ? trim : P.top.colour),
+      trim: fabricAlbedo(trim, 0.19),
       sleeveLen: TOP_SLEEVE[P.top.style] ?? 0.45,
       loose: TOP_LOOSE[P.top.style] ?? 0.5,
       hood: P.top.style === 'hoodie',
@@ -2244,22 +2566,22 @@ function buildContext(profile, materials) {
       graphic: { mark: R.top.graphicMark, text: R.top.graphicText },
     },
     bottom: {
-      style: P.bottom.style, colour: P.bottom.colour,
+      style: P.bottom.style, colour: fabricAlbedo(P.bottom.colour, 0.20),
       length: BOTTOM_LEN[P.bottom.style] ?? 1,
       loose: BOTTOM_LOOSE[P.bottom.style] ?? 0.5,
       cuffed: P.bottom.style === 'joggers',
     },
     shoe: {
-      style: P.shoes.style, colour: P.shoes.colour, laces: P.shoes.laces,
+      style: P.shoes.style, colour: fabricAlbedo(P.shoes.colour, 0.185), laces: P.shoes.laces,
       sole: P.shoes.style === 'vulc' || P.shoes.style === 'skate' ? 0x9c6a34
         : P.shoes.style === 'boot' ? 0x2a2723 : 0xd8d6cf,
       bulk: SHOE_BULK[P.shoes.style] ?? 0.6,
       high: SHOE_HIGH[P.shoes.style] ?? 0,
     },
-    glove: { on: !!P.gloves.on, colour: P.gloves.colour },
-    pad: { ...P.pads, colour: 0x1a1c20 },
+    glove: { on: !!P.gloves.on, colour: fabricAlbedo(P.gloves.colour, 0.19) },
+    pad: { ...P.pads, colour: 0x2e3138 },
     lid: {
-      style: P.headwear, colour: P.headwearColour,
+      style: P.headwear, colour: fabricAlbedo(P.headwearColour, 0.185),
       covers: lidOpt.covers ?? 0, helmet: P.headwear === 'helmet',
     },
   };
@@ -3151,64 +3473,154 @@ function bustPass(geo, origin, axis, front, amount, centreT, width) {
 // ---------------------------------------------------------------------------
 
 /**
- * Head surface in local space (origin = head centre, +Z forward, +Y up).
- * a = azimuth, 0 at the face; v = 0 under the chin, 1 at the crown.
- * The brow, nose, cheekbones, jaw and occiput are real displacement, not paint.
+ * FACE LAYOUT — the single table both the skull sculpt and the face painter read.
+ * `t` is normalised head height: 0 = the underside of the jaw, 1 = the crown, and
+ * it is EXACTLY the v coordinate the head mesh carries, so a feature painted at
+ * FL.eye lands on the geometry that was sculpted at FL.eye. `u` is measured from
+ * the face centre (u = 0.5) as a fraction of the atlas width — one unit of u is
+ * one full turn around the head, so the offsets below are real millimetres
+ * divided by the circumference the head presents at the face.
  */
-function headSurface(a, v, R, S) {
-  const phi = (1 - v) * Math.PI;
-  const sp = Math.sin(phi), cp = Math.cos(phi);
-  const xn = Math.sin(a) * sp, yn = cp, zn = Math.cos(a) * sp;
-  let px = xn * 0.800 * R * S.wide;
-  let py = yn * 1.135 * R;
-  let pz = zn * 1.020 * R;
+// Heights come straight off a 221 mm head: hairline 47 mm above the eye line,
+// brow +14, nose base −46, mouth −68, chin point −100.
+const FL = {
+  crown: 1.000,
+  hairline: 0.728,
+  brow: 0.578,
+  eye: 0.515,
+  earTop: 0.615, earMid: 0.484, earLow: 0.352,
+  noseRoot: 0.596, noseTip: 0.334, noseBase: 0.307,
+  lipTop: 0.244, mouth: 0.2075, lipLow: 0.162,
+  chinCrease: 0.130, chin: 0.0625, jaw: 0.020,
+  eyeDX: 0.0650,          // pupil offset from centre  (≈ 63 mm interpupillary)
+  eyeW: 0.0310,           // half eye opening          (≈ 30 mm wide)
+  mouthW: 0.0516,         // half mouth width          (≈ 50 mm)
+  noseW: 0.0351,          // half width at the alae    (≈ 34 mm)
+  nostrilDX: 0.0186,
+  earU: 0.2980,           // ear centre offset from the face centre
+  yn: (t) => t * 2 - 1,
+};
 
-  // jaw + cheek taper below the ear line
-  if (yn < 0) {
-    const k = -yn;
-    px *= 1 - (0.46 - 0.14 * S.jaw) * k * k;
-    pz *= 1 - 0.16 * k * k;
-    py *= 1 + 0.030 * k;
+const _g = (x, s) => Math.exp(-((x / s) * (x / s)));
+
+/**
+ * Head surface in local space (origin = head centre, +Z forward, +Y up).
+ * `a` = azimuth, 0 at the face; `t` = normalised height (see FL above).
+ * Brow, sockets, cheekbones, nose, lips, chin, mandible and occiput are all real
+ * displacement — the paint only shades what the skull already does.
+ */
+function headSurface(a, t, R, S) {
+  const yn = clamp(t * 2 - 1, -1, 1);
+  const ring = Math.sqrt(Math.max(0, 1 - yn * yn));
+  const sa = Math.sin(a), ca = Math.cos(a);
+  const xn = sa * ring, zn = ca * ring;
+  const sgn = xn < 0 ? -1 : 1;
+  const ax = Math.abs(xn);
+  const front = clamp((zn - 0.02) / 0.45, 0, 1);           // how face-on this point is
+  let px = xn * 0.822 * R * S.wide;
+  let py = yn * 1.128 * R;
+  let pz = zn * 1.005 * R;
+
+  // --- cranium ---------------------------------------------------------------
+  if (yn > 0.42) {                                          // dome narrows and flattens
+    const k = (yn - 0.42) / 0.58;
+    px *= 1 - 0.20 * k * k;
+    pz *= 1 - 0.13 * k * k;
+    py -= k * k * 0.050 * R;
   }
-  // chin
-  const chin = Math.exp(-(((yn + 0.60) / 0.30) ** 2)) * Math.max(0, zn) * Math.exp(-((xn / 0.34) ** 2));
-  pz += chin * 0.013 * R / 0.098 * S.jaw;
-  py -= chin * 0.004 * R / 0.098;
-  // brow ridge
-  const brow = Math.exp(-(((yn - 0.28) / 0.16) ** 2)) * Math.max(0, zn - 0.20) * Math.exp(-((xn / 0.55) ** 2));
-  pz += brow * 0.0085 * R / 0.098 * S.brow;
-  // eye sockets sink either side of the nose
-  const socket = Math.exp(-(((yn - 0.16) / 0.14) ** 2)) *
-    Math.exp(-(((Math.abs(xn) - 0.30) / 0.16) ** 2)) * Math.max(0, zn);
-  pz -= socket * 0.006 * R / 0.098;
-  // cheekbones
-  const cheek = Math.exp(-(((yn + 0.02) / 0.20) ** 2)) *
-    Math.exp(-(((Math.abs(xn) - 0.52) / 0.22) ** 2)) * Math.max(0, zn * 0.6 + 0.2);
-  px += Math.sign(xn) * cheek * 0.005 * R / 0.098;
-  // nose
-  const nose = Math.exp(-((a / 0.22) ** 2)) * Math.exp(-(((yn - 0.02) / 0.17) ** 2));
-  pz += nose * 0.021 * R / 0.098;
-  py -= nose * 0.002 * R / 0.098;
-  const nostril = Math.exp(-((a / 0.34) ** 2)) * Math.exp(-(((yn + 0.16) / 0.07) ** 2));
-  px *= 1 + nostril * 0.10;
-  // occiput
-  const occ = Math.max(0, -zn) * Math.exp(-(((yn - 0.10) / 0.42) ** 2));
-  pz -= occ * 0.010 * R / 0.098;
-  // crown flattens a touch
-  if (yn > 0.72) py -= (yn - 0.72) * 0.030 * R / 0.098;
+  // the back of the skull is a plane, not a ball
+  pz += Math.max(0, -zn - 0.55) * _g(yn - 0.35, 0.55) * 0.10 * R;
+  px *= 1 - 0.050 * _g(yn - 0.40, 0.20) * Math.max(0, 1 - Math.abs(zn) * 1.15);   // temples
+  pz -= Math.max(0, -zn) * _g(yn - 0.14, 0.40) * 0.022 * R;                        // occiput
+
+  // --- mandible --------------------------------------------------------------
+  const jl = clamp((-0.20 - yn) / 0.72, 0, 1);
+  px *= 1 - (0.40 + 0.14 * (1 - S.jaw)) * Math.pow(jl, 1.55);
+  pz *= 1 - 0.14 * Math.pow(jl, 2.1);
+  if (yn < -0.70) {                                         // flat-ish under-jaw plane
+    const k = smoothstep(clamp((-0.70 - yn) / 0.30, 0, 1));
+    py = lerp(py, -0.90 * 1.128 * R, k * 0.62);
+    pz -= Math.max(0, -zn) * k * 0.12 * R;                  // clear the neck at the back
+  }
+  const gon = _g(yn + 0.60, 0.18) * _g(ax - 0.62, 0.30) * _g(zn + 0.05, 0.55);
+  px += sgn * gon * 0.045 * R * S.jaw;                      // gonial angle
+  // the mandible edge itself — a defined line from the chin back to the jaw angle
+  const jawEdge = _g(yn + 0.78, 0.115) * Math.max(0, zn + 0.35) * (0.4 + 0.6 * front);
+  px += sgn * jawEdge * 0.034 * R * S.jaw;
+  pz += jawEdge * 0.012 * R * S.jaw;
+
+  // --- chin ------------------------------------------------------------------
+  const chin = _g(yn + 0.875, 0.17) * Math.max(0, zn) * _g(xn, 0.34);
+  pz += chin * 0.115 * R * S.jaw;
+  py -= chin * 0.014 * R;
+  pz += _g(yn + 0.86, 0.10) * _g(xn, 0.17) * Math.max(0, zn) * 0.030 * R;   // chin button
+  pz -= _g(yn + 0.739, 0.075) * _g(xn, 0.26) * front * 0.042 * R;           // mentolabial crease
+
+  // --- mouth -----------------------------------------------------------------
+  const lipC = _g(xn, 0.40) * front;
+  pz += _g(yn + 0.55, 0.150) * lipC * 0.030 * R;            // the whole muzzle sits proud
+  pz += _g(yn + 0.549, 0.048) * lipC * 0.044 * R;           // upper lip
+  pz += _g(yn + 0.630, 0.052) * lipC * 0.052 * R;           // lower lip
+  pz -= _g(yn + 0.585, 0.019) * lipC * 0.040 * R;           // mouth line
+  pz -= _g(yn + 0.450, 0.042) * _g(xn, 0.060) * front * 0.022 * R;          // philtrum
+
+  // --- nose ------------------------------------------------------------------
+  // A swept ridge: half-width and forward reach both vary from root to base, and
+  // the cross-section is a rounded triangle, which is what gives a real nose its
+  // shadow line down each side instead of a painted stripe.
+  const nh = clamp((0.193 - yn) / 0.579, -0.4, 1.6);        // 0 at the root, 1 at the base
+  if (nh > -0.30 && nh < 1.45 && zn > -0.1) {
+    const halfW = lerp(0.075, 0.230, smoothstep(clamp(nh, 0, 1)));
+    const p = ax / halfW;
+    const across = Math.exp(-Math.pow(p, 2.5) * 1.35);
+    const along = smoothstep(clamp((nh + 0.06) / 0.26, 0, 1))
+      * (1 - smoothstep(clamp((nh - 0.96) / 0.26, 0, 1)));
+    const fwd = lerp(0.028, 0.185, smoothstep(clamp((nh - 0.10) / 0.66, 0, 1)));
+    pz += along * across * fwd * R * front;
+    // alae flare either side of the tip, nostrils cut in underneath
+    const ala = _g(nh - 0.95, 0.13) * _g(ax - 0.180, 0.080) * front;
+    px += sgn * ala * 0.030 * R;
+    pz += ala * 0.020 * R;
+    const nostril = _g(nh - 1.09, 0.09) * _g(ax - 0.110, 0.060) * front;
+    pz -= nostril * 0.032 * R;
+    py -= nostril * 0.006 * R;
+  }
+
+  // --- brow, sockets, eyes ---------------------------------------------------
+  const brow = _g(yn - 0.157, 0.105) * Math.max(0, zn - 0.22) * (0.50 + 0.50 * _g(ax - 0.30, 0.27));
+  pz += brow * 0.058 * R * S.brow;
+  const eyeX = ax - 0.315;
+  pz -= _g(yn - 0.030, 0.100) * _g(eyeX, 0.170) * Math.max(0, zn - 0.28) * 0.040 * R;   // socket
+  pz += _g(yn - 0.025, 0.065) * _g(eyeX, 0.100) * Math.max(0, zn - 0.42) * 0.032 * R;   // globe
+  pz -= _g(yn - 0.090, 0.028) * _g(eyeX, 0.090) * Math.max(0, zn - 0.42) * 0.014 * R;   // lid crease
+
+  // --- cheeks ----------------------------------------------------------------
+  const zyg = _g(yn + 0.170, 0.150) * _g(ax - 0.600, 0.245) * Math.max(0, zn * 0.65 + 0.35);
+  px += sgn * zyg * 0.042 * R;
+  pz += zyg * 0.016 * R;
+  const hollow = _g(yn + 0.400, 0.165) * _g(ax - 0.470, 0.230) * front;
+  pz -= hollow * 0.040 * R;
+  px -= sgn * hollow * 0.032 * R;
+  // nasolabial fold, and the soft pad of the cheek beside the mouth
+  pz -= _g(yn + 0.470, 0.070) * _g(ax - 0.225, 0.065) * front * 0.016 * R;
+  pz += _g(yn + 0.560, 0.100) * _g(ax - 0.300, 0.100) * front * 0.008 * R;
   return V(px, py, pz);
 }
 
 function buildHead(centre, R, S) {
-  const NU = 30, NV = 22;
+  const NU = 40, NV = 26;
   const pos = [], uvs = [], idx = [];
   for (let j = 0; j <= NV; j++) {
-    const v = j / NV;
+    const s = j / NV;
+    // Blend a polar distribution (rows bunch at the poles, so the crown and the
+    // under-jaw stay smooth) with a uniform-height one (rows bunch at the face,
+    // where every feature is), then hand the resulting height straight to the UV.
+    const t = clamp(lerp(0.5 - 0.5 * Math.cos(Math.PI * s), s, 0.55), 0, 1);
     for (let i = 0; i <= NU; i++) {
       const a = Math.PI - (i / NU) * TAU;
-      const p = headSurface(a, v, R, S).add(centre);
+      const p = headSurface(a, t, R, S).add(centre);
       pos.push(p.x, p.y, p.z);
-      uvs.push(i / NU, v);
+      uvs.push(i / NU, t);
     }
   }
   const w = NU + 1;
@@ -3226,38 +3638,117 @@ function buildHead(centre, R, S) {
   return geo;
 }
 
+/**
+ * A real ear: an oval lens against the skull with a curled helix rim, a sunken
+ * concha, a tragus and a free lobe. Two shells (outer + inner) joined at the rim,
+ * ~260 triangles, and it changes the head's silhouette from every angle.
+ */
 function buildEar(centre, R, S, side) {
-  const ear = new THREE.SphereGeometry(R * 0.245, 9, 7);
-  const p = ear.attributes.position;
-  for (let i = 0; i < p.count; i++) {
-    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
-    // flatten against the skull, notch the lobe, curl the helix
-    p.setXYZ(i, x * 0.26, y * 1.34 - (z > 0 ? 0 : R * 0.02), z * 0.70 - Math.max(0, y) * 0.14);
+  const NA = 18, NR = 5;
+  // local frame: `out` away from the skull, `up` along the ear's own long axis
+  // (tilted back at the top, as a real ear is), `fore` toward the face
+  const out = V(side * 0.972, 0.02, -0.235).normalize();
+  const up = V(-side * 0.055, 0.972, 0.228).normalize();
+  const fore = new THREE.Vector3().crossVectors(up, out).normalize().multiplyScalar(side);
+  // seated INTO the skull, so the front third of the shell is buried and the ear
+  // reads as part of the head rather than a card stuck to it
+  const at = headSurface(side * (Math.PI * 0.5 + 0.34), FL.earMid, R, S).add(centre)
+    .addScaledVector(out, -0.040 * R).addScaledVector(fore, -0.020 * R);
+  const rx = 0.190 * R, ry = 0.320 * R;
+
+  const pos = [], uvs = [], idx = [];
+  // θ = 0 toward the face, π/2 up, π back
+  const outline = (th) => {
+    const cth = Math.cos(th), sth = Math.sin(th);
+    // fuller and rounder at the back and top; the lobe is narrow and forward
+    const rr = 1 - 0.13 * Math.max(0, -sth) + 0.05 * Math.max(0, -cth);
+    return [cth * rx * rr * (1 - 0.10 * Math.max(0, -sth)), sth * ry * rr];
+  };
+  const point = (rho, th, shellOut) => {
+    const [bx, by] = outline(th);
+    const px = bx * rho, py = by * rho;
+    const cth = Math.cos(th), sth = Math.sin(th);
+    // helix rim rolls over from the front-top, round the back, into the lobe
+    const rimAmt = smoothstep(clamp((rho - 0.52) / 0.48, 0, 1));
+    const rimArc = smoothstep(clamp((th - 0.05) / 1.05, 0, 1))
+      * (1 - 0.50 * smoothstep(clamp((th - 4.60) / 1.20, 0, 1)));
+    // concha bowl, antihelix ridge behind it, tragus over the canal
+    const bowl = (1 - smoothstep(clamp((rho - 0.04) / 0.42, 0, 1))) * clamp(0.45 + cth * 0.75, 0, 1);
+    const anti = _g(rho - 0.50, 0.20) * clamp(0.30 - cth * 0.85, 0, 1) * Math.max(0, sth + 0.35);
+    const tragus = _g(rho - 0.30, 0.20) * _g(Math.atan2(Math.sin(th + 0.35), Math.cos(th + 0.35)), 0.45);
+    const d = 0.050 * R * rimAmt * rimArc + 0.020 * R * anti
+      - 0.052 * R * bowl + 0.026 * R * tragus;
+    const p = at.clone()
+      .addScaledVector(fore, px)
+      .addScaledVector(up, py)
+      .addScaledVector(out, shellOut > 0 ? d + 0.016 * R
+        : -0.014 * R - 0.020 * R * (1 - rho) * clamp(0.5 + Math.cos(th) * 0.9, 0, 1));
+    return p;
+  };
+  for (const shellOut of [1, -1]) {
+    const base = pos.length / 3;
+    for (let j = 0; j <= NR; j++) {
+      const rho = j / NR;
+      for (let i = 0; i <= NA; i++) {
+        const th = (i / NA) * TAU;
+        const p = point(rho, th, shellOut);
+        pos.push(p.x, p.y, p.z);
+        uvs.push(0.5 + Math.cos(th) * rho * 0.42, 0.5 + Math.sin(th) * rho * 0.46);
+      }
+    }
+    const w = NA + 1;
+    for (let j = 0; j < NR; j++) {
+      for (let i = 0; i < NA; i++) {
+        const A = base + j * w + i, B = A + w;
+        if (shellOut > 0) idx.push(A, B, A + 1, B, B + 1, A + 1);
+        else idx.push(A, A + 1, B, B, A + 1, B + 1);
+      }
+    }
   }
-  ear.computeVertexNormals();
-  const at = headSurface(side * Math.PI * 0.5, 0.555, R, S).add(centre);
-  ear.translate(at.x - side * R * 0.055, at.y - R * 0.03, at.z - R * 0.15);
-  return ear;
+  // close the helix: stitch the outer boundary ring to the inner one, otherwise
+  // the open edge shows as a bright sliver from behind
+  const wr = NA + 1;
+  const outerRim = NR * wr, innerRim = wr * (NR + 1) + NR * wr;
+  for (let i = 0; i < NA; i++) {
+    const A = outerRim + i, B = A + 1, C = innerRim + i, D = C + 1;
+    idx.push(A, C, B, C, D, B);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  return geo;
 }
 
+// `line` is the FRONT hairline in head-height units (see FL) — the shell drops
+// from there at the temples and again at the nape.
 const HAIR_SPEC = {
-  bald: { t: 0, line: 0.66 },
-  buzz: { t: 0.10, line: 0.605, noise: 0.10 },
-  short: { t: 0.22, line: 0.615, noise: 0.16 },
-  fade: { t: 0.30, line: 0.615, taper: 1.0, noise: 0.14 },
-  messy: { t: 0.42, line: 0.625, noise: 0.55, freq: 7 },
-  spikes: { t: 0.46, line: 0.630, noise: 0.90, freq: 11, spike: 1 },
-  curly: { t: 0.62, line: 0.630, noise: 0.62, freq: 9 },
-  afro: { t: 1.00, line: 0.620, noise: 0.40, freq: 8 },
-  mohawk: { t: 0.20, line: 0.605, crest: 1.5, noise: 0.30, freq: 6 },
-  longStraight: { t: 0.34, line: 0.620, curtain: 1.0, noise: 0.14 },
-  shag: { t: 0.46, line: 0.640, curtain: 0.55, noise: 0.45, freq: 8 },
-  ponytail: { t: 0.30, line: 0.640, tail: 1, noise: 0.12 },
-  bun: { t: 0.28, line: 0.640, bun: 1, noise: 0.12 },
-  braids: { t: 0.30, line: 0.620, strands: 8, curtain: 0.30, noise: 0.20 },
-  dreads: { t: 0.40, line: 0.620, strands: 12, curtain: 0.45, noise: 0.30 },
-  bowl: { t: 0.34, line: 0.585, noise: 0.10 },
+  bald: { t: 0, line: 0.760 },
+  buzz: { t: 0.14, line: 0.722, noise: 0.10 },
+  short: { t: 0.28, line: 0.730, noise: 0.18 },
+  fade: { t: 0.36, line: 0.730, taper: 1.0, noise: 0.14 },
+  messy: { t: 0.50, line: 0.738, noise: 0.55, freq: 7 },
+  spikes: { t: 0.54, line: 0.742, noise: 0.90, freq: 11, spike: 1 },
+  curly: { t: 0.70, line: 0.740, noise: 0.62, freq: 9 },
+  afro: { t: 1.05, line: 0.734, noise: 0.40, freq: 8 },
+  mohawk: { t: 0.26, line: 0.722, crest: 1.5, noise: 0.30, freq: 6 },
+  longStraight: { t: 0.40, line: 0.734, curtain: 1.0, noise: 0.14 },
+  shag: { t: 0.52, line: 0.744, curtain: 0.55, noise: 0.45, freq: 8 },
+  ponytail: { t: 0.36, line: 0.744, tail: 1, noise: 0.12 },
+  bun: { t: 0.34, line: 0.744, bun: 1, noise: 0.12 },
+  braids: { t: 0.36, line: 0.734, strands: 8, curtain: 0.30, noise: 0.20 },
+  dreads: { t: 0.46, line: 0.734, strands: 12, curtain: 0.45, noise: 0.30 },
+  bowl: { t: 0.40, line: 0.706, noise: 0.10 },
 };
+
+/** How far the hair shell stands off the skull — headwear has to clear this. */
+function hairThickness(X, R) {
+  const spec = HAIR_SPEC[X.hair.style] || HAIR_SPEC.short;
+  if (!spec.t) return 0;
+  const vol = clamp(X.hair.volume, 0.05, 1);
+  return 0.034 * spec.t * (0.6 + 0.7 * vol) * (R / 0.098);
+}
 
 /**
  * A fitted hair shell: a closed cap that follows the skull, thick where the style
@@ -3267,9 +3758,8 @@ const HAIR_SPEC = {
 function buildHair(centre, R, S, X, coverV) {
   const spec = HAIR_SPEC[X.hair.style] || HAIR_SPEC.short;
   if (!spec.t) return null;
-  const vol = clamp(X.hair.volume, 0.05, 1);
   const NU = 26, NV = 9, NC = spec.curtain ? 6 : 0;
-  const thickBase = 0.030 * spec.t * (0.6 + 0.7 * vol) * (R / 0.098);
+  const thickBase = hairThickness(X, R);
   const noiseAmp = (spec.noise ?? 0.2) * thickBase * 1.1;
   const freq = spec.freq ?? 5;
   const parts = [];
@@ -3277,7 +3767,10 @@ function buildHair(centre, R, S, X, coverV) {
   const lineAt = (a) => {
     // lower at the temples, lower again at the nape
     const f = Math.cos(a);                        // 1 front, -1 back
-    let v = spec.line - 0.055 * (1 - Math.abs(f)) - (f < 0 ? 0.075 : 0);
+    // the temple drop stays ABOVE FL.earTop: hair goes around an ear, not over it
+    let v = spec.line - 0.070 * (1 - Math.abs(f)) - (f < 0 ? 0.185 : 0);
+    // a widow's peak: the front line dips a touch dead centre
+    if (f > 0.6) v += 0.010 * _g(Math.sin(a), 0.22);
     if (spec.crest) {
       // a mohawk is a strip: away from the sagittal line the shell pinches shut
       // at the crown, leaving the shaved sides to the scalp paint underneath
@@ -3288,9 +3781,10 @@ function buildHair(centre, R, S, X, coverV) {
   };
   const thickAt = (a, v) => {
     let t = thickBase;
-    if (spec.taper) t *= lerp(0.25, 1.0, smoothstep(clamp((v - 0.62) / 0.32, 0, 1)));
+    if (spec.taper) t *= lerp(0.25, 1.0, smoothstep(clamp((v - 0.72) / 0.22, 0, 1)));
     if (spec.crest) {
-      const xn = Math.abs(Math.sin(a) * Math.sin((1 - v) * Math.PI));
+      const yn = v * 2 - 1;
+      const xn = Math.abs(Math.sin(a) * Math.sqrt(Math.max(0, 1 - yn * yn)));
       t = thickBase * (0.18 + spec.crest * Math.exp(-((xn / 0.20) ** 2)) * 2.2);
     }
     const n = fbm2(Math.cos(a) * freq + 3.1, Math.sin(a) * freq + v * freq * 1.4, 3) - 0.5;
@@ -3415,8 +3909,8 @@ function buildBeardShell(centre, R, S, X) {
   if (cov < 0.45) return null;
   const NU = 22, NV = 8;
   const aMax = Math.acos(0.40);
-  const vTop = (f) => 0.372 + 0.150 * (1 - f);              // f = cos(a)
-  const vBot = (f) => 0.150 + 0.045 * (1 - f);
+  const vTop = (f) => 0.150 + 0.667 * (1 - f);              // f = cos(a)
+  const vBot = (f) => 0.030 + 0.080 * (1 - f);
   const pos = [], uvs = [], idx = [];
   for (let j = 0; j <= NV; j++) {
     const tv = j / NV;
@@ -3464,12 +3958,70 @@ function sheet(fn, NU, NV, uvFn) {
     }
   }
   const w = NU + 1;
+  const back = [];
   for (let j = 0; j < NV; j++) {
     for (let i = 0; i < NU; i++) {
       const A = j * w + i, B = A + w;
       idx.push(A, B, A + 1, B, B + 1, A + 1);
-      idx.push(A + 1, B, A, B + 1, B, A + 1);
+      back.push(A + 1, B, A, B + 1, B, A + 1);
     }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  // Normals FIRST, from the front winding only. Indexing both windings before
+  // computeVertexNormals makes every face normal cancel its twin, leaves the
+  // sheet with zero-length normals and renders it dead black.
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  geo.setIndex(idx.concat(back));
+  return geo;
+}
+
+/**
+ * A closed thin slab swept off a parametric surface: a front face, a back face
+ * offset along the surface normal, and a sealed rim. Unlike `sheet` it has real
+ * thickness, so a cap peak catches a highlight on top and goes dark underneath.
+ */
+function slab(fn, NU, NV, thick, uvFn) {
+  const eps = 0.004;
+  const P = (u, v) => fn(clamp(u, 0, 1), clamp(v, 0, 1));
+  const nAt = (u, v) => {
+    const du = P(u + eps, v).sub(P(u - eps, v));
+    const dv = P(u, v + eps).sub(P(u, v - eps));
+    const n = du.cross(dv);
+    return n.lengthSq() < 1e-14 ? V(0, 1, 0) : n.normalize();
+  };
+  const pos = [], uvs = [], idx = [];
+  const w = NU + 1, N = w * (NV + 1);
+  for (const layer of [0, 1]) {
+    for (let j = 0; j <= NV; j++) {
+      for (let i = 0; i <= NU; i++) {
+        const u = i / NU, v = j / NV;
+        const p = P(u, v).addScaledVector(nAt(u, v), layer ? -thick : 0);
+        pos.push(p.x, p.y, p.z);
+        const t = uvFn ? uvFn(u, v) : [u, v];
+        uvs.push(t[0], t[1] * (layer ? 0.92 : 1));
+      }
+    }
+  }
+  for (let j = 0; j < NV; j++) {
+    for (let i = 0; i < NU; i++) {
+      const A = j * w + i, B = A + w;
+      idx.push(A, B, A + 1, B, B + 1, A + 1);
+      const C = A + N, D = B + N;
+      idx.push(C, C + 1, D, D, C + 1, D + 1);
+    }
+  }
+  const edge = [];
+  for (let i = 0; i <= NU; i++) edge.push(NV * w + i);
+  for (let j = NV; j >= 0; j--) edge.push(j * w + NU);
+  for (let i = NU; i >= 0; i--) edge.push(i);
+  for (let j = 0; j <= NV; j++) edge.push(j * w);
+  for (let k = 0; k < edge.length - 1; k++) {
+    const a = edge[k], b = edge[k + 1];
+    if (a === b) continue;
+    idx.push(a, b, a + N, b, b + N, a + N);
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
@@ -3484,18 +4036,28 @@ function buildLid(centre, R, S, X) {
   const style = X.lid.style;
   if (style !== 'cap' && style !== 'capBackwards' && style !== 'beanie') return null;
   const beanie = style === 'beanie';
+  const backwards = style === 'capBackwards';
   const NU = 26, NV = beanie ? 8 : 6;
-  const lowV = beanie ? 0.575 : 0.640;
-  const thick = (beanie ? 0.020 : 0.013) * (R / 0.098);
+  const lowV = beanie ? 0.600 : backwards ? 0.640 : 0.632;
+  // Headwear rides ON the hair: the shell stands off the skull by its own
+  // thickness PLUS whatever the chosen cut puts under it, so a cap on an afro
+  // sits high and a cap on a buzz sits tight, and neither one clips through.
+  const thick = (beanie ? 0.017 : 0.010) * (R / 0.098) + hairThickness(X, R) * 1.05;
   const parts = [];
-  // a cap band rides high across the forehead and drops at the sides and nape
-  const lineAt = (a) => lowV + (beanie ? 0.085 : 0.082) * Math.max(0, Math.cos(a))
-    - (beanie ? 0.02 : 0.03) * Math.max(0, -Math.cos(a));
+  // a cap band rides across the forehead just above the brow and drops at the
+  // sides and the nape
+  // worn backwards the band rides up off the brow and drops at the nape
+  const lineAt = (a) => lowV + (beanie ? 0.070 : backwards ? 0.098 : 0.058) * Math.max(0, Math.cos(a))
+    - (beanie ? 0.028 : backwards ? 0.048 : 0.030) * Math.max(0, -Math.cos(a));
   const shell = (a, v) => {
     const base = headSurface(a, v, R, S);
     const nrm = base.clone().normalize();
-    const puff = beanie ? 1 + 0.10 * smoothstep(clamp((v - 0.6) / 0.4, 0, 1)) : 1.0;
-    return base.multiplyScalar(puff).addScaledVector(nrm, thick).add(centre);
+    const puff = beanie ? 1 + 0.10 * smoothstep(clamp((v - 0.72) / 0.28, 0, 1)) : 1.0;
+    // six panels joined by raised seams, and a crown that sits a touch flatter
+    // than the skull under it — a cap is stitched, not shrink-wrapped
+    const seam = beanie ? 0 : 0.0026 * R / 0.098 * Math.pow(Math.abs(Math.cos(3 * a)), 14);
+    const crown = beanie ? 0 : -0.010 * R / 0.098 * smoothstep(clamp((v - 0.88) / 0.12, 0, 1));
+    return base.multiplyScalar(puff).addScaledVector(nrm, thick + seam + crown).add(centre);
   };
   const pos = [], uvs = [], idx = [];
   for (let j = 0; j <= NV; j++) {
@@ -3515,9 +4077,13 @@ function buildLid(centre, R, S, X) {
     }
   }
   const rimStart = pos.length / 3;
+  const inset = hairThickness(X, R) * 0.92;
   for (let i = 0; i <= NU; i++) {
     const a = Math.PI - (i / NU) * TAU;
-    const inner = headSurface(a, lineAt(a), R, S).add(centre);
+    const base = headSurface(a, lineAt(a), R, S);
+    // the rolled edge closes onto the HAIR, not the scalp, so a cap never skirts
+    // down through a thick cut
+    const inner = base.addScaledVector(base.clone().normalize(), inset).add(centre);
     pos.push(inner.x, inner.y, inner.z);
     uvs.push(i / NU, -0.06);
   }
@@ -3543,22 +4109,162 @@ function buildLid(centre, R, S, X) {
     }, NU, 3, (u, t) => [u * 2, t * 0.35]);
     parts.push(band);
   } else {
-    // brim: a flat visor swept out of the front (or back) of the crown
+    // brim: a curved visor with real thickness, swept out of the band
     const back = style === 'capBackwards';
     const dir = back ? Math.PI : 0;
-    const span = 54 * DEG;
-    const len = 0.115 * (R / 0.098);
-    const brim = sheet((u, t) => {
-      const a = dir + lerp(-span, span, u);
-      const v = lineAt(a) + 0.035;
+    const span = 62 * DEG;
+    const len = (back ? 0.100 : 0.125) * (R / 0.098);
+    const brim = slab((u, t) => {
+      const s = (u - 0.5) * 2;                             // -1 … 1 across the peak
+      const a = dir + s * span;
+      const v = lineAt(a) + 0.030;
       const base = shell(a, v);
-      const out = V(Math.sin(a) * 0.55, -0.12, Math.cos(a)).normalize();
-      const droop = (back ? 0.16 : 0.30) * t * t;
-      return base.addScaledVector(out, len * t).add(V(0, -len * droop, 0));
-    }, 16, 3, (u, t) => [0.10 + u * 0.80, 0.82 + t * 0.16]);
+      const out = V(Math.sin(a) * 0.62, -0.16, Math.cos(a) * 0.98).normalize();
+      // the peak is shorter at its corners and curls down along its length
+      const reach = len * t * (1 - 0.30 * s * s);
+      const droop = (back ? 0.20 : 0.42) * t * t;
+      const curl = 0.055 * (R / 0.098) * s * s * t;        // side-to-side curve
+      return base.addScaledVector(out, reach)
+        .add(V(0, -len * droop - curl, 0));
+    }, 18, 4, 0.0075 * (R / 0.098), (u, t) => [0.10 + u * 0.80, 0.80 + t * 0.18]);
     parts.push(brim);
+    // crown button
+    const btn = new THREE.SphereGeometry(0.012 * (R / 0.098), 8, 6);
+    const top = shell(0, 0.999);
+    btn.scale(1, 0.7, 1);
+    btn.translate(top.x, top.y + 0.004, top.z);
+    parts.push(btn);
   }
   return merge(parts);
+}
+
+// ---------------------------------------------------------------------------
+// rider: hands and shoes — the two parts a close camera always lands on
+// ---------------------------------------------------------------------------
+
+/**
+ * A closed fist on a bar. The palm lies along the bar, four fingers curl over
+ * the front and tuck under, the thumb crosses the front diagonally toward the
+ * fingertips, and the knuckle row stands proud. ~520 triangles.
+ */
+function buildFist(wrist, barDir, handR, glove) {
+  const F = frameOf(barDir, V(0, 1, 0));
+  const along = F.y, up = F.z, fwd = F.x;
+  const parts = [];
+  const g = glove ? 1.08 : 1.0;
+  // palm: from just inboard of the wrist to the far side of the fist
+  const a0 = wrist.clone().addScaledVector(along, -handR * 0.22);
+  const a1 = wrist.clone().addScaledVector(along, handR * 1.55);
+  parts.push(placeZ(capsule2(a0.distanceTo(a1), handR * 0.70 * g, handR * 0.64 * g, {
+    radial: 10, capSegs: 3, bodyRings: 3,
+    mid: (t) => 1 + 0.10 * Math.sin(t * Math.PI),
+    shape: (t) => [lerp(0.78, 0.70, t), lerp(0.98, 1.06, t)],
+  }), a0, a1, up));
+
+  // the grip axis the fingers close around, a little forward and below the palm
+  const centre = wrist.clone().addScaledVector(along, handR * 0.62)
+    .addScaledVector(fwd, handR * 0.30).addScaledVector(up, -handR * 0.18);
+  const at = (s, deg, r) => centre.clone()
+    .addScaledVector(along, s)
+    .addScaledVector(up, Math.cos(deg * DEG) * r)
+    .addScaledVector(fwd, Math.sin(deg * DEG) * r);
+
+  for (let i = 0; i < 4; i++) {
+    const t = i / 3;
+    const s = lerp(-handR * 0.42, handR * 0.72, t);
+    const fr = handR * lerp(0.215, 0.170, t) * g;         // index thickest
+    const reach = lerp(1.00, 0.90, Math.abs(t - 0.35) * 1.2);
+    parts.push(sweep([
+      at(s, 8, handR * 0.86 * reach),
+      at(s, 62, handR * 0.94 * reach),
+      at(s * 0.94, 118, handR * 0.80 * reach),
+      at(s * 0.86, 168, handR * 0.52 * reach),
+    ], { radius: fr, radial: 6, steps: 7, taper: (k) => lerp(1.0, 0.78, k) }));
+    // knuckle
+    const kn = new THREE.SphereGeometry(fr * 1.18, 7, 5);
+    const kp = at(s, 6, handR * 0.90 * reach);
+    kn.translate(kp.x, kp.y, kp.z);
+    parts.push(kn);
+  }
+  // thumb: base pad at the inboard back, wrapping across the front
+  parts.push(sweep([
+    at(-handR * 0.52, -66, handR * 0.80),
+    at(-handR * 0.20, -14, handR * 0.95),
+    at(handR * 0.28, 44, handR * 0.94),
+    at(handR * 0.66, 86, handR * 0.80),
+  ], { radius: handR * 0.255 * g, radial: 7, steps: 7, taper: (k) => lerp(1.05, 0.72, k) }));
+  return merge(parts);
+}
+
+/**
+ * A skate shoe: moulded sole with a raised heel and a toe bumper, an upper with
+ * a real toe box, a padded collar, a tongue and four crossed laces.
+ * Returns the parts split by atlas region.
+ */
+function buildShoe(ankle, toe, hs, X, side) {
+  const bulk = lerp(0.92, 1.14, X.shoe.bulk);
+  const high = X.shoe.high;
+  const F = frameOf(toe.clone().sub(ankle).setY(toe.y - ankle.y), V(0, 1, 0));
+  const fwd = F.y;                                        // heel → toe
+  const up = F.z;
+  const side3 = F.x;
+  const foot = ankle.distanceTo(toe);
+  const heel = ankle.clone().addScaledVector(fwd, -foot * 0.42).addScaledVector(up, -0.052 * hs);
+  const tip = toe.clone().addScaledVector(fwd, foot * 0.16).addScaledVector(up, -0.030 * hs);
+  const len = heel.distanceTo(tip);
+  // the atlas expects u = 0.5 on the instep, which means the capsules are laid
+  // out with their local +Z pointing DOWN
+  const down = up.clone().negate();
+  const upper = [], sole = [], lace = [];
+
+  // --- upper: heel counter → instep → toe box -------------------------------
+  upper.push(placeZ(capsule2(len, 0.050 * hs * bulk, 0.036 * hs * bulk, {
+    radial: 12, capSegs: 3, bodyRings: 6, capA: 0.75, capB: 0.55,
+    // low over the instep, swelling again into the toe box
+    mid: (t) => (1 - 0.16 * Math.exp(-(((t - 0.45) / 0.20) ** 2))) * bulge(t, 0.82, 0.16, 0.10),
+    shape: (t) => [lerp(1.00, 0.86, t), lerp(0.92, 1.12, smoothstep(t))],
+  }), heel.clone().addScaledVector(up, 0.030 * hs), tip.clone().addScaledVector(up, 0.020 * hs), down));
+  // padded collar around the ankle
+  const cH = lerp(0.030, 0.070, high) * hs;
+  upper.push(placeZ(capsule2(cH, 0.055 * hs * bulk, 0.050 * hs * bulk, {
+    radial: 10, capSegs: 2, shape: () => [0.86, 1.0],
+  }), ankle.clone().addScaledVector(up, -0.030 * hs).addScaledVector(fwd, -0.010 * hs),
+  ankle.clone().addScaledVector(up, cH).addScaledVector(fwd, -0.004 * hs), fwd));
+  // tongue, tucked under the laces
+  upper.push(placeZ(capsule2(0.062 * hs, 0.030 * hs, 0.026 * hs, {
+    radial: 8, capSegs: 2, shape: () => [0.42, 1.0],
+  }), ankle.clone().addScaledVector(fwd, 0.010 * hs).addScaledVector(up, 0.012 * hs),
+  ankle.clone().addScaledVector(fwd, 0.070 * hs).addScaledVector(up, 0.030 * hs), down));
+
+  // --- sole: midsole slab + outsole lip + toe bumper -------------------------
+  const sA = heel.clone().addScaledVector(up, -0.004 * hs);
+  const sB = tip.clone().addScaledVector(up, -0.002 * hs).addScaledVector(fwd, -0.004 * hs);
+  sole.push(placeZ(capsule2(sA.distanceTo(sB), 0.042 * hs * bulk, 0.034 * hs * bulk, {
+    radial: 10, capSegs: 2, bodyRings: 4, capA: 0.5, capB: 0.5,
+    shape: (t) => [lerp(1.14, 1.02, t), lerp(0.44, 0.40, t)],
+  }), sA, sB, down));
+  // heel wedge
+  sole.push(placeZ(capsule2(0.052 * hs, 0.040 * hs * bulk, 0.038 * hs * bulk, {
+    radial: 8, capSegs: 2, shape: () => [1.10, 0.34],
+  }), heel.clone().addScaledVector(up, -0.012 * hs).addScaledVector(fwd, -0.006 * hs),
+  heel.clone().addScaledVector(up, -0.012 * hs).addScaledVector(fwd, 0.046 * hs), down));
+
+  // --- laces -----------------------------------------------------------------
+  for (let i = 0; i < 4; i++) {
+    const t = i / 3;
+    const s = lerp(0.020, 0.072, t) * hs;
+    const rr = lerp(0.030, 0.024, t) * hs;
+    const base = ankle.clone().addScaledVector(fwd, s).addScaledVector(up, lerp(0.016, 0.030, t) * hs);
+    for (const dir of [-1, 1]) {
+      lace.push(sweep([
+        base.clone().addScaledVector(side3, dir * rr).addScaledVector(up, -0.008 * hs),
+        base.clone().addScaledVector(side3, dir * rr * 0.35).addScaledVector(up, 0.008 * hs),
+        base.clone().addScaledVector(side3, -dir * rr * 0.30).addScaledVector(fwd, 0.014 * hs)
+          .addScaledVector(up, 0.006 * hs),
+      ], { radius: 0.0042 * hs, radial: 5, steps: 4 }));
+    }
+  }
+  return { upper: merge(upper), sole: merge(sole), lace: merge(lace) };
 }
 
 // ---------------------------------------------------------------------------
@@ -3590,10 +4296,11 @@ function buildRiderBody(pose, boneIndex, X, A) {
   const wLo = M.hipWidth * 1.16, wHi = M.shoulderWidth * 1.30;
   const dLo = M.waistDepth * 0.86, dHi = M.chestDepth * 0.90;
   const torso = limb(torsoA, torsoB, 0.150 * hs, 0.086 * hs, {
-    radial: 18, capSegs: 4, bodyRings: 9,
-    mid: (t) => (t < 0.30 ? lerp(1.02, 0.90, t / 0.30)
-      : t < 0.62 ? lerp(0.90, 1.26, smoothstep((t - 0.30) / 0.32))
-        : lerp(1.26, 1.00, smoothstep((t - 0.62) / 0.38))) * (1 + topLoose * 0.10),
+    radial: 18, capSegs: 4, bodyRings: 11,
+    // hem flare → waist → ribcage → the shoulder yoke
+    mid: (t) => (t < 0.15 ? lerp(1.10 + topLoose * 0.10, 0.92, smoothstep(t / 0.15))
+      : t < 0.62 ? lerp(0.92, 1.26, smoothstep((t - 0.15) / 0.47))
+        : lerp(1.26, 1.02, smoothstep((t - 0.62) / 0.38))) * (1 + topLoose * 0.10),
     shape: (t) => [
       lerp(dLo, dHi, smoothstep(clamp(t * 1.4, 0, 1))),
       lerp(wLo, wHi, smoothstep(clamp((t - 0.10) / 0.75, 0, 1))),
@@ -3606,10 +4313,33 @@ function buildRiderBody(pose, boneIndex, X, A) {
   push(torso, 'TOP', (g) => skinAlong(g, boneIndex, ['hips', 'spine', 'chest', 'neck'],
     [torsoA, pose.spine, pose.chest, torsoB]));
 
+  // collar: a real rolled band around the neck opening, not a painted stripe
+  if (X.top.style !== 'tank') {
+    const nDir = pose.head.clone().sub(pose.neck).normalize();
+    const cR = 0.058 * hs * lerp(0.94, 1.10, M.build) * (X.top.style === 'hoodie' ? 1.18 : 1.0);
+    const collar = placeZ(capsule2(0.030 * hs, cR * 1.24, cR * 1.16, {
+      radial: 14, capSegs: 2, capA: 0.4, capB: 0.4, shape: () => [1.06, 1.0],
+    }), torsoB.clone().addScaledVector(nDir, -0.012 * hs), torsoB.clone().addScaledVector(nDir, 0.018 * hs),
+    LEFT);
+    // sample only the collar band at the very top of the garment region
+    const cu = collar.attributes.uv;
+    for (let i = 0; i < cu.count; i++) cu.setXY(i, cu.getX(i), 0.978 + cu.getY(i) * 0.020);
+    push(collar, X.top.trimCuff ? 'TRIM' : 'TOP',
+      (g) => skinPart(g, boneIndex, 'chest', 'neck', pose.chest, torsoB, 0.2, 1.0, 0.8));
+  }
+
   // ------------------------------------------------------------ neck + head
   const neckR = 0.055 * hs * lerp(0.92, 1.10, M.build) * (M.gender === 'female' ? 0.93 : 1);
-  push(limb(pose.neck.clone().add(V(0, -0.03 * hs, 0)), pose.head.clone().add(V(0, 0.03 * hs, 0)),
-    neckR, neckR * 0.92, { radial: 12, capSegs: 3 }),
+  // The neck's root has to run DOWN THE TORSO AXIS, not down the world Y: with the
+  // rider pitched forward over the bars a vertical root pushes its cap out through
+  // the back of the shirt as a bare patch on the shoulder.
+  push(limb(pose.neck.clone().addScaledVector(pose.lean, -0.055 * hs), pose.head.clone().add(V(0, 0.030 * hs, 0)),
+    neckR * 1.14, neckR * 0.90, {
+      radial: 12, capSegs: 3,
+      // trapezius flare at the base, a slight hollow at the throat
+      mid: (t) => lerp(1.05, 0.97, smoothstep(clamp(t * 1.35, 0, 1))),
+      shape: (t) => [lerp(1.10, 1.00, t), lerp(0.88, 0.98, t)],
+    }),
   'SKIN', (g) => skinPart(g, boneIndex, 'neck', 'head', pose.neck, pose.head, 0.2, 1.0, 0.85));
 
   const headR = L.head;
@@ -3617,10 +4347,10 @@ function buildRiderBody(pose, boneIndex, X, A) {
   const S = { jaw: M.jaw, brow: M.brow, wide: lerp(0.96, 1.06, M.build) };
   push(buildHead(headC, headR, S), 'FACE', (g) => skinPart(g, boneIndex, 'head', null));
   for (const s of [-1, 1]) {
-    push(buildEar(headC, headR, S, s), 'SKIN', (g) => skinPart(g, boneIndex, 'head', null), 0.2, 0.5);
+    push(buildEar(headC, headR, S, s), 'SKIN', (g) => skinPart(g, boneIndex, 'head', null), 0.62, 0.86);
   }
 
-  const lidCover = X.lid.style === 'beanie' ? 0.50 : X.lid.style === 'helmet' ? 0.0 : 0.0;
+  const lidCover = X.lid.style === 'beanie' ? 0.72 : X.lid.style === 'helmet' ? 0.88 : 0.0;
   push(buildHair(headC, headR, S, X, lidCover), 'HAIR', (g) => skinPart(g, boneIndex, 'head', null));
   push(buildBeardShell(headC, headR, S, X), 'HAIR', (g) => skinPart(g, boneIndex, 'head', null), 0, 0.5);
   push(buildLid(headC, headR, S, X), 'LID', (g) => skinPart(g, boneIndex, 'head', null));
@@ -3651,6 +4381,27 @@ function buildRiderBody(pose, boneIndex, X, A) {
     const rShoulder = 0.052 * hs * girth, rElbow = 0.040 * hs * girth;
     const rFore = 0.039 * hs * M.forearmGirth, rWrist = 0.029 * hs * M.forearmGirth;
     const puff = 1 + 0.07 + topLoose * 0.15;
+    // Muscle, not pipe: a deltoid swell at the top of the upper arm, a biceps
+    // belly at 45 %, a brachioradialis swell just past the elbow, then a real
+    // taper into a flattened wrist.
+    const armMid = (t) => bulge(t, 0.08, 0.22, 0.20 * girth) * bulge(t, 0.46, 0.26, 0.11 * girth);
+    const armShape = (t) => [1 + 0.05 * _g(t - 0.10, 0.22), lerp(1.07, 0.99, t)];
+    const foreMid = (t) => bulge(t, 0.17, 0.24, 0.17 * M.forearmGirth);
+    const foreShape = (t) => [lerp(1.03, 0.80, smoothstep(t)), lerp(0.99, 1.14, smoothstep(t))];
+
+    // deltoid cap — fills the armpit and gives the silhouette a shoulder
+    const delt = new THREE.SphereGeometry(1, 12, 9);
+    delt.scale(0.062 * hs * girth * M.shoulderWidth, 0.058 * hs * girth, 0.060 * hs * girth);
+    delt.translate(sh.x + s * 0.006 * hs, sh.y + 0.012 * hs, sh.z);
+    // Keep the sphere well inside its region: a small part sitting near a region
+    // boundary samples a coarse mip and drags the neighbouring band's colour on
+    // to the shoulder as a pale blotch.
+    const du = delt.attributes.uv;
+    for (let i = 0; i < du.count; i++) {
+      du.setXY(i, 0.28 + du.getX(i) * 0.44, 0.34 + du.getY(i) * 0.32);
+    }
+    push(delt, X.top.style === 'tank' ? 'SKIN' : (sleeveT > 0.02 ? 'SLEEVE' : 'TOP'),
+      (g) => skinPart(g, boneIndex, 'chest', 'shoulder' + side, pose.chest, sh, 0.1, 0.9, 0.75));
 
     // upper arm: sleeve then skin, split wherever the sleeve ends
     const tUp = clamp(sleeveT / upperFrac, 0, 1);
@@ -3658,9 +4409,11 @@ function buildRiderBody(pose, boneIndex, X, A) {
     if (tUp > 0.02) {
       const end = sh.clone().lerp(el, tUp);
       const sleeve = limb(shOut, end, rShoulder * puff, lerp(rShoulder, rElbow, tUp) * puff, {
-        radial: 12, capSegs: 4, capB: 0.30,
+        radial: 12, capSegs: 4, bodyRings: 6, capB: 0.30,
         shape: (t) => [1, lerp(1.06, 1.0, t)],
-        mid: (t) => 1 + topLoose * 0.06 * Math.sin(t * Math.PI),
+        // a sleeve hangs off the deltoid: tight at the shoulder, loose and
+        // slightly flared where it ends
+        mid: (t) => 1 + topLoose * (0.05 + 0.10 * smoothstep(t)) * Math.sin(t * 2.2),
       });
       push(sleeve, X.top.style === 'tank' ? 'TOP' : 'SLEEVE', skinU);
       if (tUp < 0.98 && sleeveT > 0.02 && X.top.trimCuff) {
@@ -3671,24 +4424,30 @@ function buildRiderBody(pose, boneIndex, X, A) {
       }
     }
     if (tUp < 0.98) {
-      const a0 = sh.clone().lerp(el, Math.max(tUp - 0.10, 0));
-      push(limb(a0, el, lerp(rShoulder, rElbow, Math.max(tUp - 0.10, 0)), rElbow,
-        { radial: 10, capSegs: 3 }), 'SKIN', skinU);
+      const t0 = Math.max(tUp - 0.10, 0);
+      const a0 = sh.clone().lerp(el, t0);
+      push(limb(a0, el, lerp(rShoulder, rElbow, t0), rElbow, {
+        radial: 10, capSegs: 3, bodyRings: 6,
+        mid: (t) => armMid(lerp(t0, 1, t)), shape: (t) => armShape(lerp(t0, 1, t)),
+      }), 'SKIN', skinU);
     }
     // forearm
     const tFore = clamp((sleeveT - upperFrac) / (1 - upperFrac), 0, 1);
     if (tFore > 0.02) {
       const end = el.clone().lerp(wr, tFore);
       push(limb(el, end, rFore * puff, lerp(rFore, rWrist, tFore) * puff,
-        { radial: 12, capSegs: 3, capB: 0.30 }), 'SLEEVE', skinF);
+        { radial: 12, capSegs: 3, bodyRings: 5, capB: 0.30 }), 'SLEEVE', skinF);
       push(limb(el.clone().lerp(wr, Math.max(0, tFore - 0.08)), end,
         lerp(rFore, rWrist, tFore) * (puff + 0.03), lerp(rFore, rWrist, tFore) * (puff + 0.05),
         { radial: 10, capSegs: 2 }), X.top.trimCuff ? 'TRIM' : 'SLEEVE', skinF);
     }
     if (tFore < 0.98) {
-      const a0 = el.clone().lerp(wr, Math.max(0, tFore - 0.10));
-      push(limb(a0, wr, lerp(rFore, rWrist, Math.max(0, tFore - 0.10)), rWrist,
-        { radial: 10, capSegs: 3, mid: (t) => lerp(1.05, 0.98, t) }), 'SKIN', skinF);
+      const t0 = Math.max(0, tFore - 0.10);
+      const a0 = el.clone().lerp(wr, t0);
+      push(limb(a0, wr, lerp(rFore, rWrist, t0), rWrist, {
+        radial: 10, capSegs: 3, bodyRings: 6,
+        mid: (t) => foreMid(lerp(t0, 1, t)), shape: (t) => foreShape(lerp(t0, 1, t)),
+      }), 'SKIN', skinF);
     }
     // elbow pad
     if (X.pad.elbow) {
@@ -3700,21 +4459,16 @@ function buildRiderBody(pose, boneIndex, X, A) {
         { radial: 10, capSegs: 3, shape: () => [1.0, 0.62] }), 'PAD', skinF);
     }
 
-    // hand: gloved or bare
+    // hand: a real fist closed on the grip, gloved or bare
     const gripDir = V(s, 0.02, -0.08).normalize();
     const handKey = X.glove.on ? 'GLOVE' : 'SKIN';
-    const palmA = wr.clone().addScaledVector(gripDir, -0.020 * hs);
-    const palmB = wr.clone().addScaledVector(gripDir, L.hand * 0.90);
-    const handR = 0.040 * hs * lerp(0.92, 1.10, M.build);
-    push(limb(palmA, palmB, handR * (X.glove.on ? 1.08 : 1), handR * 0.92, {
-      radial: 10, capSegs: 3, shape: () => [1.0, 1.18], zDir: V(0, -1, 0),
-    }), handKey, (g) => skinPart(g, boneIndex, 'wrist' + side, null));
-    push(limb(wr.clone().add(V(0, 0.014 * hs, 0.026 * hs)),
-      wr.clone().add(V(s * 0.036 * hs, 0.006 * hs, 0.052 * hs)), handR * 0.42, handR * 0.34,
-      { radial: 8, capSegs: 3 }), handKey, (g) => skinPart(g, boneIndex, 'wrist' + side, null));
+    const handR = 0.041 * hs * lerp(0.92, 1.10, M.build);
+    push(buildFist(wr, gripDir, handR, X.glove.on), handKey,
+      (g) => skinPart(g, boneIndex, 'wrist' + side, null));
     if (X.glove.on) {
-      push(limb(wr.clone().addScaledVector(gripDir, -0.058 * hs),
-        wr.clone().addScaledVector(gripDir, -0.014 * hs), handR * 1.00, handR * 1.10,
+      // gauntlet cuff over the wrist
+      push(limb(wr.clone().addScaledVector(gripDir, -0.062 * hs),
+        wr.clone().addScaledVector(gripDir, -0.012 * hs), handR * 0.86, handR * 0.98,
         { radial: 10, capSegs: 2, zDir: V(0, -1, 0) }),
       'GLOVE', (g) => skinPart(g, boneIndex, 'wrist' + side, null));
     }
@@ -3731,11 +4485,20 @@ function buildRiderBody(pose, boneIndex, X, A) {
     const rHip = 0.085 * hs * girth, rKnee = 0.058 * hs * girth;
     const rCalf = 0.062 * hs * M.calfGirth, rAnkle = 0.042 * hs * M.calfGirth;
     const puff = 1 + 0.05 + botLoose * 0.16;
+    // quad mass high on the thigh, a flattened knee, a gastrocnemius belly a
+    // third of the way down the shin, then a narrow ankle
+    const thighMid = (t) => bulge(t, 0.20, 0.30, 0.11 * girth) * (1 - 0.05 * smoothstep(t));
+    const thighShape = (t) => [lerp(1.05, 0.93, t), lerp(1.00, 0.90, t)];
+    const calfMid = (t) => bulge(t, 0.26, 0.24, 0.20 * M.calfGirth);
+    const calfShape = (t) => [lerp(0.98, 0.88, t), lerp(1.00, 0.92, t)];
+    // trousers hang: the cloth ignores the calf and breaks over the shoe
+    const clothMid = (t) => (1 + botLoose * 0.05) * bulge(t, 0.18, 0.30, 0.06)
+      * bulge(t, 0.95, 0.10, botLoose * 0.10);
 
     const tUp = clamp(legT / thighFrac, 0, 1);
     push(limb(hp.clone().add(V(0, 0.03 * hs, 0)), tUp >= 1 ? kn : hp.clone().lerp(kn, tUp),
       rHip * puff, lerp(rHip, rKnee, tUp) * puff,
-      { radial: 12, capSegs: 3, mid: (t) => (1 + botLoose * 0.05) * lerp(1.04, 1.0, t) }),
+      { radial: 12, capSegs: 3, bodyRings: 6, mid: clothMid, shape: thighShape }),
     'BOTTOM', skinT);
     if (tUp < 0.99) {
       // shorts hem, then bare leg
@@ -3743,14 +4506,17 @@ function buildRiderBody(pose, boneIndex, X, A) {
       push(limb(hp.clone().lerp(kn, Math.max(0, tUp - 0.05)), end,
         lerp(rHip, rKnee, tUp) * (puff + 0.03), lerp(rHip, rKnee, tUp) * (puff + 0.06),
         { radial: 12, capSegs: 2 }), 'BOTTOM', skinT);
-      push(limb(hp.clone().lerp(kn, Math.max(0, tUp - 0.08)), kn,
-        lerp(rHip, rKnee, Math.max(0, tUp - 0.08)), rKnee, { radial: 10, capSegs: 3 }), 'SKIN', skinT);
+      const t0 = Math.max(0, tUp - 0.08);
+      push(limb(hp.clone().lerp(kn, t0), kn, lerp(rHip, rKnee, t0), rKnee, {
+        radial: 10, capSegs: 3, bodyRings: 5,
+        mid: (t) => thighMid(lerp(t0, 1, t)), shape: (t) => thighShape(lerp(t0, 1, t)),
+      }), 'SKIN', skinT);
     }
     const tLo = clamp((legT - thighFrac) / (1 - thighFrac), 0, 1);
     if (tLo > 0.02) {
       const end = kn.clone().lerp(an, tLo);
       push(limb(kn, end, rCalf * puff, lerp(rCalf, rAnkle, tLo) * puff * (X.bottom.cuffed ? 0.92 : 1),
-        { radial: 12, capSegs: 3 }), 'BOTTOM', skinS);
+        { radial: 12, capSegs: 3, bodyRings: 6, mid: clothMid }), 'BOTTOM', skinS);
       if (X.bottom.cuffed || tLo < 0.98) {
         push(limb(kn.clone().lerp(an, Math.max(0, tLo - 0.06)), end,
           lerp(rCalf, rAnkle, tLo) * (puff + 0.02), lerp(rCalf, rAnkle, tLo) * (puff - 0.04),
@@ -3758,9 +4524,12 @@ function buildRiderBody(pose, boneIndex, X, A) {
       }
     }
     if (tLo < 0.98) {
-      const a0 = kn.clone().lerp(an, Math.max(0, tLo - 0.08));
-      push(limb(a0, an, lerp(rCalf, rAnkle, Math.max(0, tLo - 0.08)), rAnkle,
-        { radial: 10, capSegs: 3 }), 'SKIN', skinS);
+      const t0 = Math.max(0, tLo - 0.08);
+      const a0 = kn.clone().lerp(an, t0);
+      push(limb(a0, an, lerp(rCalf, rAnkle, t0), rAnkle, {
+        radial: 10, capSegs: 3, bodyRings: 6,
+        mid: (t) => calfMid(lerp(t0, 1, t)), shape: (t) => calfShape(lerp(t0, 1, t)),
+      }), 'SKIN', skinS);
     }
     // knee pad and shin guard
     if (X.pad.knee) {
@@ -3780,24 +4549,12 @@ function buildRiderBody(pose, boneIndex, X, A) {
         { radial: 10, capSegs: 3, shape: () => [1.0, 0.48] }), 'PAD', skinS);
     }
 
-    // shoe: upper, sole slab, ankle collar
-    const bulk = lerp(0.92, 1.14, X.shoe.bulk);
-    const heel = an.clone().add(V(0, -0.036 * hs, -0.058 * hs));
-    const tip = toe.clone().add(V(0, 0.006 * hs, 0.026 * hs));
-    const shoeZ = V(0, -1, 0);
-    push(limb(heel, tip, 0.052 * hs * bulk, 0.042 * hs * bulk, {
-      radial: 12, capSegs: 3, zDir: shoeZ,
-      shape: (t) => [lerp(1.0, 0.92, t), lerp(1.0, 0.78, t)],
-    }), 'SHOE', (g) => skinPart(g, boneIndex, 'ankle' + side, 'toe' + side, an, toe, 0.55, 1.0, 0.6));
-    const soleA = heel.clone().add(V(0, -0.030 * hs * bulk, 0));
-    const soleB = tip.clone().add(V(0, -0.026 * hs * bulk, 0));
-    push(limb(soleA, soleB, 0.040 * hs * bulk, 0.034 * hs * bulk,
-      { radial: 10, capSegs: 2, zDir: shoeZ, shape: () => [1.06, 0.42] }),
-    'SOLE', (g) => skinPart(g, boneIndex, 'ankle' + side, 'toe' + side, an, toe, 0.55, 1.0, 0.6));
-    const collarH = lerp(0.030, 0.062, X.shoe.high) * hs;
-    push(limb(an.clone().add(V(0, -0.030 * hs, -0.012 * hs)), an.clone().add(V(0, collarH, -0.004 * hs)),
-      0.056 * hs * bulk, 0.052 * hs * bulk, { radial: 10, capSegs: 2 }),
-    'SHOE', (g) => skinPart(g, boneIndex, 'ankle' + side, null));
+    // shoe: moulded sole, upper with a toe box, collar, tongue and laces
+    const shoe = buildShoe(an.clone().add(V(0, -0.026 * hs, 0)), toe, hs, X, s);
+    const skinFoot = (g) => skinPart(g, boneIndex, 'ankle' + side, 'toe' + side, an, toe, 0.55, 1.0, 0.6);
+    push(shoe.upper, 'SHOE', skinFoot);
+    push(shoe.sole, 'SOLE', skinFoot);
+    push(shoe.lace, 'SHOE', skinFoot, 0.465, 0.535);
   }
 
   return merge(parts);
@@ -4073,10 +4830,13 @@ export async function createRider(ctx, profile = DEFAULT_PROFILE) {
 
   // Fabric, not plastic: fully rough, low env response, a sheen lobe for the
   // grazing-angle lift real cloth has, and a strong normal for weave and folds.
+  // envMapIntensity is deliberately near 1: the sky IS the fill light on an
+  // overcast dusk, and a character that only answers to the sun turns into a
+  // black cut-out the moment it faces away from it.
   const riderMat = new THREE.MeshPhysicalMaterial({
     ...AD.maps, color: 0xffffff, metalness: 0, roughness: 1,
-    normalScale: new THREE.Vector2(0.62, 0.62), envMapIntensity: 0.42,
-    sheen: 0.18, sheenRoughness: 0.92, sheenColor: new THREE.Color(0x8d939c),
+    normalScale: new THREE.Vector2(0.70, 0.70), envMapIntensity: 0.95,
+    sheen: 0.26, sheenRoughness: 0.85, sheenColor: new THREE.Color(0x9aa0aa),
   });
   riderMat.name = 'riderSkinned';
 

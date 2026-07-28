@@ -9,6 +9,7 @@ import { seed } from './core/mathx.js';
 import { createMaterials } from './world/materials.js';
 import { createEnvironment } from './world/environment.js';
 import { createPark } from './world/park.js';
+import { createPuddles } from './world/puddles.js';
 import { createCollision } from './physics/collision.js';
 import { createBikePhysics } from './physics/bikePhysics.js';
 import { createRider } from './rider/bike.js';
@@ -62,6 +63,10 @@ async function boot() {
   ctx.world.park = await createPark(ctx);
   ctx.scene.add(ctx.world.park.group);
   ctx.world.collision = createCollision(ctx.world.park.colliders, ctx.world.park.rails);
+  // Wet ground: needs the park and collision in place so it can survey for flat,
+  // low areas that would genuinely hold water.
+  ctx.world.puddles = createPuddles(ctx);
+  ctx.scene.add(ctx.world.puddles.group);
 
   // --- player --------------------------------------------------------------
   // Customization first: it publishes ctx.player.profile and ctx.player.cheats,
@@ -129,6 +134,7 @@ async function boot() {
 
     ctx.player.anim.update(dt, ctx);
     ctx.world.environment.update?.(dt, ctx);
+    ctx.world.puddles?.update?.(dt, ctx);
     ctx.world.park.update?.(dt, ctx);
     ctx.cameraRig.update(dt, ctx);
     ctx.fx.update(dt, ctx);

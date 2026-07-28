@@ -15,6 +15,20 @@ import { rng, rand, randInt, pick, clamp, lerp, smoothstep, fbm2, seed, TAU } fr
 // The lot is a rectangle; the park itself lives inside ~±26 m so all dressing is
 // kept out at the perimeter.
 const LOT = { hx: 42, hz: 36 };
+
+/**
+ * A point `gap` metres beyond the lot boundary along heading `a`. Walking out
+ * along a ray and leaving the rectangle is the only placement that is correct at
+ * the corners as well as the flats — scaling an ellipse by (hx+gap, hz+gap) puts
+ * points at 45° back *inside* the fence.
+ */
+function outsideLot(a, gap, padX = 0, padZ = 0) {
+  const dx = Math.cos(a), dz = Math.sin(a);
+  const tx = Math.abs(dx) > 1e-5 ? (LOT.hx + padX) / Math.abs(dx) : Infinity;
+  const tz = Math.abs(dz) > 1e-5 ? (LOT.hz + padZ) / Math.abs(dz) : Infinity;
+  const r = Math.min(tx, tz) + gap;
+  return { x: dx * r, z: dz * r, r };
+}
 const FENCE_H = 2.2;
 const BAY = 3.0;                     // fence bay width (metres)
 const GATE = { centre: 14, width: 5.4 };   // opening in the +Z run
@@ -130,7 +144,7 @@ function floatAttr(g, name, value) {
   return g;
 }
 
-const KEEP = ['position', 'normal', 'uv', 'color', 'aRegion', 'aFlex', 'aWind'];
+const KEEP = ['position', 'normal', 'uv', 'color', 'aRegion', 'aFlex', 'aWind', 'aHaze'];
 /**
  * Drop attributes nothing reads and guarantee an index — mergeGeometries refuses
  * to mix indexed and non-indexed inputs, and the polyhedra come in non-indexed.
@@ -449,81 +463,310 @@ function makeWeedTexture() {
   return canvas;
 }
 
-/** Tileable facade: 16 m × 16 m of window grid. Returns { color, emissive }. */
-function makeFacadeTextures() {
-  const S = 512;
-  const a = canvas2d(S, S), b = canvas2d(S, S);
-  const g = a.g, e = b.g;
+// --- facades ---------------------------------------------------------------
+// Three tileable facade treatments, each 12.8 m square (four 3.2 m floors by
+// eight 1.6 m bays). Buildings pick a treatment, then scale and offset their UVs
+// per building, so window pitch, floor alignment and the pattern of lit windows
+// all differ from neighbour to neighbour without an atlas or a second texture.
+//
+// Each treatment returns three canvases:
+//   color     — albedo (sRGB)
+//   orm       — G = roughness, B = metalness (the channels three reads)
+//   emissive  — lit windows, black elsewhere
+const FACADE_M = 12.8;
+const FACADE_PX = 512;
 
-  g.fillStyle = '#8f8b80';
-  g.fillRect(0, 0, S, S);
-  // concrete panel joints + noise
+function makeFacade(kind) {
+  const S = FACADE_PX;
+  const FL = 4, BAYS = 8;
+  const fh = S / FL, bw = S / BAYS;
+  const cc = canvas2d(S, S), oo = canvas2d(S, S), ee = canvas2d(S, S);
+  const g = cc.g, og = oo.g, eg = ee.g;
+
+  /** Roughness/metalness patch. */
+  const orm = (x, y, w, h, r, m) => {
+    og.fillStyle = `rgb(0,${(clamp(r, 0, 1) * 255) | 0},${(clamp(m, 0, 1) * 255) | 0})`;
+    og.fillRect(x, y, w, h);
+  };
+  /** Lit window in the emissive map, with blinds/occupancy breaking it up. */
+  const litWindow = (x, y, w, h, chance) => {
+    if (rng() > chance) return;
+    const warm = rng() < 0.80;
+    const i = rand(0.30, 1.0);
+    eg.fillStyle = warm
+      ? `rgb(${(255 * i) | 0},${(203 * i) | 0},${(138 * i) | 0})`
+      : `rgb(${(172 * i) | 0},${(210 * i) | 0},${(246 * i) | 0})`;
+    eg.fillRect(x, y, w, h);
+    eg.fillStyle = 'rgba(0,0,0,0.5)';
+    const k = randInt(0, 3);
+    if (k === 1) eg.fillRect(x, y, w, h * rand(0.2, 0.55));            // blinds down
+    if (k === 2) eg.fillRect(x + w * rand(0.1, 0.55), y + h * 0.35, w * 0.2, h * 0.65);
+    if (k === 3) eg.fillRect(x, y + h * rand(0.5, 0.75), w, h * 0.5);  // desk line
+  };
+  /**
+   * Glass, with the sky mirrored in the upper part of the pane and the room
+   * behind it going dark below the reflected horizon — the thing that makes a
+   * distant facade read as glazing and not as a grey rectangle.
+   */
+  const glass = (x, y, w, h, warm) => {
+    const gr = g.createLinearGradient(0, y, 0, y + h);
+    if (warm) {
+      gr.addColorStop(0.00, '#cbb79b');
+      gr.addColorStop(0.26, '#8e8177');
+      gr.addColorStop(0.36, '#2c313b');
+      gr.addColorStop(1.00, '#151920');
+    } else {
+      gr.addColorStop(0.00, '#a8b1bd');
+      gr.addColorStop(0.28, '#727e8e');
+      gr.addColorStop(0.38, '#262d38');
+      gr.addColorStop(1.00, '#12161d');
+    }
+    g.fillStyle = gr;
+    g.fillRect(x, y, w, h);
+    g.save();
+    g.beginPath(); g.rect(x, y, w, h); g.clip();
+    const st = g.createLinearGradient(x, y + h, x + w, y);
+    st.addColorStop(0, 'rgba(255,255,255,0)');
+    st.addColorStop(0.5, `rgba(255,238,214,${rand(0.05, 0.17)})`);
+    st.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = st;
+    g.fillRect(x, y, w, h);
+    g.restore();
+    orm(x, y, w, h, rand(0.08, 0.19), 0.88);
+  };
+  /** Streaks and soiling; wraps in x so the tile stays seamless. */
+  const grime = (n, alpha) => {
+    for (let i = 0; i < n; i++) {
+      const x = rand(-20, S), y = rand(0, S), len = rand(24, 140), wdt = rand(2, 9);
+      const gr = g.createLinearGradient(0, y, 0, y + len);
+      gr.addColorStop(0, `rgba(46,41,34,${alpha})`);
+      gr.addColorStop(1, 'rgba(46,41,34,0)');
+      g.fillStyle = gr;
+      for (const dx of [-S, 0, S]) g.fillRect(x + dx, y, wdt, len);
+    }
+  };
+
+  eg.fillStyle = '#000'; eg.fillRect(0, 0, S, S);
+  orm(0, 0, S, S, 0.92, 0.0);
+
+  if (kind === 'curtain') {
+    // ---- glass curtain wall: ribbon glazing, spandrel bands, fine mullions --
+    g.fillStyle = '#666d78'; g.fillRect(0, 0, S, S);
+    for (let f = 0; f < FL; f++) {
+      const y = f * fh;
+      const spandrelH = fh * 0.26;
+      // spandrel: an opaque metal panel under each glazing band
+      const sg = g.createLinearGradient(0, y, 0, y + spandrelH);
+      sg.addColorStop(0, '#84868a'); sg.addColorStop(1, '#54575d');
+      g.fillStyle = sg; g.fillRect(0, y, S, spandrelH);
+      orm(0, y, S, spandrelH, 0.44, 0.85);
+      const gy = y + spandrelH, gh = fh - spandrelH - 3;
+      const warmFloor = rng() < 0.4;
+      for (let b = 0; b < BAYS; b++) {
+        const x = b * bw;
+        glass(x + 1.5, gy, bw - 3, gh, warmFloor !== (rng() < 0.25));
+        litWindow(x + 1.5, gy, bw - 3, gh, 0.30);
+      }
+      // transom across the glazing, then vertical mullions
+      g.fillStyle = 'rgba(206,208,210,0.55)';
+      g.fillRect(0, gy + gh * 0.52, S, 2);
+      g.fillStyle = 'rgba(220,222,224,0.7)';
+      for (let b = 0; b <= BAYS; b++) g.fillRect(b * bw - 1.5, gy, 3, gh);
+      // slab edge shadow at the head of the glazing
+      g.fillStyle = 'rgba(12,14,18,0.42)';
+      g.fillRect(0, gy, S, 3);
+      g.fillStyle = 'rgba(236,232,222,0.35)';
+      g.fillRect(0, y + spandrelH - 2, S, 2);
+    }
+    grime(26, 0.10);
+  } else if (kind === 'brick') {
+    // ---- older masonry loft: brick courses, arched heads, stone bands -------
+    g.fillStyle = '#7d5342'; g.fillRect(0, 0, S, S);
+    const course = 6.4, brick = 15;
+    for (let y = 0, r = 0; y < S; y += course, r++) {
+      const off = (r % 2) * brick * 0.5;
+      for (let x = -brick; x < S; x += brick) {
+        const v = rand(-16, 16);
+        g.fillStyle = `rgb(${clamp(126 + v, 60, 190) | 0},${clamp(80 + v * 0.7, 40, 150) | 0},${clamp(64 + v * 0.6, 32, 130) | 0})`;
+        g.fillRect(x + off + 0.7, y + 0.7, brick - 1.4, course - 1.4);
+      }
+    }
+    for (let f = 0; f < FL; f++) {
+      const y = f * fh;
+      // stone string course at each floor line
+      g.fillStyle = '#a89880'; g.fillRect(0, y, S, 7);
+      g.fillStyle = 'rgba(255,250,238,0.35)'; g.fillRect(0, y, S, 2);
+      g.fillStyle = 'rgba(24,16,12,0.35)'; g.fillRect(0, y + 7, S, 2.5);
+      orm(0, y, S, 9, 0.82, 0.0);
+      for (let b = 0; b < BAYS; b += 2) {
+        const wx = b * bw + bw * 0.42, ww = bw * 1.16;
+        const wy = y + fh * 0.26, wh = fh * 0.54;
+        // reveal, segmental arch head, stone sill
+        g.fillStyle = 'rgba(16,10,8,0.78)';
+        g.fillRect(wx - 5, wy - 6, ww + 10, wh + 10);
+        g.fillStyle = '#8e7b64';
+        g.beginPath();
+        g.ellipse(wx + ww * 0.5, wy - 1, ww * 0.62, 9, 0, Math.PI, 0);
+        g.fill();
+        glass(wx, wy, ww, wh, rng() < 0.3);
+        g.fillStyle = 'rgba(190,186,176,0.75)';
+        g.fillRect(wx + ww * 0.5 - 1.5, wy, 3, wh);
+        g.fillRect(wx, wy + wh * 0.42, ww, 2);
+        g.fillStyle = '#b0a48e';
+        g.fillRect(wx - 6, wy + wh, ww + 12, 5);
+        orm(wx - 6, wy + wh, ww + 12, 5, 0.8, 0.0);
+        litWindow(wx, wy, ww, wh, 0.34);
+      }
+    }
+    grime(44, 0.14);
+  } else {
+    // ---- precast concrete with punched windows, sills, AC units ------------
+    g.fillStyle = '#948d81'; g.fillRect(0, 0, S, S);
+    for (let y = 0; y < S; y += 4) {
+      for (let x = 0; x < S; x += 4) {
+        const n = noise01(x * 0.055 + 3.1, y * 0.055 + 7.7, 4);
+        g.fillStyle = `rgba(${(n * 130) | 0},${(n * 122) | 0},${(n * 106) | 0},0.20)`;
+        g.fillRect(x, y, 4, 4);
+      }
+    }
+    // precast panel joints on the floor line and every two bays
+    for (let f = 0; f <= FL; f++) {
+      g.fillStyle = 'rgba(46,42,36,0.42)'; g.fillRect(0, f * fh - 1.5, S, 3);
+      g.fillStyle = 'rgba(232,228,216,0.28)'; g.fillRect(0, f * fh + 1.5, S, 1.5);
+    }
+    for (let b = 0; b <= BAYS; b += 2) {
+      g.fillStyle = 'rgba(46,42,36,0.30)'; g.fillRect(b * bw - 1, 0, 2, S);
+    }
+    for (let f = 0; f < FL; f++) {
+      const y = f * fh;
+      for (let b = 0; b < BAYS; b++) {
+        const wx = b * bw + bw * 0.19, ww = bw * 0.62;
+        const wy = y + fh * 0.22, wh = fh * 0.50;
+        g.fillStyle = 'rgba(14,12,11,0.80)';           // deep reveal
+        g.fillRect(wx - 5, wy - 5, ww + 9, wh + 8);
+        glass(wx, wy, ww, wh, rng() < 0.28);
+        g.fillStyle = 'rgba(198,196,188,0.6)';
+        g.fillRect(wx + ww * 0.5 - 1.2, wy, 2.4, wh);
+        g.fillStyle = '#c2bcae';                        // sill
+        g.fillRect(wx - 5, wy + wh, ww + 10, 4);
+        orm(wx - 5, wy + wh, ww + 10, 4, 0.85, 0.0);
+        // the odd through-wall AC unit hanging under a sill
+        if (rng() < 0.14) {
+          g.fillStyle = '#8f9295';
+          g.fillRect(wx + ww * 0.2, wy + wh + 4, ww * 0.6, fh * 0.11);
+          orm(wx + ww * 0.2, wy + wh + 4, ww * 0.6, fh * 0.11, 0.5, 0.7);
+        }
+        litWindow(wx, wy, ww, wh, 0.38);
+      }
+    }
+    grime(52, 0.16);
+  }
+
+  weather(g, 0, 0, S, S, 0.5);
+  return { color: cc.canvas, orm: oo.canvas, emissive: ee.canvas };
+}
+
+/** Tileable pale precast concrete for parapets, piers and viaduct decking. */
+function makeTrimTexture() {
+  const S = 256;
+  const { canvas, g } = canvas2d(S, S);
+  g.fillStyle = '#b3ada1'; g.fillRect(0, 0, S, S);
   for (let y = 0; y < S; y += 4) {
     for (let x = 0; x < S; x += 4) {
-      const n = noise01(x * 0.05, y * 0.05, 4);
-      g.fillStyle = `rgba(${(n * 96) | 0},${(n * 88) | 0},${(n * 78) | 0},0.22)`;
+      const n = noise01(x * 0.06 + 12.3, y * 0.06 + 2.9, 4);
+      g.fillStyle = `rgba(${(n * 150) | 0},${(n * 144) | 0},${(n * 128) | 0},0.24)`;
       g.fillRect(x, y, 4, 4);
     }
   }
-  e.fillStyle = '#000000';
-  e.fillRect(0, 0, S, S);
+  g.fillStyle = 'rgba(60,55,48,0.30)';
+  g.fillRect(0, S * 0.5 - 1, S, 2);
+  g.fillRect(S * 0.5 - 1, 0, 2, S);
+  for (let i = 0; i < 40; i++) {
+    const x = rand(-10, S), y = rand(0, S), len = rand(20, 90);
+    const gr = g.createLinearGradient(0, y, 0, y + len);
+    gr.addColorStop(0, 'rgba(48,44,38,0.16)');
+    gr.addColorStop(1, 'rgba(48,44,38,0)');
+    g.fillStyle = gr;
+    for (const dx of [-S, 0, S]) g.fillRect(x + dx, y, rand(2, 6), len);
+  }
+  return canvas;
+}
 
-  const COLS = 4, ROWS = 4;                 // 4 m window pitch over 16 m
-  const cw = S / COLS, ch = S / ROWS;
-  for (let r = 0; r < ROWS; r++) {
-    for (let c = 0; c < COLS; c++) {
-      const x = c * cw, y = r * ch;
-      // spandrel band under each window row
-      g.fillStyle = 'rgba(60,56,50,0.20)';
-      g.fillRect(x, y + ch * 0.78, cw, ch * 0.22);
-
-      const wx = x + cw * 0.16, wy = y + ch * 0.14, ww = cw * 0.68, wh = ch * 0.56;
-      // recess shadow
-      g.fillStyle = 'rgba(20,18,16,0.55)';
-      g.fillRect(wx - 3, wy - 3, ww + 6, wh + 6);
-      // glass
-      const gr = g.createLinearGradient(wx, wy, wx, wy + wh);
-      gr.addColorStop(0, '#2c3a49');
-      gr.addColorStop(0.55, '#1b2530');
-      gr.addColorStop(1, '#39434d');
-      g.fillStyle = gr;
-      g.fillRect(wx, wy, ww, wh);
-      // mullion
-      g.fillStyle = 'rgba(190,188,180,0.55)';
-      g.fillRect(wx + ww * 0.5 - 1.5, wy, 3, wh);
-      g.fillRect(wx, wy + wh * 0.5 - 1.5, ww, 3);
-      // sill highlight
-      g.fillStyle = 'rgba(230,226,214,0.5)';
-      g.fillRect(wx - 4, wy + wh + 3, ww + 8, 3);
-
-      // lit windows in the emissive map — about half on, warm and uneven
-      if (rng() < 0.55) {
-        const warm = rng() < 0.78;
-        const i = rand(0.35, 1);
-        const cr = warm ? 255 * i : 190 * i;
-        const cg = warm ? 214 * i : 214 * i;
-        const cb = warm ? 150 * i : 245 * i;
-        e.fillStyle = `rgb(${cr | 0},${cg | 0},${cb | 0})`;
-        e.fillRect(wx, wy, ww, wh);
-        // blinds / occupied silhouettes
-        e.fillStyle = 'rgba(0,0,0,0.45)';
-        const blinds = randInt(0, 2);
-        if (blinds === 1) e.fillRect(wx, wy, ww, wh * rand(0.2, 0.5));
-        if (blinds === 2) e.fillRect(wx + ww * rand(0.1, 0.5), wy + wh * 0.4, ww * 0.22, wh * 0.6);
-      }
+/**
+ * One palm frond, rooted at the left edge with the rachis on the horizontal
+ * centre line so the geometry can fold the two halves up into a shallow V.
+ */
+function makePalmTexture() {
+  const W = 256, H = 128, MID = H * 0.5;
+  const { canvas, g } = canvas2d(W, H);
+  g.clearRect(0, 0, W, H);
+  g.lineCap = 'round';
+  for (let side = -1; side <= 1; side += 2) {
+    for (let i = 0; i < 52; i++) {
+      const t = 0.05 + (i / 52) * 0.95;
+      const rx = 6 + t * (W - 16);
+      const len = clamp(1 - Math.pow(Math.abs(t - 0.40) * 1.62, 1.7), 0, 1) * MID * 0.94;
+      if (len <= 2) continue;
+      const sweep = 0.30 + t * 0.55;
+      const sh = 0.60 + 0.40 * (1 - t * 0.7) + rand(-0.13, 0.13);
+      g.strokeStyle = `rgba(${(92 * sh) | 0},${(124 * sh) | 0},${(56 * sh) | 0},${rand(0.8, 1)})`;
+      g.lineWidth = rand(2.2, 3.6);
+      g.beginPath();
+      g.moveTo(rx, MID);
+      g.quadraticCurveTo(rx + len * 0.28, MID + side * len * 0.62,
+        rx + len * sweep, MID + side * len);
+      g.stroke();
     }
   }
-  weather(g, 0, 0, S, S, 0.6);
-  // vertical streaking below sills
-  for (let i = 0; i < 60; i++) {
-    const x = rand(0, S), y = rand(0, S);
-    const gr = g.createLinearGradient(0, y, 0, y + rand(20, 90));
-    gr.addColorStop(0, 'rgba(40,36,30,0.22)');
-    gr.addColorStop(1, 'rgba(40,36,30,0)');
-    g.fillStyle = gr;
-    g.fillRect(x, y, rand(2, 7), 90);
+  g.strokeStyle = 'rgba(126,128,66,0.95)';
+  g.lineWidth = 4.5;
+  g.beginPath(); g.moveTo(4, MID); g.lineTo(W - 8, MID); g.stroke();
+  return canvas;
+}
+
+/**
+ * The outermost city: a low-contrast silhouette strip of far towers that
+ * dissolves upward into the sky. Sits behind everything and never reads as a
+ * wall because its alpha is gone well before the top of the band.
+ */
+function makeDistantCityTexture() {
+  const W = 2048, H = 256;
+  const { canvas, g } = canvas2d(W, H);
+  g.clearRect(0, 0, W, H);
+  for (let layer = 0; layer < 2; layer++) {
+    const base = H * 0.97;
+    const alpha = layer === 0 ? 0.30 : 0.44;
+    const tint = layer === 0 ? '150,158,172' : '128,136,152';
+    let x = 0;
+    while (x < W + 40) {
+      const w = rand(14, 74);
+      const hh = (rand(0.10, 0.42) + Math.pow(rng(), 3) * 0.42) * H * (layer === 0 ? 1.0 : 0.78);
+      const top = base - hh;
+      const gr = g.createLinearGradient(0, top, 0, base);
+      gr.addColorStop(0, `rgba(${tint},${alpha * 0.30})`);
+      gr.addColorStop(0.55, `rgba(${tint},${alpha * 0.82})`);
+      gr.addColorStop(1, `rgba(${tint},${alpha})`);
+      g.fillStyle = gr;
+      g.fillRect(x, top, w - rand(1, 5), hh);
+      // the occasional mast
+      if (rng() < 0.10) {
+        g.fillStyle = `rgba(${tint},${alpha * 0.5})`;
+        g.fillRect(x + w * 0.45, top - rand(8, 26), 2, 26);
+      }
+      x += w;
+    }
   }
-  return { color: a.canvas, emissive: b.canvas };
+  // dissolve the whole strip upward so the tops feather into the sky
+  g.globalCompositeOperation = 'destination-in';
+  const fade = g.createLinearGradient(0, 0, 0, H);
+  fade.addColorStop(0.00, 'rgba(0,0,0,0)');
+  fade.addColorStop(0.45, 'rgba(0,0,0,0.55)');
+  fade.addColorStop(0.86, 'rgba(0,0,0,1)');
+  fade.addColorStop(1.00, 'rgba(0,0,0,1)');
+  g.fillStyle = fade;
+  g.fillRect(0, 0, W, H);
+  g.globalCompositeOperation = 'source-over';
+  return canvas;
 }
 
 /** Spray-can pieces for the shipping container, transparent background. */
@@ -746,38 +989,6 @@ function makeChainlinkTexture() {
   return canvas;
 }
 
-/** Horizon haze + hill silhouette band (alpha, top-fading). */
-function makeHazeTexture(hills) {
-  const W = 1024, H = 256;
-  const { canvas, g } = canvas2d(W, H);
-  g.clearRect(0, 0, W, H);
-  if (hills) {
-    // two ridgelines, back one lighter
-    for (let layer = 0; layer < 2; layer++) {
-      const base = H * (layer === 0 ? 0.62 : 0.74);
-      const amp = layer === 0 ? 42 : 30;
-      g.beginPath();
-      g.moveTo(0, H);
-      for (let x = 0; x <= W; x += 4) {
-        const n = noise01(x * 0.006 + layer * 31.7, layer * 8.3, 4);
-        const n2 = noise01(x * 0.021 + layer * 5.1, 3.3, 3);
-        g.lineTo(x, base - n * amp - n2 * 14);
-      }
-      g.lineTo(W, H); g.closePath();
-      g.fillStyle = layer === 0 ? 'rgba(96,104,124,0.62)' : 'rgba(72,80,101,0.82)';
-      g.fill();
-    }
-  }
-  // warm dust gradient rising off the ground
-  const gr = g.createLinearGradient(0, H, 0, 0);
-  gr.addColorStop(0, 'rgba(226,196,150,0.62)');
-  gr.addColorStop(0.35, 'rgba(214,186,152,0.30)');
-  gr.addColorStop(1, 'rgba(200,180,160,0)');
-  g.fillStyle = gr;
-  g.fillRect(0, 0, W, H);
-  return canvas;
-}
-
 // ---------------------------------------------------------------------------
 // shader patches — wind and idle motion happen on the GPU so update() stays free
 // ---------------------------------------------------------------------------
@@ -890,17 +1101,98 @@ export function createProps(ctx) {
   // --- procedural textures + the materials that need them ------------------
   const bannerTex = ownTex(makeTex(makeBannerAtlas(), { aniso }));
   const leafTex = ownTex(makeTex(makeLeafTexture(), { aniso }));
+  const palmTex = ownTex(makeTex(makePalmTexture(), { aniso }));
   const weedTex = ownTex(makeTex(makeWeedTexture(), { aniso }));
-  const facade = makeFacadeTextures();
-  const facadeTex = ownTex(makeTex(facade.color, { aniso, wrap: THREE.RepeatWrapping, repeat: [1 / 16, 1 / 16] }));
-  const facadeEmi = ownTex(makeTex(facade.emissive, { aniso, wrap: THREE.RepeatWrapping, repeat: [1 / 16, 1 / 16] }));
   const graffitiTex = ownTex(makeTex(makeGraffitiTexture(), { aniso }));
   const coneTex = ownTex(makeTex(makeConeTexture(), { aniso, wrap: THREE.RepeatWrapping }));
   const dustTex = ownTex(makeTex(makeDustTexture(), { aniso }));
   const skidTex = ownTex(makeTex(makeSkidTexture(), { aniso }));
   const litterTex = ownTex(makeTex(makeLitterTexture(), { aniso }));
-  const hazeTex = ownTex(makeTex(makeHazeTexture(true), { aniso }));
-  const dustBandTex = ownTex(makeTex(makeHazeTexture(false), { aniso }));
+  const distantTex = ownTex(makeTex(makeDistantCityTexture(), { aniso, wrap: THREE.RepeatWrapping, repeat: [3, 1] }));
+
+  // ---------------------------------------------------------------------
+  // Aerial perspective for the backdrop.
+  //
+  // The scene's height fog thins out ~9 m above grade, which is correct for the
+  // lot but leaves a 150 m tower crisp and black against the sky. Everything in
+  // the city backdrop therefore carries its own per-vertex `aHaze` and is
+  // blended toward the horizon colour in linear space, before tonemapping. The
+  // colour is pulled off scene.fog every frame, so it tracks time of day and
+  // the environment's sun/anti-sun fog blend for free.
+  // ---------------------------------------------------------------------
+  //
+  // The colour comes from this module's own time-of-day ramp rather than from
+  // scene.fog: the environment biases its fog hard toward the sun and can hand
+  // back values well outside [0,1], which is fine for a height-fog term that
+  // dies 9 m above grade but would blow a 150 m tower to white. The scene fog is
+  // still used to nudge the ramp, but only when it comes back sane.
+  const HAZE_STOPS = [
+    [0.00, 0x7d8698], [0.14, 0xa3adba], [0.33, 0xb1bbc7], [0.52, 0xacb3bd],
+    [0.68, 0xbcb3a6], [0.84, 0x9a9fa8], [0.92, 0x4e566a], [1.00, 0x7d8698],
+  ];
+  const _hzA = new THREE.Color(), _hzB = new THREE.Color();
+  function hazeForTod(t) {
+    const tt = ((t % 1) + 1) % 1;
+    let i = 0;
+    while (i < HAZE_STOPS.length - 2 && HAZE_STOPS[i + 1][0] < tt) i++;
+    const [t0, c0] = HAZE_STOPS[i];
+    const [t1, c1] = HAZE_STOPS[i + 1];
+    const f = clamp((tt - t0) / Math.max(1e-4, t1 - t0), 0, 1);
+    _hzA.setHex(c0, THREE.SRGBColorSpace);
+    _hzB.setHex(c1, THREE.SRGBColorSpace);
+    return _hzA.lerp(_hzB, f);
+  }
+  const hazeU = { value: hazeForTod(0.68).clone() };
+
+  function patchCityHaze(material) {
+    const prev = material.onBeforeCompile;
+    material.onBeforeCompile = (shader, renderer) => {
+      if (prev) prev(shader, renderer);
+      shader.uniforms.uCityHaze = hazeU;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aHaze;\nvarying float vHaze;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\n\tvHaze = aHaze;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform vec3 uCityHaze;\nvarying float vHaze;')
+        .replace('#include <opaque_fragment>',
+          '#include <opaque_fragment>\n\tgl_FragColor.rgb = mix( gl_FragColor.rgb, uCityHaze, vHaze );');
+    };
+    material.customProgramCacheKey = () => 'props_city_haze';
+    return material;
+  }
+
+  /** Facade material for one treatment: albedo + packed rough/metal + lit windows. */
+  function facadeMaterial(kind) {
+    const f = makeFacade(kind);
+    const rep = [1 / FACADE_M, 1 / FACADE_M];
+    const m = new THREE.MeshStandardMaterial({
+      name: `props_facade_${kind}`,
+      map: ownTex(makeTex(f.color, { aniso, wrap: THREE.RepeatWrapping, repeat: rep })),
+      roughnessMap: ownTex(makeTex(f.orm, { srgb: false, aniso, wrap: THREE.RepeatWrapping, repeat: rep })),
+      emissiveMap: ownTex(makeTex(f.emissive, { aniso, wrap: THREE.RepeatWrapping, repeat: rep })),
+      emissive: new THREE.Color(0xffffff),
+      emissiveIntensity: 0.03,
+      vertexColors: true,
+      roughness: 1,
+      metalness: 1,
+      envMapIntensity: 1.15,
+      fog: false,
+    });
+    m.metalnessMap = m.roughnessMap;      // G = roughness, B = metalness
+    return own(patchCityHaze(m));
+  }
+
+  const trimTex = ownTex(makeTex(makeTrimTexture(), { aniso, wrap: THREE.RepeatWrapping, repeat: [0.25, 0.25] }));
+  /** Rough pale concrete/painted surfaces in the backdrop. */
+  const cityTrimMat = own(patchCityHaze(new THREE.MeshStandardMaterial({
+    name: 'props_city_trim', map: trimTex, vertexColors: true, fog: false,
+    roughness: 0.9, metalness: 0.0, envMapIntensity: 0.9,
+  })));
+  /** Steel, plant rooms, aerials, viaduct furniture. */
+  const cityDarkMat = own(patchCityHaze(new THREE.MeshStandardMaterial({
+    name: 'props_city_dark', vertexColors: true, fog: false,
+    roughness: 0.62, metalness: 0.72, envMapIntensity: 1.0,
+  })));
 
   // Banners: one atlas, one merged mesh, wind wobble driven by aFlex.
   const bannerMat = own(new THREE.MeshStandardMaterial({
@@ -929,13 +1221,14 @@ export function createProps(ctx) {
   `, 'props_banner_wind');
 
   // Rooftop billboards use the same atlas but must not flap.
-  const billboardMat = own(new THREE.MeshStandardMaterial({
+  const billboardMat = own(patchCityHaze(new THREE.MeshStandardMaterial({
     name: 'props_billboard',
     map: bannerTex,
-    side: THREE.FrontSide,
+    side: THREE.DoubleSide,
     roughness: 0.8,
     metalness: 0,
-  }));
+    fog: false,
+  })));
 
   const foliageMat = own(new THREE.MeshStandardMaterial({
     name: 'props_foliage',
@@ -984,17 +1277,37 @@ export function createProps(ctx) {
     }
   `, 'props_weed_wind');
 
-  const facadeMat = own(new THREE.MeshStandardMaterial({
-    name: 'props_facade',
-    map: facadeTex,
-    emissiveMap: facadeEmi,
-    emissive: new THREE.Color(0xffffff),
-    emissiveIntensity: 0,
-    vertexColors: true,
-    roughness: 0.86,
-    metalness: 0.03,
-    fog: true,
+  const FACADE_MATS = {
+    curtain: facadeMaterial('curtain'),
+    punched: facadeMaterial('punched'),
+    brick: facadeMaterial('brick'),
+  };
+
+  const palmMat = own(new THREE.MeshStandardMaterial({
+    name: 'props_palm',
+    map: palmTex,
+    alphaTest: 0.34,
+    side: THREE.DoubleSide,
+    roughness: 0.84,
+    metalness: 0,
+    envMapIntensity: 0.9,
   }));
+  patchVertex(palmMat, windU, /* glsl */`
+    uniform float uTime;
+    uniform vec2 uWind;
+    attribute float aWind;
+    ${WIND_NOISE}
+  `, /* glsl */`
+    {
+      vec3 ip = (instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+      float t = uTime * 1.05;
+      float w = propWave(ip, t, 0.31);
+      float gust = 0.55 + 0.45 * sin(uTime * 0.19 + ip.x * 0.02);
+      transformed.x += w * 0.42 * aWind * gust * uWind.x;
+      transformed.z += propWave(ip.zxy, t * 0.79, 0.37) * 0.30 * aWind * gust;
+      transformed.y -= abs(w) * 0.10 * aWind;
+    }
+  `, 'props_palm_wind');
 
   const graffitiMat = own(new THREE.MeshStandardMaterial({
     name: 'props_graffiti',
@@ -1055,13 +1368,9 @@ export function createProps(ctx) {
     metalness: 0.1,
   }));
 
-  const hazeMat = own(new THREE.MeshBasicMaterial({
-    name: 'props_haze', map: hazeTex, transparent: true, depthWrite: false,
-    side: THREE.BackSide, fog: false, opacity: 0.95,
-  }));
-  const dustBandMat = own(new THREE.MeshBasicMaterial({
-    name: 'props_dustband', map: dustBandTex, transparent: true, depthWrite: false,
-    side: THREE.BackSide, fog: false, opacity: 0.5,
+  const distantMat = own(new THREE.MeshBasicMaterial({
+    name: 'props_distant_city', map: distantTex, transparent: true, depthWrite: false,
+    side: THREE.BackSide, fog: false, opacity: 0.9,
   }));
 
   // --- buckets -------------------------------------------------------------
@@ -1779,15 +2088,23 @@ export function createProps(ctx) {
     attribute vec3 aShirt;
     attribute vec3 aPants;
     attribute vec3 aSkin;
+    attribute vec3 aHair;
   `, /* glsl */`
     {
-      float t = uTime * 1.7 + aPhase;
-      float bob = sin(t) * 0.022 + sin(t * 0.53 + 1.7) * 0.012;
-      float sway = sin(uTime * 0.9 + aPhase * 1.7) * 0.016;
-      float up = clamp(position.y * 0.8, 0.0, 1.4);
-      transformed.y += bob;
+      // Idle motion: weight shifts from foot to foot, the chest breathes and the
+      // arms trail it. Everything is scaled by height off the ground so the feet
+      // stay planted.
+      float t = uTime * 1.55 + aPhase;
+      float up = clamp(position.y * 0.62, 0.0, 1.25);
+      float arm = clamp((position.y - 0.9) * 1.4, 0.0, 1.0);
+      float bob = sin(t * 0.85) * 0.013 + sin(t * 0.41 + 1.7) * 0.009;
+      float sway = sin(t * 0.47) * 0.021 + sin(t * 1.31 + 2.2) * 0.006;
+      transformed.y += bob * up;
       transformed.x += sway * up;
-      transformed.z += cos(uTime * 0.7 + aPhase) * 0.008 * up;
+      transformed.z += cos(t * 0.39 + 1.1) * 0.012 * up;
+      // small independent arm/hand drift
+      transformed.x += sin(t * 1.9 + 0.7) * 0.016 * arm * sign(position.x + 0.001);
+      transformed.z += sin(t * 1.6) * 0.014 * arm;
     }
   `, 'props_crowd_idle');
   crowdMat.onBeforeCompile = ((base) => (shader) => {
@@ -1796,7 +2113,8 @@ export function createProps(ctx) {
       #include <color_vertex>
       {
         vec3 tint = aSkin;
-        if (aRegion > 2.5) tint = vec3(0.045, 0.042, 0.05);
+        if (aRegion > 3.5) tint = aHair;
+        else if (aRegion > 2.5) tint = vec3(0.045, 0.042, 0.05);
         else if (aRegion > 1.5) tint = aPants;
         else if (aRegion > 0.5) tint = aShirt;
         vColor.rgb *= tint;
@@ -1812,80 +2130,169 @@ export function createProps(ctx) {
     return strip(geo);
   }
 
-  function standingFigure() {
-    const parts = [];
-    parts.push(figurePart(place(box(0.14, 0.09, 0.29), 0.11, 0.045, 0.03), 3, 0.9));
-    parts.push(figurePart(place(box(0.14, 0.09, 0.29), -0.11, 0.045, -0.02), 3, 0.9));
-    parts.push(figurePart(place(box(0.155, 0.80, 0.175), 0.11, 0.48, 0), 2, 0.92));
-    parts.push(figurePart(place(box(0.155, 0.80, 0.175), -0.11, 0.48, 0), 2, 0.88));
-    parts.push(figurePart(place(box(0.40, 0.17, 0.25), 0, 0.92, 0), 2, 0.95));
-    parts.push(figurePart(place(taperY(box(0.43, 0.58, 0.25), -0.29, 0.29, 0.84, 1.0), 0, 1.28, 0), 1, 1.0));
-    parts.push(figurePart(place(box(0.13, 0.54, 0.15), 0.28, 1.28, 0.01, 0, 0, -0.10), 1, 0.9));
-    parts.push(figurePart(place(box(0.13, 0.54, 0.15), -0.28, 1.28, -0.01, 0, 0, 0.10), 1, 0.87));
-    parts.push(figurePart(place(box(0.10, 0.12, 0.11), 0.32, 0.98, 0.02), 0, 0.95));
-    parts.push(figurePart(place(box(0.10, 0.12, 0.11), -0.32, 0.98, -0.02), 0, 0.95));
-    parts.push(figurePart(place(box(0.105, 0.10, 0.105), 0, 1.60, 0), 0, 0.92));
-    parts.push(figurePart(place(new THREE.IcosahedronGeometry(0.128, 1), 0, 1.72, 0), 0, 1.0));
-    parts.push(figurePart(place(box(0.235, 0.06, 0.245), 0, 1.80, 0.006), 3, 1.0));
-    const g = mergeGeometries(parts, false);
-    for (const p of parts) p.dispose();
+  /**
+   * One bone of a spectator. `len` is signed: negative hangs down from the joint
+   * at (x,y,z), positive rises from it. Returns the far end so the next bone in
+   * the chain can start there — that is what gives the crowd real elbows, knees
+   * and a head that follows a leaning torso.
+   */
+  function bone(out, region, shade, x, y, z, len, w, d, pitch, roll, taper = 0.86) {
+    const g = box(w, Math.abs(len), d);
+    if (taper !== 1) {
+      const h = Math.abs(len) * 0.5;
+      taperY(g, -h, h, len < 0 ? taper : 1, len < 0 ? 1 : taper);
+    }
+    g.translate(0, len * 0.5, 0);
+    _euler.set(pitch, 0, roll, 'YXZ');
+    _quat.setFromEuler(_euler);
+    _scl.set(1, 1, 1);
+    _m4.compose(_pos.set(x, y, z), _quat, _scl);
+    g.applyMatrix4(_m4);
+    out.push(figurePart(g, region, shade));
+    const cr = Math.cos(roll), sr = Math.sin(roll);
+    return [x - len * sr, y + len * cr * Math.cos(pitch), z + len * cr * Math.sin(pitch)];
+  }
+
+  /**
+   * A spectator in a given pose. Regions: 0 skin, 1 top, 2 trousers, 3 dark
+   * (shoes and headwear), 4 hair. +Z is the direction the figure faces, and
+   * because `bone` rotates about the joint, a hanging bone (arms, legs) swings
+   * forward on NEGATIVE pitch while a rising one (torso, neck) leans forward on
+   * POSITIVE pitch. The pose table below is written with that in mind.
+   */
+  function figureGeo(o) {
+    const p = [];
+    const hipY = o.hipY;
+
+    // --- legs, hips ---------------------------------------------------------
+    for (let s = 0; s < 2; s++) {
+      const sx = s ? 0.098 : -0.098;
+      const sh = s ? 0.88 : 0.95;
+      const knee = bone(p, 2, sh, sx, hipY, 0, -0.44, 0.138, 0.162, o.thigh[s], (s ? 0.035 : -0.035), 0.82);
+      const ank = bone(p, 2, sh * 0.97, knee[0], knee[1], knee[2], -0.43, 0.108, 0.122, o.shin[s], 0, 0.84);
+      const fy = o.footYaw ? (s ? o.footYaw : -o.footYaw) : 0;
+      p.push(figurePart(place(box(0.102, 0.078, 0.265),
+        ank[0], ank[1] + 0.012, ank[2] + 0.062, fy), 3, 0.98));
+      // ankle/sock so the shoe is not a floating slab
+      p.push(figurePart(place(box(0.088, 0.075, 0.10), ank[0], ank[1] + 0.062, ank[2] + 0.005), 0, 0.9));
+    }
+    p.push(figurePart(place(box(0.305, 0.215, 0.198), 0, hipY + 0.05, 0), 2, 0.97));
+
+    // --- torso --------------------------------------------------------------
+    const waistY = hipY + 0.145;
+    const CHEST = 0.455;
+    const shoulder = bone(p, 1, 1.0, 0, waistY, 0, CHEST, 0.335, 0.212, o.torso, 0, 1.17);
+    const sinT = Math.sin(o.torso), cosT = Math.cos(o.torso);
+    // shoulder yoke: gives the silhouette its width right where it matters
+    p.push(figurePart(place(taperY(box(0.44, 0.135, 0.235), -0.07, 0.07, 1.0, 0.86),
+      shoulder[0], shoulder[1] - 0.045 * cosT, shoulder[2] - 0.045 * sinT, 0, o.torso), 1, 1.0));
+
+    // --- arms ---------------------------------------------------------------
+    for (let s = 0; s < 2; s++) {
+      const sx = s ? 0.196 : -0.196;
+      const sh = s ? 0.9 : 0.97;
+      const ay = shoulder[1] - 0.055 * cosT;
+      const az = shoulder[2] - 0.055 * sinT;
+      const elbow = bone(p, 1, sh, sx, ay, az, -0.285, 0.104, 0.112, o.upperArm[s], o.armRoll[s], 0.88);
+      const wrist = bone(p, 0, sh, elbow[0], elbow[1], elbow[2], -0.27, 0.088, 0.096,
+        o.upperArm[s] + o.elbow[s], o.foreRoll ? o.foreRoll[s] : o.armRoll[s] * 0.4, 0.9);
+      p.push(figurePart(place(box(0.078, 0.115, 0.072), wrist[0], wrist[1] - 0.05, wrist[2]), 0, 0.95));
+    }
+
+    // --- neck, head, hair ---------------------------------------------------
+    const neck = bone(p, 0, 0.88, shoulder[0], shoulder[1] - 0.03 * cosT, shoulder[2] - 0.03 * sinT,
+      0.085, 0.088, 0.09, o.torso * 0.35, 0, 1);
+    const hp = o.torso * 0.35 + (o.head || 0);
+    const hx = neck[0], hy = neck[1] + 0.098 * Math.cos(hp), hz = neck[2] + 0.098 * Math.sin(hp);
+    const headGeo = new THREE.IcosahedronGeometry(0.103, 1);
+    headGeo.scale(0.98, 1.16, 1.04);
+    p.push(figurePart(place(headGeo, hx, hy, hz, 0, hp), 0, 1.0));
+    // hair/headwear: a cap over the crown and down the back, face left clear
+    const hair = new THREE.IcosahedronGeometry(0.108, 1);
+    hair.scale(1.05, 0.72, 1.08);
+    p.push(figurePart(place(hair, hx, hy + 0.052, hz - 0.012, 0, hp), 4, 1.0));
+    p.push(figurePart(place(box(0.185, 0.14, 0.075), hx, hy + 0.01, hz - 0.078, 0, hp), 4, 0.9));
+
+    const g = mergeGeometries(p, false);
+    for (const q of p) q.dispose();
     return g;
   }
 
-  function seatedFigure() {
-    const parts = [];
-    parts.push(figurePart(place(box(0.16, 0.15, 0.44), 0.11, 0.07, 0.22), 2, 0.92));
-    parts.push(figurePart(place(box(0.16, 0.15, 0.44), -0.11, 0.07, 0.22), 2, 0.88));
-    parts.push(figurePart(place(box(0.145, 0.46, 0.16), 0.11, -0.24, 0.40), 2, 0.9));
-    parts.push(figurePart(place(box(0.145, 0.46, 0.16), -0.11, -0.24, 0.40), 2, 0.86));
-    parts.push(figurePart(place(box(0.15, 0.09, 0.28), 0.11, -0.44, 0.50), 3, 0.9));
-    parts.push(figurePart(place(box(0.15, 0.09, 0.28), -0.11, -0.44, 0.50), 3, 0.9));
-    parts.push(figurePart(place(taperY(box(0.43, 0.56, 0.25), -0.28, 0.28, 0.84, 1.0), 0, 0.40, 0.02, 0, -0.10), 1, 1.0));
-    parts.push(figurePart(place(box(0.13, 0.46, 0.16), 0.28, 0.38, 0.08, 0, -0.35), 1, 0.9));
-    parts.push(figurePart(place(box(0.13, 0.46, 0.16), -0.28, 0.38, 0.08, 0, -0.35), 1, 0.87));
-    parts.push(figurePart(place(box(0.10, 0.11, 0.11), 0.30, 0.20, 0.26), 0, 0.95));
-    parts.push(figurePart(place(box(0.10, 0.11, 0.11), -0.30, 0.20, 0.26), 0, 0.95));
-    parts.push(figurePart(place(box(0.105, 0.10, 0.105), 0, 0.71, 0.01), 0, 0.92));
-    parts.push(figurePart(place(new THREE.IcosahedronGeometry(0.126, 1), 0, 0.83, 0.01), 0, 1.0));
-    parts.push(figurePart(place(box(0.23, 0.06, 0.24), 0, 0.91, 0.012), 3, 1.0));
-    const g = mergeGeometries(parts, false);
-    for (const p of parts) p.dispose();
-    return g;
-  }
+  const POSE = {
+    // relaxed stand: weight on one leg, one forearm brought up across the chest
+    stand: {
+      hipY: 0.900, torso: 0.055, footYaw: 0.22,
+      thigh: [0.05, -0.06], shin: [-0.06, 0.04],
+      upperArm: [0.08, 0.16], armRoll: [-0.12, 0.13], elbow: [-0.34, -1.15],
+      head: -0.04,
+    },
+    // arms folded, hunched forward watching the run — the strongest silhouette
+    // of the four at fence distance
+    lean: {
+      hipY: 0.885, torso: 0.26, footYaw: 0.14,
+      thigh: [0.06, -0.05], shin: [-0.08, 0.06],
+      upperArm: [-0.12, -0.10], armRoll: [-0.20, 0.22], elbow: [-1.72, -1.66],
+      foreRoll: [1.28, -1.24], head: 0.14,
+    },
+    // arms up: someone calling a trick
+    cheer: {
+      hipY: 0.902, torso: -0.06, footYaw: 0.34,
+      thigh: [-0.03, 0.03], shin: [0.02, -0.02],
+      upperArm: [2.55, 2.68], armRoll: [-0.34, 0.36], elbow: [0.42, 0.36],
+      head: -0.18,
+    },
+    // seated on the bleacher nosing, forearms on the knees
+    sit: {
+      hipY: 0.080, torso: 0.20, footYaw: 0.18,
+      thigh: [-1.42, -1.38], shin: [-0.06, -0.11],
+      upperArm: [-0.72, -0.68], armRoll: [-0.10, 0.11], elbow: [-0.95, -0.90],
+      head: 0.10,
+    },
+  };
 
-  const SHIRTS = [0xd8452f, 0x2f6fb8, 0xe8e2d4, 0x2a2d33, 0xe0a52b, 0x4a8f5c, 0x8f4ba0, 0xd97ea0, 0x3c3f8f, 0xb8b2a4];
-  const PANTS = [0x2b3242, 0x4a4438, 0x22242a, 0x5a5f66, 0x38424f, 0x6a5a44];
-  const SKINS = [0x9c6b4a, 0x81563a, 0x5f3c26, 0xb08059, 0x4a2f1e, 0x8c6242];
+  const SHIRTS = [0xd8452f, 0x2f6fb8, 0xe8e2d4, 0x2a2d33, 0xe0a52b, 0x4a8f5c, 0x8f4ba0,
+    0xd97ea0, 0x3c3f8f, 0xb8b2a4, 0xf0f0ea, 0x1f6f68, 0xc25a1e, 0x6f7480];
+  const PANTS = [0x2b3242, 0x4a4438, 0x22242a, 0x5a5f66, 0x38424f, 0x6a5a44, 0x8a8578, 0x2f3b4c];
+  const SKINS = [0x9c6b4a, 0x81563a, 0x5f3c26, 0xb08059, 0x4a2f1e, 0x8c6242, 0xc09472];
+  const HAIRS = [0x1c1614, 0x2e2018, 0x4a3423, 0x6a4a2c, 0x8a7050, 0x161616,
+    0x2a2f3a, 0xb03a2a, 0x1b3f6a, 0xd8d4c8];   // last few read as caps/beanies
 
   function crowdMesh(geo, spots, name, cast) {
     const n = spots.length;
+    if (!n) return null;
     const shirt = new Float32Array(n * 3);
     const pants = new Float32Array(n * 3);
     const skin = new Float32Array(n * 3);
+    const hair = new Float32Array(n * 3);
     const phase = new Float32Array(n);
     const mesh = new THREE.InstancedMesh(geo, crowdMat, n);
     mesh.name = name;
     mesh.castShadow = cast;
     mesh.receiveShadow = false;
+    const put = (arr, i, hex) => {
+      _col.setHex(hex, THREE.SRGBColorSpace);
+      arr[i * 3] = _col.r; arr[i * 3 + 1] = _col.g; arr[i * 3 + 2] = _col.b;
+    };
     for (let i = 0; i < n; i++) {
       const s = spots[i];
       _euler.set(0, s.ry, 0, 'YXZ');
       _quat.setFromEuler(_euler);
       _pos.set(s.x, s.y, s.z);
-      _scl.set(s.s, s.s * rand(0.97, 1.05), s.s);
+      // real height spread: 1.55 m to 1.92 m, with matching build
+      const h = s.s;
+      _scl.set(h * rand(0.94, 1.06), h, h * rand(0.94, 1.06));
       _m4.compose(_pos, _quat, _scl);
       mesh.setMatrixAt(i, _m4);
-      _col.setHex(pick(SHIRTS), THREE.SRGBColorSpace);
-      shirt[i * 3] = _col.r; shirt[i * 3 + 1] = _col.g; shirt[i * 3 + 2] = _col.b;
-      _col.setHex(pick(PANTS), THREE.SRGBColorSpace);
-      pants[i * 3] = _col.r; pants[i * 3 + 1] = _col.g; pants[i * 3 + 2] = _col.b;
-      _col.setHex(pick(SKINS), THREE.SRGBColorSpace);
-      skin[i * 3] = _col.r; skin[i * 3 + 1] = _col.g; skin[i * 3 + 2] = _col.b;
+      put(shirt, i, pick(SHIRTS));
+      put(pants, i, pick(PANTS));
+      put(skin, i, pick(SKINS));
+      put(hair, i, pick(HAIRS));
       phase[i] = rand(0, TAU);
     }
     geo.setAttribute('aShirt', new THREE.InstancedBufferAttribute(shirt, 3));
     geo.setAttribute('aPants', new THREE.InstancedBufferAttribute(pants, 3));
     geo.setAttribute('aSkin', new THREE.InstancedBufferAttribute(skin, 3));
+    geo.setAttribute('aHair', new THREE.InstancedBufferAttribute(hair, 3));
     geo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(phase, 1));
     mesh.instanceMatrix.needsUpdate = true;
     group.add(mesh);
@@ -1893,49 +2300,122 @@ export function createProps(ctx) {
     return mesh;
   }
 
+  const bikeSpots = [];       // spectators' bikes, parked or held beside them
+
   {
-    const standSpots = [];
-    // leaning on the fence along the +Z run, either side of the gate
-    for (let i = 0; i < 16; i++) {
-      const x = lerp(-24, 30, i / 15) + rand(-0.8, 0.8);
-      if (Math.abs(x - GATE.centre) < GATE.width * 0.5 + 0.6) continue;
-      const z = LOT.hz - rand(0.85, 1.5);
-      standSpots.push({ x, y: 0, z, ry: Math.atan2(-x, -z) + rand(-0.35, 0.35), s: rand(0.93, 1.06) });
+    // Figures are authored 1 m tall at the hips-and-up scale used above; the
+    // instance scale is the rider's height in metres relative to that build.
+    const height = () => rand(0.855, 1.015);   // ≈ 1.58 m to 1.88 m tall
+    const standSpots = [], leanSpots = [], cheerSpots = [], sitSpots = [];
+
+    /** Push a spectator into whichever pose list suits the spot. */
+    const spec = (x, z, ry, opts = {}) => {
+      const r = rng();
+      const list = opts.atFence
+        ? (r < 0.60 ? leanSpots : r < 0.86 ? standSpots : cheerSpots)
+        : (r < 0.76 ? standSpots : cheerSpots);
+      list.push({ x, y: opts.y || 0, z, ry, s: height() });
+      if (opts.bikes && rng() < 0.32) {
+        bikeSpots.push({ x: x + Math.cos(ry) * rand(0.55, 0.9), z: z - Math.sin(ry) * rand(0.55, 0.9), ry: ry + rand(-0.5, 0.5) });
+      }
+    };
+
+    // the +Z fence run either side of the gate — the deepest crowd
+    for (let i = 0; i < 22; i++) {
+      const x = lerp(-27, 33, i / 21) + rand(-0.7, 0.7);
+      if (Math.abs(x - GATE.centre) < GATE.width * 0.5 + 0.7) continue;
+      const z = LOT.hz - rand(0.75, 1.35);
+      spec(x, z, Math.atan2(-x, -z) + rand(-0.3, 0.3), { atFence: true, bikes: true });
     }
-    // along the -Z run and the east fence
-    for (let i = 0; i < 9; i++) {
-      const x = lerp(-18, 24, i / 8) + rand(-1, 1);
-      standSpots.push({ x, y: 0, z: -LOT.hz + rand(0.9, 1.7), ry: Math.atan2(-x, LOT.hz) + rand(-0.3, 0.3), s: rand(0.93, 1.06) });
+    // a second, looser row behind the first
+    for (let i = 0; i < 11; i++) {
+      const x = lerp(-22, 30, i / 10) + rand(-1.4, 1.4);
+      if (Math.abs(x - GATE.centre) < GATE.width * 0.5 + 1.2) continue;
+      spec(x, LOT.hz - rand(1.9, 3.1), Math.atan2(-x, -LOT.hz) + rand(-0.5, 0.5), { bikes: true });
+    }
+    // the -Z run and the east fence
+    for (let i = 0; i < 12; i++) {
+      const x = lerp(-20, 26, i / 11) + rand(-1, 1);
+      spec(x, -LOT.hz + rand(0.8, 1.6), Math.atan2(-x, LOT.hz) + rand(-0.28, 0.28), { atFence: true });
+    }
+    for (let i = 0; i < 8; i++) {
+      const z = lerp(-16, 10, i / 7) + rand(-1, 1);
+      spec(LOT.hx - rand(0.9, 2.0), z, Math.atan2(-LOT.hx, -z) + rand(-0.28, 0.28), { atFence: true, bikes: true });
+    }
+    // knots hanging around the gate and the bleacher aisle
+    for (let i = 0; i < 7; i++) {
+      spec(GATE.centre - 6 + rand(-2.6, 2.6), LOT.hz - 6 + rand(-2.4, 2.4), rand(0, TAU), { bikes: true });
     }
     for (let i = 0; i < 6; i++) {
-      const z = lerp(-14, 8, i / 5) + rand(-1, 1);
-      standSpots.push({ x: LOT.hx - rand(1.0, 2.2), y: 0, z, ry: Math.atan2(-LOT.hx, -z) + rand(-0.3, 0.3), s: rand(0.93, 1.06) });
+      spec(BLEACH.x + rand(1.0, 3.6), rand(-10, 10), Math.PI * 0.5 + rand(-0.5, 0.5), { bikes: true });
     }
-    // knots of people by the gate and the bleachers
-    for (let i = 0; i < 5; i++) {
-      standSpots.push({
-        x: GATE.centre - 6 + rand(-2.2, 2.2), y: 0, z: LOT.hz - 6 + rand(-2, 2),
-        ry: rand(0, TAU), s: rand(0.93, 1.06),
-      });
-    }
-    for (let i = 0; i < 4; i++) {
-      standSpots.push({
-        x: BLEACH.x + rand(1.2, 3.4), y: 0, z: rand(-9, 9),
-        ry: Math.PI * 0.5 + rand(-0.4, 0.4), s: rand(0.93, 1.06),
-      });
-    }
-    crowdMesh(standingFigure(), standSpots, 'props_crowd_standing', true);
 
-    const sitSpots = [];
-    for (let r = 1; r < seatRows.length; r++) {
+    // bleachers: a few clusters per tier rather than an even sprinkle
+    for (let r = 0; r < seatRows.length; r++) {
       const row = seatRows[r];
-      const count = randInt(3, 6);
-      for (let i = 0; i < count; i++) {
-        const z = rand(-row.len * 0.45, row.len * 0.45);
-        sitSpots.push({ x: row.x, y: row.y, z, ry: Math.PI * 0.5 + rand(-0.28, 0.28), s: rand(0.94, 1.05) });
+      const clusters = randInt(2, 3);
+      for (let c = 0; c < clusters; c++) {
+        const z0 = rand(-row.len * 0.42, row.len * 0.42);
+        const n = randInt(1, 4);
+        for (let i = 0; i < n; i++) {
+          sitSpots.push({
+            x: row.x + rand(-0.05, 0.05), y: row.y, z: z0 + i * rand(0.62, 0.82),
+            ry: Math.PI * 0.5 + rand(-0.22, 0.22), s: rand(0.855, 1.015),
+          });
+        }
       }
     }
-    crowdMesh(seatedFigure(), sitSpots, 'props_crowd_seated', true);
+
+    crowdMesh(figureGeo(POSE.stand), standSpots, 'props_crowd_standing', true);
+    crowdMesh(figureGeo(POSE.lean), leanSpots, 'props_crowd_leaning', true);
+    crowdMesh(figureGeo(POSE.cheer), cheerSpots, 'props_crowd_cheering', true);
+    crowdMesh(figureGeo(POSE.sit), sitSpots, 'props_crowd_seated', true);
+  }
+
+  // spectators' bikes: one instanced mesh, per-instance frame colour
+  if (bikeSpots.length) {
+    const parts = [];
+    const wheelR = 0.255;
+    for (const wz of [-0.525, 0.525]) {
+      parts.push(strip(place(new THREE.TorusGeometry(wheelR, 0.032, 5, 14), 0, wheelR, wz, 0, 0, Math.PI * 0.5)));
+      parts.push(strip(place(cyl(0.030, 0.030, 0.075, 6), 0, wheelR, wz, 0, 0, Math.PI * 0.5)));
+      for (let k = 0; k < 3; k++) {
+        parts.push(strip(place(cyl(0.006, 0.006, wheelR * 1.9, 4), 0, wheelR, wz, 0, k * 1.05, 0)));
+      }
+    }
+    // frame: down tube, top tube, seat tube, chainstay, fork, bars, seat
+    parts.push(strip(place(cyl(0.021, 0.021, 0.62, 5), 0, 0.44, 0.10, 0, 0, 1.30)));
+    parts.push(strip(place(cyl(0.021, 0.021, 0.56, 5), 0, 0.68, 0.06, 0, 0, 1.44)));
+    parts.push(strip(place(cyl(0.020, 0.020, 0.32, 5), 0, 0.60, -0.20, 0, 0, 0.24)));
+    parts.push(strip(place(cyl(0.016, 0.016, 0.56, 5), 0, 0.32, -0.28, 0, 0, 1.50)));
+    parts.push(strip(place(cyl(0.018, 0.018, 0.60, 5), 0, 0.56, 0.44, 0, 0, -0.22)));
+    parts.push(strip(place(cyl(0.018, 0.018, 0.52, 5), 0, 0.98, 0.40, 0, 0, Math.PI * 0.5)));
+    parts.push(strip(place(box(0.06, 0.05, 0.24), 0, 0.80, -0.30)));
+    const geo = mergeGeometries(parts, false);
+    for (const g of parts) g.dispose();
+    const bikeMat = own(new THREE.MeshStandardMaterial({
+      name: 'props_crowd_bike', color: 0xffffff, roughness: 0.42, metalness: 0.8, envMapIntensity: 1.1,
+    }));
+    const bikes = new THREE.InstancedMesh(geo, bikeMat, bikeSpots.length);
+    bikes.name = 'props_crowd_bikes';
+    bikes.castShadow = true;
+    bikes.receiveShadow = false;
+    const FRAMES = [0x1a1c20, 0x8c2f2a, 0x2a5b8c, 0xc8a02a, 0x2f6f4a, 0xb0b4b8, 0x6a3a7a];
+    for (let i = 0; i < bikeSpots.length; i++) {
+      const s = bikeSpots[i];
+      // parked bikes lean over on their pedal
+      _euler.set(0, s.ry, rand(0.18, 0.34) * (rng() < 0.5 ? -1 : 1), 'YXZ');
+      _quat.setFromEuler(_euler);
+      _pos.set(s.x, 0.03, s.z);
+      _scl.setScalar(rand(0.96, 1.04));
+      _m4.compose(_pos, _quat, _scl);
+      bikes.setMatrixAt(i, _m4);
+      bikes.setColorAt(i, _col.setHex(pick(FRAMES), THREE.SRGBColorSpace));
+    }
+    bikes.instanceMatrix.needsUpdate = true;
+    if (bikes.instanceColor) bikes.instanceColor.needsUpdate = true;
+    group.add(bikes);
+    owned.geo.push(geo);
   }
 
   // =========================================================================
@@ -2083,6 +2563,118 @@ export function createProps(ctx) {
     owned.geo.push(shrubGeo);
   }
 
+  // --- palms along the street beyond the fence -------------------------------
+  // Two instanced meshes (trunks + crowns) for the whole avenue. They read as
+  // the reference's palm line: tall bare stems with the crown well clear of the
+  // fence, so the skyline behind them still shows through.
+  {
+    const palmBark = libMat('wood', { color: 0xc0b19a, roughness: 0.96 }, { color: 0xc0b19a, roughness: 0.96 });
+
+    /** Curved, ringed palm stem, 1 m tall at unit scale. */
+    function palmTrunk() {
+      const parts = [];
+      const segs = 8;
+      for (let i = 0; i < segs; i++) {
+        const t0 = i / segs, t1 = (i + 1) / segs;
+        const r0 = lerp(0.042, 0.024, t0), r1 = lerp(0.042, 0.024, t1);
+        const bend = 0.11;
+        parts.push(place(cyl(r1, r0, 1 / segs + 0.006, 7),
+          Math.pow(t0, 2) * bend, (t0 + t1) * 0.5, 0, 0, 0, -0.10 * t0));
+        // leaf-scar ring
+        if (i % 2 === 0) {
+          parts.push(place(cyl(r0 * 1.16, r0 * 1.16, 0.012, 7), Math.pow(t0, 2) * bend, t0 + 0.03, 0));
+        }
+      }
+      parts.push(place(cyl(0.055, 0.078, 0.10, 8), 0, 0.05, 0));       // root swell
+      const merged = mergeGeometries(parts.map(strip), false);
+      for (const p of parts) p.dispose();
+      return merged;
+    }
+
+    /**
+     * Crown of fronds. Each frond is two half-quads folded up along the rachis
+     * into a shallow V, so the crown keeps a silhouette from every angle rather
+     * than vanishing edge-on like a flat card would.
+     */
+    function palmCrown() {
+      const parts = [];
+      const N = 12;
+      for (let i = 0; i < N; i++) {
+        const a = (i / N) * TAU + rand(-0.15, 0.15);
+        const dead = i >= N - 2;
+        const droop = dead ? rand(1.25, 1.55)
+          : lerp(0.10, 1.05, Math.pow((i + rand(0, 0.6)) / N, 0.75));
+        const len = rand(2.5, 3.4) * (dead ? 0.82 : 1);
+        for (const sign of [-1, 1]) {
+          const q = new THREE.PlaneGeometry(len, len * 0.25);
+          q.translate(len * 0.5, sign * len * 0.125, 0);
+          const uv = q.attributes.uv;
+          for (let k = 0; k < uv.count; k++) {
+            uv.setXY(k, uv.getX(k), sign > 0 ? 0.5 + uv.getY(k) * 0.5 : uv.getY(k) * 0.5);
+          }
+          q.rotateX(-Math.PI * 0.5);          // lie flat, face up
+          q.rotateX(sign * 0.40);             // fold the half up along the rachis
+          place(q, 0, 0, 0, a, 0, -droop);
+          const p2 = q.attributes.position;
+          const wind = new Float32Array(p2.count);
+          for (let k = 0; k < p2.count; k++) {
+            wind[k] = clamp(Math.hypot(p2.getX(k), p2.getZ(k)) / len, 0, 1) * 1.35;
+          }
+          q.setAttribute('aWind', new THREE.BufferAttribute(wind, 1));
+          parts.push(strip(q));
+        }
+      }
+      const merged = mergeGeometries(parts, false);
+      for (const p of parts) p.dispose();
+      return merged;
+    }
+
+    // an avenue just outside the fence, plus a scattered back row
+    const palms = [];
+    for (let i = 0; i < 26; i++) {
+      const a = ((i + rand(-0.28, 0.28)) / 26) * TAU;
+      const p = outsideLot(a, rand(2.6, 7.5));
+      // keep the gate approach and the parked vehicles clear
+      if (p.z > LOT.hz && p.x > GATE.centre - 10 && p.x < GATE.centre + 10) continue;
+      palms.push({ x: p.x, z: p.z, h: rand(7.5, 13.0), ry: rand(0, TAU) });
+    }
+    for (let i = 0; i < 18; i++) {
+      const p = outsideLot(rand(0, TAU), rand(12, 46));
+      palms.push({ x: p.x, z: p.z, h: rand(8, 15.5), ry: rand(0, TAU) });
+    }
+
+    const tGeo = palmTrunk(), cGeo = palmCrown();
+    const tMesh = new THREE.InstancedMesh(tGeo, palmBark, palms.length);
+    const cMesh = new THREE.InstancedMesh(cGeo, palmMat, palms.length);
+    tMesh.name = 'props_palm_trunks';
+    cMesh.name = 'props_palm_crowns';
+    tMesh.castShadow = cMesh.castShadow = false;
+    tMesh.receiveShadow = cMesh.receiveShadow = false;
+    for (let i = 0; i < palms.length; i++) {
+      const p = palms[i];
+      _euler.set(0, p.ry, 0, 'YXZ');
+      _quat.setFromEuler(_euler);
+      _pos.set(p.x, 0, p.z);
+      _scl.set(p.h * 0.92, p.h, p.h * 0.92);
+      _m4.compose(_pos, _quat, _scl);
+      tMesh.setMatrixAt(i, _m4);
+      // the crown sits on top of the stem and does not inherit its stretch
+      const cs = lerp(0.80, 1.28, clamp((p.h - 7) / 8, 0, 1));
+      const bend = p.h * 0.092;
+      _euler.set(0, p.ry + rand(0, TAU), 0, 'YXZ');
+      _quat.setFromEuler(_euler);
+      _pos.set(p.x + Math.cos(p.ry) * bend, p.h * 0.985, p.z - Math.sin(p.ry) * bend);
+      _scl.set(cs, cs, cs);
+      _m4.compose(_pos, _quat, _scl);
+      cMesh.setMatrixAt(i, _m4);
+    }
+    tMesh.instanceMatrix.needsUpdate = true;
+    cMesh.instanceMatrix.needsUpdate = true;
+    group.add(tMesh);
+    group.add(cMesh);
+    owned.geo.push(tGeo, cGeo);
+  }
+
   // =========================================================================
   // 9. ground scatter: dust, tyre marks, litter, weeds in the cracks
   // =========================================================================
@@ -2225,157 +2817,428 @@ export function createProps(ctx) {
   }
 
   // =========================================================================
-  // 10. city backdrop: skyline ring, water towers, cranes, billboards, haze
+  // 10. city backdrop: four depth bands, an elevated freeway, cranes, masts
   // =========================================================================
+  // Nothing here casts a shadow and nothing here is closer than the fence line.
+  // Depth is carried by `aHaze`: each piece is blended toward the live horizon
+  // colour in linear space, so the far band lifts and desaturates into the air
+  // instead of sitting on the sky as a cut-out.
   const skyline = new THREE.Group();
   skyline.name = 'props_skyline';
   group.add(skyline);
 
-  const TINTS = [0x8d8a82, 0x7f8288, 0x9b9184, 0x6f757e, 0xa39584, 0x87837c, 0x5f6670, 0x94867a];
+  const VIA = { z: -118, x0: -340, x1: 340, deckY: 14.0, w: 17 };
 
   {
-    const buildingGeos = [];
-    const roofBucket = createBucket();
-    const towers = [];
+    const facadeGeos = { curtain: [], punched: [], brick: [] };
+    const trimGeos = [], darkGeos = [], boardGeos = [];
+    const roofSlots = [];              // { x, z, y, a, w, d, band } for tanks/boards
 
-    const COUNT = 78;
-    for (let i = 0; i < COUNT; i++) {
-      const a = (i / COUNT) * TAU + rand(-0.035, 0.035);
-      const ring = rng();
-      const r = lerp(165, 430, Math.pow(ring, 0.75)) + rand(-22, 22);
-      const x = Math.cos(a) * r, z = Math.sin(a) * r;
-      const w = rand(16, 42), d = rand(16, 42);
-      // nearer buildings stay lower so the far towers still read as a skyline
-      const tall = Math.pow(rng(), 2.2);
-      const h = lerp(14, 46, ring) + tall * lerp(20, 90, ring);
-      const tint = pick(TINTS);
-
-      const base = tintGeo(place(box(w, h, d), x, h * 0.5, z, a), tint, 0.03);
-      buildingGeos.push(strip(base));
-
-      // setbacks
-      let sh = h, sw = w, sd = d;
-      const setbacks = randInt(0, 2);
-      for (let k = 0; k < setbacks; k++) {
-        sw *= rand(0.55, 0.8); sd *= rand(0.55, 0.8);
-        const add = rand(6, 26) * (0.4 + ring);
-        buildingGeos.push(strip(tintGeo(place(box(sw, add, sd), x, sh + add * 0.5, z, a), tint, 0.03)));
-        sh += add;
+    /** Tag a backdrop geometry with its colour and its aerial-perspective weight. */
+    function hazed(g, tint, haze, jitter = 0.03) {
+      tintGeo(g, tint, jitter);
+      const p = g.attributes.position;
+      const arr = new Float32Array(p.count);
+      for (let i = 0; i < p.count; i++) {
+        // the bases of the city sit deeper in the haze than the tops
+        arr[i] = clamp(haze + (1 - clamp(p.getY(i) / 55, 0, 1)) * 0.045, 0, 0.86);
       }
+      g.setAttribute('aHaze', new THREE.BufferAttribute(arr, 1));
+      return strip(g);
+    }
+    const trim = (g, tint, haze, j) => { trimGeos.push(hazed(g, tint, haze, j)); };
+    const dark = (g, tint, haze, j) => { darkGeos.push(hazed(g, tint, haze, j)); };
 
-      // parapet + rooftop clutter, dark and unlit so the roofline stays crisp
-      roofBucket.add(MAT.concretePale, place(box(sw + 0.8, 0.9, sd + 0.8), x, sh + 0.45, z, a));
-      const clutter = randInt(1, 4);
-      for (let k = 0; k < clutter; k++) {
-        const cw = rand(2, 7), cd = rand(2, 7), chh = rand(1.6, 5);
-        roofBucket.add(MAT.steelDark, place(box(cw, chh, cd),
-          x + rand(-sw * 0.3, sw * 0.3), sh + chh * 0.5, z + rand(-sd * 0.3, sd * 0.3), a));
+    /**
+     * A facade mass. UVs arrive in metres from `box`; per building we rescale
+     * them (window pitch), lift them so v = 0 lands on the pavement, and slide
+     * them along, so no two neighbours show the same pattern of lit windows.
+     */
+    function facadeBox(kind, w, h, d, x, y, z, ry, tint, haze, uvS, uvO) {
+      const g = box(w, h, d);
+      const uv = g.attributes.uv;
+      for (let i = 0; i < uv.count; i++) {
+        uv.setXY(i, uv.getX(i) * uvS + uvO[0], (uv.getY(i) + h * 0.5) * uvS + uvO[1]);
       }
-      if (rng() < 0.30) {
-        const mh = rand(8, 26);
-        roofBucket.add(MAT.steelDark, place(cyl(0.25, 0.5, mh, 5), x + rand(-4, 4), sh + mh * 0.5, z + rand(-4, 4)));
-      }
-      if (rng() < 0.18) towers.push({ x, z, y: sh, a });
+      place(g, x, y, z, ry);
+      facadeGeos[kind].push(hazed(g, tint, haze));
     }
 
-    const merged = mergeGeometries(buildingGeos, false);
-    for (const g of buildingGeos) g.dispose();
-    if (merged) {
+    const BASE_TINTS = [0xa89e8e, 0xb5aa97, 0x968f85, 0xbcae92, 0x8d929a, 0xa19786,
+      0xbcb29e, 0x7d828a, 0xa5977f, 0x8d939d, 0xc0b299, 0x757b85];
+    const NEUTRAL = new THREE.Color().setHex(0xa4a6a6, THREE.SRGBColorSpace);
+    const _t = new THREE.Color();
+    /** Desaturate toward the horizon and lift the value with distance. */
+    function bandTint(B) {
+      _t.setHex(pick(BASE_TINTS), THREE.SRGBColorSpace);
+      _t.lerp(NEUTRAL, 1 - B.sat).multiplyScalar(B.val);
+      return _t.getHex(THREE.SRGBColorSpace);
+    }
+    const trimTint = (B) => {
+      _t.setHex(0xbab3a4, THREE.SRGBColorSpace);
+      _t.lerp(NEUTRAL, 1 - B.sat).multiplyScalar(B.val);
+      return _t.getHex(THREE.SRGBColorSpace);
+    };
+
+    const BANDS = [
+      { // 0 — sprawl right outside the fence: lock-ups, workshops, a depot
+        count: 48, ell: true, gap: [9, 62], h: [3.2, 9.5], foot: [8, 30],
+        haze: [0.05, 0.12], sat: 1.00, val: 0.96,
+        kinds: ['brick', 'punched', 'brick'], setbacks: 0, roof: 2, tall: 0.0,
+      },
+      { // 1 — near mid-rise: the first real street wall
+        count: 42, r: [110, 178], h: [11, 36], foot: [15, 40],
+        haze: [0.11, 0.22], sat: 0.90, val: 1.10,
+        kinds: ['punched', 'brick', 'curtain'], setbacks: 1, roof: 3, tall: 0.30,
+      },
+      { // 2 — downtown blocks
+        count: 48, r: [188, 308], h: [26, 90], foot: [18, 48],
+        haze: [0.26, 0.42], sat: 0.72, val: 1.14,
+        kinds: ['punched', 'curtain', 'curtain'], setbacks: 2, roof: 3, tall: 0.55,
+      },
+      { // 3 — towers beyond downtown, almost pure air
+        count: 42, r: [325, 565], h: [45, 175], foot: [22, 58],
+        haze: [0.44, 0.66], sat: 0.46, val: 0.99,
+        kinds: ['curtain', 'curtain', 'punched'], setbacks: 2, roof: 2, tall: 0.85,
+      },
+    ];
+
+    for (let bi = 0; bi < BANDS.length; bi++) {
+      const B = BANDS[bi];
+      for (let i = 0; i < B.count; i++) {
+        const a = ((i + rand(-0.36, 0.36)) / B.count) * TAU;
+        let x, z, t;
+        if (B.ell) {
+          const gap = rand(B.gap[0], B.gap[1]);
+          t = (gap - B.gap[0]) / (B.gap[1] - B.gap[0]);
+          const p = outsideLot(a, gap, 4, 4);
+          x = p.x; z = p.z;
+        } else {
+          t = Math.pow(rng(), 0.85);
+          const r = lerp(B.r[0], B.r[1], t);
+          x = Math.cos(a) * r;
+          z = Math.sin(a) * r;
+        }
+        // keep the freeway corridor and the gate approach clear
+        if (Math.abs(z - VIA.z) < 24 && x > VIA.x0 - 24 && x < VIA.x1 + 24) continue;
+        if (z > LOT.hz && Math.abs(x - GATE.centre) < 13 && bi === 0) continue;
+
+        // buildings follow a street grid, and the grid turns between districts
+        const sector = (((a % TAU) + TAU) % TAU) / (TAU / 4) | 0;
+        const ry = [0.10, 0.63, -0.40, 1.19][sector]
+          + (rng() < 0.5 ? 0 : Math.PI * 0.5) + rand(-0.05, 0.05);
+
+        const w = rand(B.foot[0], B.foot[1]);
+        const d = rand(B.foot[0], B.foot[1]) * rand(0.55, 1.0);
+        const h = lerp(B.h[0], B.h[1], Math.pow(rng(), lerp(2.3, 1.05, B.tall)));
+        const haze = lerp(B.haze[0], B.haze[1], t);
+        const kind = pick(B.kinds);
+        const tint = bandTint(B);
+        const tt = trimTint(B);
+        const uvS = rand(0.80, 1.30);
+        const uvO = [rand(0, FACADE_M), randInt(0, 3) * (FACADE_M * 0.25)];
+        const co = Math.cos(ry), si = Math.sin(ry);
+
+        facadeBox(kind, w, h, d, x, h * 0.5, z, ry, tint, haze, uvS, uvO);
+
+        // a lower wing or podium pushed off to one side — varied footprints
+        if (rng() < 0.48) {
+          const pw = w * rand(0.40, 0.95), pd = d * rand(0.55, 1.10);
+          const ph = Math.max(3.2, h * rand(0.20, 0.55));
+          const ox = w * 0.5 + pw * 0.5 - rand(0.5, w * 0.22);
+          const px = x + co * ox, pz = z - si * ox;
+          facadeBox(kind, pw, ph, pd, px, ph * 0.5, pz, ry, tint, haze, uvS, uvO);
+          trim(place(box(pw + 0.7, 0.6, pd + 0.7), px, ph + 0.30, pz, ry), tt, haze, 0.02);
+        }
+
+        // setbacks
+        let sh = h, sw = w, sd = d;
+        for (let k = 0; k < B.setbacks; k++) {
+          if (rng() > 0.55) break;
+          sw *= rand(0.58, 0.84); sd *= rand(0.58, 0.84);
+          const add = rand(0.14, 0.45) * h;
+          facadeBox(kind, sw, add, sd, x, sh + add * 0.5, z, ry, tint, haze, uvS, uvO);
+          trim(place(box(sw + 1.3, 0.7, sd + 1.3), x, sh + 0.35, z, ry), tt, haze, 0.02);
+          sh += add;
+        }
+
+        // parapet — a hard, lit edge is what separates one roofline from the next
+        const pt = Math.max(0.7, Math.min(1.5, h * 0.035));
+        trim(place(box(sw + 0.9, pt, sd + 0.9), x, sh + pt * 0.5, z, ry), tt, haze, 0.02);
+        trim(place(box(sw + 1.5, 0.28, sd + 1.5), x, sh + pt, z, ry), tt, haze * 0.9, 0.02);
+
+        // rooftop clutter: a stair/lift bulkhead, plant, aerials
+        const bwd = clamp(Math.min(sw, sd) * rand(0.24, 0.42), 2.2, 9);
+        const bh = rand(2.4, 5.2);
+        const bx = x + co * rand(-sw * 0.22, sw * 0.22) + si * rand(-sd * 0.22, sd * 0.22);
+        const bz = z - si * rand(-sw * 0.22, sw * 0.22) + co * rand(-sd * 0.22, sd * 0.22);
+        trim(place(box(bwd, bh, bwd * rand(0.75, 1.4)), bx, sh + bh * 0.5, bz, ry), tt, haze, 0.02);
+        dark(place(box(bwd + 0.5, 0.22, bwd * 1.1), bx, sh + bh + 0.11, bz, ry), 0x6c7076, haze, 0.05);
+        const plant = randInt(1, B.roof);
+        for (let k = 0; k < plant; k++) {
+          const cw = rand(1.5, 4.4), ch = rand(0.9, 2.6);
+          dark(place(box(cw, ch, cw * rand(0.7, 1.35)),
+            x + rand(-sw * 0.38, sw * 0.38), sh + ch * 0.5, z + rand(-sd * 0.38, sd * 0.38), ry),
+            pick([0x6a6f75, 0x7b7f83, 0x5c6167]), haze, 0.05);
+        }
+        if (rng() < 0.4) {
+          const mh = rand(5, 20) * (0.55 + B.tall);
+          const mx = x + rand(-sw * 0.3, sw * 0.3), mz = z + rand(-sd * 0.3, sd * 0.3);
+          dark(place(cyl(0.13, 0.30, mh, 4), mx, sh + mh * 0.5, mz), 0x565b62, haze, 0.05);
+          for (let k = 0; k < 3; k++) {
+            dark(place(box(rand(0.8, 2.0), 0.12, 0.12), mx, sh + mh * (0.55 + k * 0.14), mz, rand(0, TAU)),
+              0x565b62, haze, 0.05);
+          }
+        }
+        if (rng() < 0.26) roofSlots.push({ x, z, y: sh + pt, a: ry, w: sw, d: sd, band: bi, haze });
+      }
+    }
+
+    // --- rooftop water tanks --------------------------------------------------
+    {
+      let made = 0;
+      for (const t of roofSlots) {
+        if (made >= 9) break;
+        if (t.band > 2 || Math.min(t.w, t.d) < 12) continue;
+        made++;
+        const legH = rand(3.0, 6.0), tr = rand(1.9, 3.2), th = rand(3.6, 6.0);
+        for (let k = 0; k < 4; k++) {
+          const la = k * Math.PI * 0.5 + 0.78;
+          dark(place(box(0.30, legH, 0.30),
+            t.x + Math.cos(la) * tr * 0.74, t.y + legH * 0.5, t.z + Math.sin(la) * tr * 0.74),
+            0x6e5c46, t.haze, 0.05);
+        }
+        trim(place(cyl(tr, tr * 1.05, th, 12), t.x, t.y + legH + th * 0.5, t.z), 0x93755a, t.haze, 0.04);
+        dark(place(new THREE.ConeGeometry(tr * 1.14, tr * 0.8, 12), t.x, t.y + legH + th + tr * 0.38, t.z),
+          0x5f5347, t.haze, 0.05);
+        dark(place(cyl(0.06, 0.06, legH, 4), t.x + tr * 0.92, t.y + legH * 0.5, t.z), 0x5f5347, t.haze);
+      }
+    }
+
+    // --- tower cranes ---------------------------------------------------------
+    for (const c of [
+      { x: -232, z: -286, h: 82, a: 0.72, hz: 0.70 },
+      { x: 268, z: -196, h: 66, a: -1.85, hz: 0.60 },
+      { x: 118, z: 262, h: 54, a: 2.35, hz: 0.42 },
+    ]) {
+      const post = 1.35, YEL = 0xd8a520;
+      for (let k = 0; k < 4; k++) {
+        const ca = k * Math.PI * 0.5 + 0.78;
+        trim(place(box(0.45, c.h, 0.45),
+          c.x + Math.cos(ca) * post, c.h * 0.5, c.z + Math.sin(ca) * post), YEL, c.hz, 0.05);
+      }
+      for (let k = 0; k < 14; k++) {
+        trim(place(box(post * 2.3, 0.24, post * 2.3), c.x, (k + 1) * (c.h / 15), c.z), YEL, c.hz, 0.05);
+      }
+      trim(place(box(4.0, 1.5, 3.0), c.x, c.h + 0.75, c.z, c.a), YEL, c.hz, 0.04);
+      // jib and counter-jib as open lattice: chord pairs plus verticals
+      for (const dy of [0, 1.5]) {
+        trim(place(box(50, 0.28, 0.28), c.x + Math.cos(c.a) * 22, c.h + 2.4 + dy, c.z - Math.sin(c.a) * 22, c.a), YEL, c.hz, 0.05);
+        trim(place(box(17, 0.28, 0.28), c.x - Math.cos(c.a) * 9, c.h + 2.4 + dy, c.z + Math.sin(c.a) * 9, c.a), YEL, c.hz, 0.05);
+      }
+      for (let k = 0; k < 11; k++) {
+        const s = 2 + k * 4.4;
+        trim(place(box(0.2, 1.6, 0.2), c.x + Math.cos(c.a) * s, c.h + 3.2, c.z - Math.sin(c.a) * s), YEL, c.hz, 0.05);
+      }
+      trim(place(box(4.2, 2.0, 2.4), c.x - Math.cos(c.a) * 16, c.h + 2.2, c.z + Math.sin(c.a) * 16, c.a), 0x9c9890, c.hz, 0.04);
+      trim(place(box(0.45, 8, 0.45), c.x, c.h + 6.5, c.z), YEL, c.hz, 0.05);
+      const hookX = c.x + Math.cos(c.a) * 32, hookZ = c.z - Math.sin(c.a) * 32;
+      dark(place(cyl(0.08, 0.08, 24, 4), hookX, c.h - 9, hookZ), 0x3f444a, c.hz);
+      dark(place(box(1.3, 1.1, 0.9), hookX, c.h - 21.6, hookZ, c.a), 0x3f444a, c.hz);
+    }
+
+    // --- elevated freeway -----------------------------------------------------
+    {
+      const dY = VIA.deckY, W = VIA.w, len = VIA.x1 - VIA.x0;
+      const cx = (VIA.x0 + VIA.x1) * 0.5, vz = VIA.z;
+      const hz = 0.22;
+      trim(place(box(len, 1.15, W), cx, dY, vz), 0xada89c, hz, 0.02);
+      trim(place(box(len, 1.0, W - 5.0), cx, dY - 0.95, vz), 0x6e6a63, hz, 0.02);
+      dark(place(box(len, 0.34, W + 0.25), cx, dY - 0.62, vz), 0x3c3a36, hz, 0.02);
+      for (const s of [-1, 1]) {
+        trim(place(box(len, 0.92, 0.5), cx, dY + 1.04, vz + s * (W * 0.5 - 0.28)), 0xbfbaae, hz, 0.02);
+        dark(place(box(len, 0.10, 0.14), cx, dY + 1.54, vz + s * (W * 0.5 - 0.28)), 0x6e737a, hz);
+      }
+      trim(place(box(len, 0.72, 0.45), cx, dY + 0.94, vz), 0xb6b1a6, hz, 0.02);
+      for (let px = VIA.x0 + 14; px < VIA.x1; px += 27) {
+        trim(place(box(2.8, dY - 0.9, 2.3), px, (dY - 0.9) * 0.5, vz), 0x9e9a90, hz, 0.02);
+        trim(place(box(4.6, 1.0, W - 2.6), px, dY - 1.1, vz), 0xa8a49a, hz, 0.02);
+        trim(place(box(4.8, 0.55, 4.4), px, 0.28, vz), 0x8d8981, hz, 0.02);
+      }
+      for (let px = VIA.x0 + 28; px < VIA.x1; px += 54) {
+        dark(place(cyl(0.13, 0.22, 9.5, 6), px, dY + 6.6, vz + W * 0.5 - 0.4), 0x5e636a, hz);
+        dark(place(box(2.1, 0.16, 0.28), px - 0.95, dY + 11.2, vz + W * 0.5 - 0.4), 0x5e636a, hz);
+      }
+      // a sign gantry spanning the carriageway
+      for (const gx of [-96, 118]) {
+        dark(place(box(0.4, 7.2, 0.4), gx, dY + 5.4, vz - W * 0.5 + 0.5), 0x5a5f66, hz);
+        dark(place(box(0.4, 7.2, 0.4), gx, dY + 5.4, vz + W * 0.5 - 0.5), 0x5a5f66, hz);
+        dark(place(box(0.45, 0.45, W), gx, dY + 8.8, vz), 0x5a5f66, hz);
+        trim(place(box(0.25, 2.2, 7.0), gx + 0.3, dY + 7.4, vz - 3), 0x2f6b3c, hz, 0.03);
+        trim(place(box(0.25, 2.2, 5.4), gx + 0.3, dY + 7.4, vz + 4), 0x2f6b3c, hz, 0.03);
+      }
+      // traffic, both directions
+      const CARS = [0xd8d5cc, 0x2c3138, 0x8f2a24, 0x27486f, 0xb0b4b8, 0x3f5f45, 0xc9a52c];
+      for (let k = 0; k < 26; k++) {
+        const px = VIA.x0 + 14 + rand(0, len - 28);
+        const lane = (k % 2 ? 1 : -1) * rand(2.1, 5.6);
+        const truck = rng() < 0.26;
+        const cl = pick(CARS);
+        const cw = truck ? rand(9, 13.5) : rand(4.1, 5.3);
+        const ch = truck ? 3.3 : 1.42;
+        const cd = truck ? 2.6 : 1.95;
+        dark(place(box(cw, ch, cd), px, dY + 0.58 + ch * 0.5, vz + lane), cl, hz, 0.02);
+        if (truck) {
+          dark(place(box(2.5, 1.1, cd), px + cw * 0.5 - 1.25, dY + 0.58 + ch + 0.55, vz + lane), cl, hz, 0.02);
+        } else {
+          dark(place(box(cw * 0.52, 0.86, cd * 0.94), px + rand(-0.4, 0.4), dY + 0.58 + ch + 0.43, vz + lane),
+            0x2a3038, hz, 0.02);
+        }
+      }
+      // an off-ramp peeling away and dropping to grade
+      {
+        const seg = 9;
+        for (let k = 0; k < seg; k++) {
+          const t0 = k / seg, t1 = (k + 1) / seg;
+          const rx = VIA.x1 - 30 + t0 * 96;
+          const rz = vz + Math.pow(t0, 1.7) * 74;
+          const ry0 = dY - Math.pow(t0, 1.5) * (dY - 0.6);
+          const nx = VIA.x1 - 30 + t1 * 96, nz = vz + Math.pow(t1, 1.7) * 74;
+          const ang = Math.atan2(-(nz - rz), nx - rx);
+          const l = Math.hypot(nx - rx, nz - rz) + 1.5;
+          trim(place(box(l, 0.9, 8.5), (rx + nx) * 0.5, ry0, (rz + nz) * 0.5, ang), 0xa8a49a, hz, 0.02);
+          trim(place(box(l, 0.9, 0.4), (rx + nx) * 0.5, ry0 + 0.85, (rz + nz) * 0.5 - 4.1, ang), 0xbfbaae, hz, 0.02);
+          trim(place(box(l, 0.9, 0.4), (rx + nx) * 0.5, ry0 + 0.85, (rz + nz) * 0.5 + 4.1, ang), 0xbfbaae, hz, 0.02);
+          if (k % 2 === 0 && ry0 > 2) {
+            trim(place(box(2.2, ry0, 2.0), rx, ry0 * 0.5, rz, ang), 0x9e9a90, hz, 0.02);
+          }
+        }
+      }
+    }
+
+    // --- billboards -----------------------------------------------------------
+    {
+      const cells = [0, 4, 7, 12, 15, 5, 2];
+      let n = 0;
+      /** One board panel plus its frame. */
+      const board = (bw, bh, bx, by, bz, face, haze, cell, legs) => {
+        const g = planeCell(bw, bh, 1, 1, cell, ATLAS_COLS, ATLAS_ROWS);
+        place(g, bx, by, bz, face);
+        boardGeos.push(hazed(g, 0xffffff, haze, 0));
+        dark(place(box(bw + 1.4, 0.55, 0.55), bx, by + bh * 0.5 + 0.3, bz, face), 0x4e5359, haze);
+        dark(place(box(bw + 1.4, 0.5, 0.5), bx, by - bh * 0.5 - 0.3, bz, face), 0x4e5359, haze);
+        for (const s of [-1, 1]) {
+          dark(place(box(0.5, bh + 1.4, 0.5),
+            bx + Math.cos(face) * s * bw * 0.42, by, bz - Math.sin(face) * s * bw * 0.42, face), 0x4e5359, haze);
+        }
+        if (legs) {
+          for (const s of [-1, 1]) {
+            dark(place(cyl(0.42, 0.55, legs, 6),
+              bx + Math.cos(face) * s * bw * 0.28, by - bh * 0.5 - legs * 0.5, bz - Math.sin(face) * s * bw * 0.28),
+              0x4e5359, haze);
+          }
+        }
+      };
+
+      for (const t of roofSlots) {
+        if (n >= 4) break;
+        if (t.band < 1 || t.band > 2 || t.w < 18) continue;
+        const bw = clamp(t.w * rand(0.8, 1.15), 18, 34), bh = bw * 0.5;
+        const face = Math.atan2(-t.x, -t.z) + rand(-0.25, 0.25);
+        board(bw, bh, t.x, t.y + bh * 0.5 + 5.5, t.z, face, t.haze, cells[n], 0);
+        n++;
+      }
+      // roadside boards on lattice poles beside the freeway
+      board(26, 13, -58, 22, VIA.z + 26, 0.18, 0.36, cells[4], 15);
+      board(22, 11, 142, 20, VIA.z + 34, -0.42, 0.34, cells[5], 14);
+      board(20, 10, -LOT.hx - 74, 15, 46, Math.PI * 0.62, 0.22, cells[6], 10);
+    }
+
+    // --- venue floodlight masts ----------------------------------------------
+    // Tall enough to read as event lighting against the sky; outside the fence,
+    // so they live in the no-shadow bucket with the rest of the perimeter.
+    function venueMast(x, z, aim) {
+      const H = 17.5;
+      far.add(MAT.concretePale, place(cyl(0.62, 0.80, 0.95, 10), x, 0.47, z));
+      far.add(MAT.steelDark, place(cyl(0.15, 0.34, H, 8), x, H * 0.5 + 0.9, z));
+      for (let i = 0; i < 7; i++) {
+        far.add(MAT.steelDark, place(box(0.44, 0.07, 0.07), x, 2.4 + i * 2.1, z, aim + 0.4));
+        far.add(MAT.steelDark, place(box(0.07, 0.07, 0.44), x, 3.4 + i * 2.1, z, aim + 0.4));
+      }
+      const topY = H + 0.9;
+      for (let row = 0; row < 2; row++) {
+        far.add(MAT.steelDark, place(box(4.8, 0.16, 0.5), x, topY + row * 1.35, z, aim));
+      }
+      far.add(MAT.steelDark, place(box(0.16, 1.5, 0.16), x - 2.3 * Math.cos(aim), topY + 0.7, z + 2.3 * Math.sin(aim), aim));
+      far.add(MAT.steelDark, place(box(0.16, 1.5, 0.16), x + 2.3 * Math.cos(aim), topY + 0.7, z - 2.3 * Math.sin(aim), aim));
+      for (let i = 0; i < 8; i++) {
+        const t = ((i >> 1) / 3 - 0.5) * 4.2;
+        const row = i & 1;
+        const hx = x + Math.cos(aim) * t, hz = z - Math.sin(aim) * t;
+        far.add(MAT.steelDark, place(box(0.62, 0.22, 0.48), hx, topY + row * 1.35 + 0.30, hz, aim, -0.62));
+        far.add(lampMat, place(box(0.54, 0.04, 0.40), hx, topY + row * 1.35 + 0.17, hz, aim, -0.62));
+      }
+    }
+    venueMast(-LOT.hx - 6.5, -LOT.hz - 6.5, -Math.PI * 0.25);
+    venueMast(LOT.hx + 6.5, -LOT.hz - 6.5, Math.PI * 0.25);
+    venueMast(LOT.hx + 6.5, LOT.hz + 6.5, Math.PI * 0.75);
+    venueMast(-LOT.hx - 6.5, LOT.hz + 6.5, -Math.PI * 0.75);
+
+    // --- flush the backdrop ---------------------------------------------------
+    const mkCity = (geos, material, name) => {
+      if (!geos.length) return;
+      const merged = geos.length === 1 ? geos[0] : mergeGeometries(geos, false);
+      if (geos.length > 1) for (const g of geos) g.dispose();
+      if (!merged) return;
       merged.computeBoundingSphere();
-      const mesh = new THREE.Mesh(merged, facadeMat);
-      mesh.name = 'props_buildings';
+      const mesh = new THREE.Mesh(merged, material);
+      mesh.name = name;
       mesh.castShadow = false;
       mesh.receiveShadow = false;
       mesh.matrixAutoUpdate = false;
       mesh.updateMatrix();
       skyline.add(mesh);
       owned.geo.push(merged);
+    };
+    for (const kind of ['curtain', 'punched', 'brick']) {
+      mkCity(facadeGeos[kind], FACADE_MATS[kind], `props_city_${kind}`);
+      emissiveNight.push({ material: FACADE_MATS[kind], intensity: 1.55, base: 0.02 });
     }
-    emissiveNight.push({ material: facadeMat, intensity: 1.55 });
-
-    // rooftop water tanks
-    for (const t of towers.slice(0, 7)) {
-      const legH = rand(3.5, 6.5), tankR = rand(2.2, 3.4), tankH = rand(4, 6.5);
-      for (let k = 0; k < 4; k++) {
-        const la = k * Math.PI * 0.5 + 0.78;
-        roofBucket.add(MAT.steelRust, place(box(0.34, legH, 0.34),
-          t.x + Math.cos(la) * tankR * 0.72, t.y + legH * 0.5, t.z + Math.sin(la) * tankR * 0.72));
-      }
-      roofBucket.add(MAT.woodGrey, place(cyl(tankR, tankR * 1.04, tankH, 12), t.x, t.y + legH + tankH * 0.5, t.z));
-      roofBucket.add(MAT.steelRust, place(new THREE.ConeGeometry(tankR * 1.12, tankR * 0.75, 12), t.x, t.y + legH + tankH + tankR * 0.36, t.z));
-      roofBucket.add(MAT.steelRust, place(cyl(0.06, 0.06, legH, 4), t.x + tankR * 0.9, t.y + legH * 0.5, t.z));
-    }
-
-    // tower cranes: mast, jib, counter-jib, hook line
-    const craneMat = libMat('paintedMetal', { color: 0xd8a520, roughness: 0.62 }, { color: 0xd8a520, roughness: 0.62, metalness: 0.7 });
-    const cranes = [
-      { x: -210, z: -260, h: 78, a: 0.7 },
-      { x: 250, z: -180, h: 64, a: -1.9 },
-    ];
-    for (const c of cranes) {
-      const post = 1.4;
-      for (let k = 0; k < 4; k++) {
-        const ca = k * Math.PI * 0.5 + 0.78;
-        roofBucket.add(craneMat, place(box(0.55, c.h, 0.55),
-          c.x + Math.cos(ca) * post, c.h * 0.5, c.z + Math.sin(ca) * post));
-      }
-      for (let k = 0; k < 12; k++) {
-        roofBucket.add(craneMat, place(box(post * 2.4, 0.30, post * 2.4), c.x, (k + 1) * (c.h / 13), c.z));
-      }
-      // slewing platform + jib
-      roofBucket.add(craneMat, place(box(4.2, 1.6, 3.2), c.x, c.h + 0.8, c.z, c.a));
-      roofBucket.add(craneMat, place(box(46, 1.6, 1.6), c.x + Math.cos(c.a) * 20, c.h + 2.6, c.z - Math.sin(c.a) * 20, c.a));
-      roofBucket.add(craneMat, place(box(16, 1.5, 1.8), c.x - Math.cos(c.a) * 8, c.h + 2.6, c.z + Math.sin(c.a) * 8, c.a));
-      roofBucket.add(MAT.concretePale, place(box(4, 2.2, 2.6), c.x - Math.cos(c.a) * 15, c.h + 2.4, c.z + Math.sin(c.a) * 15, c.a));
-      // A-frame + hoist cable
-      roofBucket.add(craneMat, place(box(0.5, 7, 0.5), c.x, c.h + 6, c.z));
-      roofBucket.add(MAT.steelDark, place(cyl(0.10, 0.10, 26, 4), c.x + Math.cos(c.a) * 30, c.h - 10, c.z - Math.sin(c.a) * 30));
-      roofBucket.add(MAT.steelDark, place(box(1.4, 1.2, 1.0), c.x + Math.cos(c.a) * 30, c.h - 23.4, c.z - Math.sin(c.a) * 30, c.a));
-    }
-
-    roofBucket.flush(skyline, owned, { cast: false, receive: false, name: 'skyline' });
-
-    // rooftop billboards, using the same atlas as the fence banners
-    const boards = [];
-    for (let i = 0; i < 5; i++) {
-      const t = towers[(i * 3 + 1) % Math.max(1, towers.length)];
-      if (!t) break;
-      const bw = rand(20, 32), bh = bw * 0.5;
-      const face = Math.atan2(-t.x, -t.z);
-      const g = planeCell(bw, bh, 1, 1, [0, 4, 7, 12, 15][i % 5], ATLAS_COLS, ATLAS_ROWS);
-      place(g, t.x, t.y + bh * 0.5 + 4, t.z, face);
-      boards.push(strip(g));
-      // frame legs
-      far.add(MAT.steelDark, place(box(bw + 1.2, 0.6, 0.6), t.x, t.y + 4, t.z, face));
-      far.add(MAT.steelDark, place(box(0.6, bh + 8, 0.6), t.x + Math.cos(face) * bw * 0.35, t.y + bh * 0.5, t.z - Math.sin(face) * bw * 0.35, face));
-      far.add(MAT.steelDark, place(box(0.6, bh + 8, 0.6), t.x - Math.cos(face) * bw * 0.35, t.y + bh * 0.5, t.z + Math.sin(face) * bw * 0.35, face));
-    }
-    if (boards.length) {
-      const bmerged = mergeGeometries(boards, false);
-      for (const g of boards) g.dispose();
-      if (bmerged) {
-        const mesh = new THREE.Mesh(bmerged, billboardMat);
-        mesh.name = 'props_billboards';
-        mesh.castShadow = false;
-        mesh.receiveShadow = false;
-        mesh.matrixAutoUpdate = false;
-        mesh.updateMatrix();
-        skyline.add(mesh);
-        owned.geo.push(bmerged);
-      }
-    }
+    mkCity(trimGeos, cityTrimMat, 'props_city_trim');
+    mkCity(darkGeos, cityDarkMat, 'props_city_dark');
+    mkCity(boardGeos, billboardMat, 'props_billboards');
   }
 
-  // far ground so the lot never ends in empty sky, plus two haze bands
+  // --- the ground the city stands on, and the outermost city -----------------
   {
-    const farGroundMat = own(new THREE.MeshStandardMaterial({
-      name: 'props_far_ground', color: 0x6d6a62, roughness: 1, metalness: 0,
-    }));
-    // starts just outside the fence and slightly below grade, so it hides under
-    // whatever ground the park lays down and only shows past its edge
-    const ring = new THREE.RingGeometry(44, 620, 56, 1);
+    const farGroundMat = own(patchCityHaze(new THREE.MeshStandardMaterial({
+      name: 'props_far_ground', vertexColors: true, roughness: 1, metalness: 0, fog: false,
+    })));
+    // Starts just outside the fence and a little below grade so the park's own
+    // ground always wins, and carries its own haze ramp so it dissolves into the
+    // same air the buildings do rather than ending as a flat grey disc.
+    const ring = new THREE.RingGeometry(44, 940, 84, 10);
     ring.rotateX(-Math.PI * 0.5);
-    ring.translate(0, -0.30, 0);
+    ring.translate(0, -0.32, 0);
+    {
+      const p = ring.attributes.position;
+      const col = new Float32Array(p.count * 3);
+      const hz = new Float32Array(p.count);
+      const c0 = new THREE.Color();
+      for (let i = 0; i < p.count; i++) {
+        const px = p.getX(i), pz = p.getZ(i);
+        const r = Math.hypot(px, pz);
+        const n = noise01(px * 0.012 + 5.5, pz * 0.012 + 1.7, 4);
+        const n2 = noise01(px * 0.06, pz * 0.06, 3);
+        // roof/asphalt/lot mottle so the sprawl floor is never one flat value
+        c0.setHex(n > 0.55 ? 0x6f6b62 : n > 0.34 ? 0x5e5b55 : 0x7a7468, THREE.SRGBColorSpace);
+        c0.multiplyScalar(0.86 + n2 * 0.30);
+        col[i * 3] = c0.r; col[i * 3 + 1] = c0.g; col[i * 3 + 2] = c0.b;
+        hz[i] = smoothstep(clamp((r - 48) / 300, 0, 1)) * 0.88;
+      }
+      ring.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      ring.setAttribute('aHaze', new THREE.BufferAttribute(hz, 1));
+    }
     const rm = new THREE.Mesh(ring, farGroundMat);
     rm.name = 'props_far_ground';
     rm.castShadow = false;
@@ -2385,23 +3248,14 @@ export function createProps(ctx) {
     skyline.add(rm);
     owned.geo.push(ring);
 
-    const hills = new THREE.CylinderGeometry(560, 560, 96, 64, 1, true);
-    hills.translate(0, 22, 0);
-    const hm = new THREE.Mesh(hills, hazeMat);
-    hm.name = 'props_hill_band';
-    hm.matrixAutoUpdate = false;
-    hm.updateMatrix();
-    hm.renderOrder = -2;
-    skyline.add(hm);
-    owned.geo.push(hills);
-
-    const band = new THREE.CylinderGeometry(345, 345, 46, 48, 1, true);
-    band.translate(0, 10, 0);
-    const bm = new THREE.Mesh(band, dustBandMat);
-    bm.name = 'props_dust_band';
+    // the city that is too far to model: a low-contrast strip that feathers out
+    const band = new THREE.CylinderGeometry(780, 780, 210, 72, 1, true);
+    band.translate(0, 46, 0);
+    const bm = new THREE.Mesh(band, distantMat);
+    bm.name = 'props_distant_city';
     bm.matrixAutoUpdate = false;
     bm.updateMatrix();
-    bm.renderOrder = -1;
+    bm.renderOrder = -2;
     skyline.add(bm);
     owned.geo.push(band);
   }
@@ -2460,10 +3314,33 @@ export function createProps(ctx) {
     nightTarget = on ? 1 : 0;
   }
 
+  const _fogRead = new THREE.Color();
+  const _neutralHaze = new THREE.Color();
+  const _sane = new THREE.Color();
   function update(dt, c) {
     const step = Math.min(dt || 0, 0.1);
     clock += step;
     time.value = clock;
+
+    // The backdrop's aerial perspective rides on whatever the environment is
+    // doing with the fog this frame, so the city always sits in the same air as
+    // the horizon behind it. Half the fog's saturation is taken out and the
+    // remainder pulled a little cool: the environment biases fog hard toward the
+    // sun, and a fully saturated haze turns the whole skyline into one gold
+    // silhouette instead of receding grey-blue distance.
+    const cc = c || ctx;
+    const tod = cc?.world?.environment?.timeOfDay;
+    _fogRead.copy(hazeForTod(typeof tod === 'number' ? tod : 0.68));
+    const fc = cc?.scene?.fog?.color;
+    // Track the environment's own fog when it hands back something usable, but
+    // never let an out-of-range colour reach the shader.
+    if (fc && Number.isFinite(fc.r) && Number.isFinite(fc.g) && Number.isFinite(fc.b)
+      && Math.min(fc.r, fc.g, fc.b) >= 0 && Math.max(fc.r, fc.g, fc.b) <= 2.5) {
+      const l = fc.r * 0.2126 + fc.g * 0.7152 + fc.b * 0.0722;
+      _neutralHaze.copy(fc).lerp(_sane.setRGB(l * 0.95, l, l * 1.10), 0.5);
+      _fogRead.lerp(_neutralHaze, 0.45);
+    }
+    hazeU.value.lerp(_fogRead, 1 - Math.exp(-4 * step));
 
     if (!manualNight) {
       const tod = (c || ctx)?.world?.environment?.timeOfDay;
@@ -2496,6 +3373,13 @@ export function createProps(ctx) {
   }
 
   group.updateMatrixWorld(true);
+  // seed the backdrop haze from whatever the environment already set, so the
+  // very first frame is not rendered against a placeholder colour
+  {
+    const tod0 = ctx?.world?.environment?.timeOfDay;
+    hazeU.value.copy(hazeForTod(typeof tod0 === 'number' ? tod0 : 0.68));
+  }
+
   seed(0x5eed1e);                       // hand the rng stream back as main.js left it
 
   return {

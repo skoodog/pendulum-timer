@@ -1,25 +1,36 @@
-// Sky, lighting rig, image-based lighting, height fog and time of day.
+// Sky, cloud decks, lighting rig, image-based lighting, aerial perspective and
+// time of day.
 //
-// The sky is a single analytic-scattering dome (Preetham-flavoured) with two
-// procedural cloud decks, a horizon haze band, a ground-bounce hemisphere and a
-// star field for dusk. That same dome is rendered into a PMREM cube so every PBR
-// material in the park is lit by the real sky instead of a constant ambient.
+// The sky is an analytic-scattering dome (Preetham-flavoured) carrying TWO
+// independently parallaxing cloud decks — a high, fine-grained deck and a low,
+// large-featured deck drifting over it — plus a break-through sun glow, a wide
+// horizon haze band and a ground-bounce hemisphere. That same dome is rendered
+// into a PMREM cube so every PBR material in the park is lit by the real sky.
 //
-// Default state at boot is late-afternoon golden hour: sun at ~22 degrees, warm
-// key, cool sky bounce, long shadows, dusty air.
+// The target frame is an overcast dusk: a covered deck with structure and
+// volume, cool blue-grey overhead, warm light breaking through low on the sun
+// side, and a city sitting inside heavy but *cool* haze. Nothing in the grade is
+// allowed to blow the sky out or crush the ramps to black.
 
 import * as THREE from 'three';
 import { PMREMGenerator } from 'three';
 import { clamp, lerp, rand, deg } from '../core/mathx.js';
 
 // ---------------------------------------------------------------------------
-// Height fog: patch the shared fog chunks so density falls off with altitude.
-// Ground haze stays thick, the park and the skyline tops stay crisp. Colour and
-// density still come from scene.fog so the renderer keeps refreshing them.
+// Height fog + aerial perspective.
+//
+// Patch the shared fog chunks so (a) density falls off with altitude — ground
+// haze stays thick, the skyline tops stay readable — and (b) distance does what
+// distance really does: it desaturates, lifts the blacks and *then* inscatters.
+// Straight `mix(colour, grey, f)` is what makes a fogged frame look muddy; the
+// desaturate-first ordering is what makes it look like air.
+//
+// Colour and density still come from scene.fog, so the renderer keeps refreshing
+// them and no extra uniforms are needed on materials this module does not own.
 // ---------------------------------------------------------------------------
 
 const FOG_BASE_HEIGHT = 0.0;      // metres — where the haze layer sits
-const FOG_HEIGHT_FALLOFF = 0.062; // 1/m — density halves every ~11 m of altitude
+const FOG_HEIGHT_FALLOFF = 0.074; // 1/m — density halves every ~9 m of altitude
 
 const _fogChunkBackup = {};
 
@@ -77,7 +88,16 @@ function installHeightFog() {
     #else
       float fogFactor = smoothstep( fogNear, fogFar, fogDist );
     #endif
-    gl_FragColor.rgb = mix( gl_FragColor.rgb, fogColor, fogFactor );
+
+    // --- aerial perspective -------------------------------------------------
+    vec3 fogSrc = gl_FragColor.rgb;
+    float fogLum = dot( fogSrc, vec3( 0.2126, 0.7152, 0.0722 ) );
+    // 1. distance eats chroma long before it eats contrast
+    fogSrc = mix( fogSrc, vec3( fogLum ), fogFactor * 0.72 );
+    // 2. and it lifts the shadows toward the haze value faster than the highlights
+    fogSrc = mix( fogSrc, fogSrc + fogColor * ( 1.0 - fogLum ) * 0.55, fogFactor * 0.75 );
+    // 3. only then does the haze itself take over
+    gl_FragColor.rgb = mix( fogSrc, fogColor, fogFactor );
   }
 #endif
 `;
@@ -110,17 +130,25 @@ const SkyShader = {
     uShowSunDisc: { value: 1.0 },
     uSunDiscIntensity: { value: 40.0 },
 
-    uCloudDrift: { value: new THREE.Vector2(0, 0) },
-    uCloudCover: { value: 0.42 },
-    uCloudScale: { value: 1.10 },
-    uCloudOpacity: { value: 0.95 },
+    // two decks, two drift vectors — the parallax between them is what sells
+    // the deck as a volume rather than a texture
+    uDriftLow: { value: new THREE.Vector2(0, 0) },
+    uDriftHigh: { value: new THREE.Vector2(0, 0) },
+    uCloudCover: { value: 0.72 },       // low deck
+    uCloudCoverHigh: { value: 0.55 },   // high deck
+    uCloudScale: { value: 1.0 },
+    uCloudOpacity: { value: 1.0 },
     uCloudGain: { value: 1.35 },
-    uCirrusCover: { value: 0.42 },
     uCloudShadowTint: { value: new THREE.Color(0.33, 0.38, 0.52) },
     uCloudLitTint: { value: new THREE.Color(1.0, 0.86, 0.68) },
+    uSilver: { value: 1.6 },            // forward-scatter rim on the sun side
+    uWarmUnder: { value: 0.5 },         // warm bounce into the cloud bases
+    uSunGlow: { value: 1.0 },           // break-through glow behind the deck
+    uCloudSat: { value: 0.55 },         // multiple scattering washes cloud chroma out
 
     uHazeTint: { value: new THREE.Color(1.0, 0.72, 0.46) },
     uHazeStrength: { value: 0.18 },
+    uHazeColor: { value: new THREE.Color(0.62, 0.66, 0.72) },
     uGroundColor: { value: new THREE.Color(0.19, 0.16, 0.13) },
     uGroundGain: { value: 1.6 },
     uTwilightColor: { value: new THREE.Color(0.014, 0.033, 0.096) },
@@ -186,7 +214,7 @@ const SkyShader = {
       // by 6 degrees blue is three orders down and cloud tops go pure red. Floor
       // each channel against the strongest so a low sun stays orange, not scarlet.
       float sunFexMax = max( sunFex.r, max( sunFex.g, sunFex.b ) );
-      sunFex = max( sunFex, vec3( sunFexMax * 0.20 ) );
+      sunFex = max( sunFex, vec3( sunFexMax * 0.24 ) );
       // sun disc solid angle (~6.8e-5 sr) folded in, then the shared 0.04 scale
       vSunIrradiance = vSunE * 1.22 * sunFex * 0.04;
     }
@@ -207,17 +235,23 @@ const SkyShader = {
     uniform float uShowSunDisc;
     uniform float uSunDiscIntensity;
 
-    uniform vec2 uCloudDrift;
+    uniform vec2 uDriftLow;
+    uniform vec2 uDriftHigh;
     uniform float uCloudCover;
+    uniform float uCloudCoverHigh;
     uniform float uCloudScale;
     uniform float uCloudOpacity;
     uniform float uCloudGain;
-    uniform float uCirrusCover;
     uniform vec3 uCloudShadowTint;
     uniform vec3 uCloudLitTint;
+    uniform float uSilver;
+    uniform float uWarmUnder;
+    uniform float uSunGlow;
+    uniform float uCloudSat;
 
     uniform vec3 uHazeTint;
     uniform float uHazeStrength;
+    uniform vec3 uHazeColor;
     uniform vec3 uGroundColor;
     uniform float uGroundGain;
     uniform vec3 uTwilightColor;
@@ -226,6 +260,7 @@ const SkyShader = {
 
     const float pi = 3.141592653589793;
     const vec3 up = vec3( 0.0, 1.0, 0.0 );
+    const vec3 LUMA = vec3( 0.2126, 0.7152, 0.0722 );
 
     const float rayleighZenithLength = 8.4E3;
     const float mieZenithLength = 1.25E3;
@@ -263,28 +298,43 @@ const SkyShader = {
 
     const mat2 M2 = mat2( 0.86, 0.51, -0.51, 0.86 );
 
-    // Both fbm variants are normalised to 0..1 so the coverage thresholds below
-    // behave the same however many octaves are used.
-    float fbm4( vec2 p ) {
+    // Fixed-octave fbm variants, each normalised to 0..1 so a single coverage
+    // threshold behaves the same however many octaves fed it. Separate functions
+    // rather than a loop bound so this stays legal ESSL1 on every driver.
+    float fbm3( vec2 p ) {
       float v = 0.0, a = 0.5, n = 0.0;
-      for ( int i = 0; i < 4; i ++ ) {
-        v += a * vnoise( p );
-        n += a;
-        p = M2 * p * 2.06 + 11.3;
-        a *= 0.5;
+      for ( int i = 0; i < 3; i ++ ) {
+        v += a * vnoise( p ); n += a;
+        p = M2 * p * 2.07 + 11.3; a *= 0.52;
       }
       return v / n;
     }
 
-    float fbm6( vec2 p ) {
+    float fbm4( vec2 p ) {
       float v = 0.0, a = 0.5, n = 0.0;
-      for ( int i = 0; i < 6; i ++ ) {
-        v += a * vnoise( p );
-        n += a;
-        p = M2 * p * 2.03 + 7.1;
-        a *= 0.52;
+      for ( int i = 0; i < 4; i ++ ) {
+        v += a * vnoise( p ); n += a;
+        p = M2 * p * 2.05 + 7.1; a *= 0.52;
       }
       return v / n;
+    }
+
+    float fbm5( vec2 p ) {
+      float v = 0.0, a = 0.5, n = 0.0;
+      for ( int i = 0; i < 5; i ++ ) {
+        v += a * vnoise( p ); n += a;
+        p = M2 * p * 2.03 + 7.1; a *= 0.53;
+      }
+      return v / n;
+    }
+
+    // Shape a raw fbm field into a coverage-controlled deck. 'sharp' widens or
+    // tightens the transition so a stratus deck can be soft and a cumulus deck
+    // can have a hard, sculpted silhouette.
+    float shapeDeck( float f, float cover, float sharp ) {
+      float base = smoothstep( 0.27, 0.78, f );
+      float thr = 1.0 - cover;
+      return smoothstep( thr, thr + sharp * cover + 0.04, base );
     }
 
     void main() {
@@ -309,7 +359,7 @@ const SkyShader = {
       // Preetham's low-sun correction term goes green on the anti-sun horizon.
       // Keep its luminance falloff, but only 45% of its chroma.
       vec3 corr = pow( vSunE * ratio * Fex, vec3( 0.5 ) );
-      float corrL = dot( corr, vec3( 0.2126, 0.7152, 0.0722 ) );
+      float corrL = dot( corr, LUMA );
       float corrW = clamp( pow( 1.0 - dot( up, vSunDirection ), 5.0 ), 0.0, 0.6 );
       Lin *= mix( vec3( 1.0 ), mix( vec3( corrL ), corr, 0.45 ), corrW );
 
@@ -320,106 +370,207 @@ const SkyShader = {
       // which is what actually makes a low sun glow orange.
       float mieShare = dot( betaMTheta, vec3( 1.0 ) ) / max( dot( betaRTheta + betaMTheta, vec3( 1.0 ) ), 1e-9 );
       float aureoleW = pow( max( cosTheta, 0.0 ), 3.0 );
-      vec3 sunHue = clamp( vSunIrradiance / max( dot( vSunIrradiance, vec3( 0.2126, 0.7152, 0.0722 ) ), 1e-4 ), 0.0, 2.6 );
+      vec3 sunHue = clamp( vSunIrradiance / max( dot( vSunIrradiance, LUMA ), 1e-4 ), 0.0, 2.6 );
       sunHue = mix( vec3( 1.0 ), sunHue, 0.88 );   // never fully kill a channel
       // forward hemisphere only — the anti-sun sky must stay blue
       float tintW = clamp( aureoleW * 0.9 + mieShare * 0.4 * max( cosTheta, 0.0 ), 0.0, 0.9 );
       col = mix( col, col * sunHue, tintW );
 
-      // direct sunlight reaching the cloud deck, already scaled to sky units
+      // --- geometry shared by both decks ------------------------------------
       vec3 sunIrr = vSunIrradiance;
-      // lambertian cloud top, albedo ~0.72
-      vec3 cloudLit = sunIrr * 0.229 * uCloudGain * uCloudLitTint;
-      float sunLumV = dot( sunIrr, vec3( 0.2126, 0.7152, 0.0722 ) );
+      float sunLumV = dot( sunIrr, LUMA );
+      float sunUp = clamp( vSunDirection.y * 3.2 + 0.25, 0.0, 1.0 );
 
-      // --- cumulus deck -----------------------------------------------------
-      float above = smoothstep( 0.0, 0.035, direction.y );
-      if ( above > 0.0 && uCloudOpacity > 0.001 ) {
-        // soft cloud-plane projection; the +0.13 keeps the horizon from
-        // compressing into aliasing-grade high frequency
-        vec2 cuv = direction.xz / ( direction.y + 0.13 ) * uCloudScale + uCloudDrift;
+      vec2 sunAz = normalize( vSunDirection.xz + vec2( 1e-4 ) );
+      vec2 viewAz = normalize( direction.xz + vec2( 1e-5 ) );
+      float azAlign = dot( viewAz, sunAz ) * 0.5 + 0.5;         // 1 = looking up-sun
 
-        // domain warp keeps the deck from looking like tiled noise
-        vec2 warp = vec2( fbm4( cuv * 0.42 + 3.1 ), fbm4( cuv * 0.42 + 17.7 ) ) - 0.5;
-        vec2 puv = cuv + warp * 1.35;
+      // How obliquely we cut the deck. 1 at the horizon (we see cloud sides and
+      // tops edge-on, stacked into a solid band), 0 overhead (we see the bases,
+      // broken and dark). This single term is what turns a flat noise field into
+      // something that reads as a ceiling with depth.
+      float sideness = 1.0 - smoothstep( 0.010, 0.30, direction.y );
 
-        // value-noise fbm clusters around 0.5; stretch it before thresholding or
-        // the coverage control does nothing
-        float base = smoothstep( 0.36, 0.70, fbm6( puv ) );
-        float thr = 1.0 - uCloudCover;
-        float density = smoothstep( thr, thr + 0.22 * uCloudCover + 0.06, base );
+      // A clearing on the sun side, low down: the break the warm light comes
+      // through. Widest right at the horizon, gone by ~12 degrees up.
+      float breakMask = pow( azAlign, 1.6 ) * ( 1.0 - smoothstep( 0.0, 0.30, direction.y ) );
 
-        // erode the edges with a higher-frequency pass so silhouettes are wispy
-        float detail = fbm4( puv * 3.4 + 21.0 );
-        density = clamp( density - ( 1.0 - density ) * ( detail - 0.34 ) * 1.1, 0.0, 1.0 );
-        density *= smoothstep( 0.0, 0.10, direction.y );
+      // --- break-through glow, laid down BEFORE the clouds so they occlude it -
+      vec3 glowCol = sunHue * uSunGlow * sunLumV *
+        ( pow( max( cosTheta, 0.0 ), 5.0 ) * 0.55 + pow( max( cosTheta, 0.0 ), 60.0 ) * 1.10 );
+      glowCol *= 0.55 + 0.45 * sideness;
+      col += glowCol;
 
-        if ( density > 0.002 ) {
-          // fake self-shadowing: look up-sun through the field
-          vec2 sunStep = normalize( vSunDirection.xz + vec2( 1e-4, 1e-4 ) ) * 0.55;
-          float upSun = smoothstep( 0.36, 0.70, fbm6( puv + sunStep ) );
-          float lit = smoothstep( -0.30, 0.16, upSun - base + 0.05 );
-          lit = mix( 0.30, 1.0, lit );
+      float skyLumPre = dot( col, LUMA );
 
-          // bases stay in shadow, tops catch the warm key
-          float tops = smoothstep( 0.05, 0.85, base );
-          lit = clamp( lit * ( 0.55 + 0.45 * tops ), 0.0, 1.0 );
+      // Direct sunlight arriving at the deck, already in sky units.
+      vec3 litCol = sunIrr * uCloudGain * uCloudLitTint * 0.235;
+      // Up-sun march length in cloud-plane units — grows as the sun drops, so a
+      // low sun rakes across the deck and throws long internal shadows.
+      float marchLen = mix( 1.35, 0.42, clamp( vSunDirection.y * 2.4, 0.0, 1.0 ) );
+      vec2 sunStep = sunAz * marchLen;
 
-          // shadowed side is lit by the sky dome plus a little bounced sun
-          float skyLum = dot( col, vec3( 0.2126, 0.7152, 0.0722 ) );
-          vec3 cloudShade = uCloudShadowTint * ( skyLum * 2.4 + sunLumV * 0.05 ) * uCloudGain;
+      float coverA = 0.0;   // total alpha accumulated, for the glow bleed below
 
-          vec3 cc = mix( cloudShade, cloudLit, lit );
+      // ======================================================================
+      // HIGH DECK — small features, far away, slow drift, brighter and thinner.
+      // Composited first so the low deck reads as passing in front of it.
+      // ======================================================================
+      if ( direction.y > 0.004 && uCloudCoverHigh > 0.002 ) {
+        vec2 uv = direction.xz / ( direction.y + 0.05 ) * ( uCloudScale * 2.55 ) + uDriftHigh;
 
-          // forward-scattered silver lining on the sun side
-          cc += cloudLit * hgPhase( cosTheta, 0.78 ) * 1.5 * ( 1.0 - density * 0.65 );
+        float f = fbm4( uv * vec2( 0.66, 1.0 ) + 41.0 );        // wind-combed
+        float coverH = uCloudCoverHigh * ( 1.0 - 0.35 * breakMask );
+        float d = shapeDeck( f, coverH, 0.34 );
+        // stack toward the horizon
+        d = 1.0 - pow( 1.0 - d, 1.0 + 2.6 * sideness );
+        d *= smoothstep( 0.004, 0.075, direction.y );
 
-          // aerial perspective: distant / low cloud fades into the sky
-          float horizonMix = 0.08 + 0.62 * ( 1.0 - smoothstep( 0.04, 0.32, direction.y ) );
-          cc = mix( cc, col, horizonMix );
+        if ( d > 0.003 ) {
+          float fu = fbm3( uv * vec2( 0.66, 1.0 ) + 41.0 + sunStep * 0.6 );
+          float du = shapeDeck( fu, coverH, 0.34 );
+          float trans = exp( -du * 1.7 );
 
-          col = mix( col, cc, density * uCloudOpacity * above );
+          float alt = smoothstep( 0.30, 0.85, f );
+          vec3 amb = uCloudShadowTint * ( skyLumPre * 3.7 ) * uCloudGain;
+          vec3 cc = amb * ( 0.85 + 0.5 * alt )
+                  + litCol * ( 0.28 + 0.72 * trans ) * ( 0.30 + 0.70 * sideness ) * 0.85
+                  + litCol * hgPhase( cosTheta, 0.76 ) * uSilver * ( 1.0 - d ) * 1.1;
+
+          cc = mix( vec3( dot( cc, LUMA ) ), cc, mix( uCloudSat, 1.0, breakMask ) );
+
+          // thin high cloud always keeps some of the sky behind it
+          float aH = d * uCloudOpacity * 0.80;
+          float fade = 1.0 - smoothstep( 0.02, 0.24, direction.y );
+          cc = mix( cc, col + uHazeColor * uHazeStrength * 0.5 * sunLumV, fade * 0.72 );
+          col = mix( col, cc, aH );
+          coverA = aH;
         }
       }
 
-      // --- high cirrus ------------------------------------------------------
-      if ( direction.y > 0.02 && uCirrusCover > 0.001 ) {
-        vec2 huv = direction.xz / ( direction.y + 0.09 ) * ( uCloudScale * 0.42 ) + uCloudDrift * 0.42;
-        huv.x *= 0.30;                       // stretched, wind-combed streaks
-        float h = smoothstep( 0.38, 0.68, fbm4( huv * 1.9 + 41.0 ) );
-        float ha = smoothstep( 0.55, 0.95, h ) * uCirrusCover;
-        ha *= smoothstep( 0.02, 0.30, direction.y );
-        vec3 hc = cloudLit * 1.18 + cloudLit * hgPhase( cosTheta, 0.62 ) * 0.9;
-        col = mix( col, mix( col, hc, 0.72 ), ha * 0.55 );
+      // ======================================================================
+      // LOW DECK — the hero. Large domain-warped features, closer (so it
+      // parallaxes faster), heavier, dark cool bases with warm underlighting.
+      // ======================================================================
+      if ( direction.y > 0.002 && uCloudOpacity > 0.002 ) {
+        // +0.145 keeps the horizon from compressing into aliasing-grade detail
+        vec2 uv = direction.xz / ( direction.y + 0.145 ) * ( uCloudScale * 1.45 ) + uDriftLow;
+
+        // domain warp — cheap, but it is the difference between "cloud" and
+        // "noise texture": it curls the silhouettes and breaks the fbm grid.
+        // Kept modest; push it past ~1.0 and the deck turns to marbling.
+        vec2 w = vec2( fbm3( uv * 0.36 + 3.1 ), fbm3( uv * 0.36 + 17.7 ) ) - 0.5;
+        vec2 p = uv + w * 0.9;
+
+        float f = fbm5( p );
+        float coverL = uCloudCover * ( 1.0 - 0.52 * breakMask );
+        float d = shapeDeck( f, coverL, 0.32 );
+
+        // erode the silhouette with a higher-frequency pass so edges are wispy
+        float det = fbm4( p * 4.2 + 21.0 );
+        d = clamp( d - ( 1.0 - d ) * ( det - 0.34 ) * 0.90, 0.0, 1.0 );
+
+        // stack toward the horizon into a solid band
+        d = 1.0 - pow( 1.0 - d, 1.0 + 2.4 * sideness * ( 1.0 - 0.75 * breakMask ) );
+        d *= smoothstep( 0.002, 0.055, direction.y );
+
+        if ( d > 0.003 ) {
+          // Fake a light march: how much cloud sits between here and the sun.
+          float f1 = fbm4( p + sunStep * 0.45 );
+          float f2 = fbm4( p + sunStep );
+          float d1 = shapeDeck( f1, coverL, 0.32 );
+          float d2 = shapeDeck( f2, coverL, 0.32 );
+          float trans = exp( -( d1 * 1.5 + d2 * 1.1 ) );
+
+          // Where we sit in the vertical body of the cloud: high fbm values are
+          // the built-up towers (bright tops), low values the thin flat base.
+          float alt = smoothstep( 0.34, 0.86, f );
+
+          // Ambient: the top of a cloud sees the whole sky dome, the base sees
+          // the ground and a sliver of horizon. Which of the two we are looking
+          // at is 'sideness'.
+          vec3 ambTop = uCloudShadowTint * ( skyLumPre * 4.4 ) * uCloudGain;
+          vec3 ambBase = ambTop * 0.62
+            + uHazeTint * uWarmUnder * sunLumV * uCloudGain * ( 0.25 + 0.75 * pow( azAlign, 2.4 ) ) * sideness;
+          vec3 amb = mix( ambBase, ambTop, sideness * 0.75 + alt * 0.25 );
+
+          // Direct: only the flanks and tops we can actually see catch the key,
+          // and under a deck this is a minority of the light — overdo it and the
+          // whole sky goes orange instead of grey with a warm break.
+          vec3 direct = litCol * ( 0.10 + 0.90 * trans ) *
+            ( 0.30 + 0.70 * sideness ) * ( 0.35 + 0.65 * alt ) * 0.95;
+
+          // Silver lining: forward scattering through the thin edges. Peaks
+          // where the deck is half transparent, which is exactly the silhouette.
+          float edge = d * ( 1.0 - d ) * 4.0;
+          vec3 silver = litCol * hgPhase( cosTheta, 0.82 ) * uSilver *
+            ( 0.30 + 0.70 * edge ) * ( 1.0 - d * 0.55 )
+            // thin edges are bright from every direction, not only up-sun
+            + ambTop * edge * 0.20
+            // and the built-up crowns catch the key almost unattenuated
+            + litCol * pow( alt, 2.0 ) * trans * 0.50;
+
+          // Internal mottling: without this the body of a big cloud is a flat
+          // grey field and the whole deck reads as a cut-out.
+          amb *= 0.68 + 0.64 * alt + 0.30 * ( det - 0.45 );
+
+          vec3 cc = amb + direct + silver;
+          // Deep cloud is grey: enough scattering events and the hue washes out.
+          // Only the break keeps its colour.
+          cc = mix( vec3( dot( cc, LUMA ) ), cc, mix( uCloudSat, 1.0, breakMask ) );
+
+          // aerial perspective on the deck itself — distant low cloud dissolves
+          // into the horizon haze rather than staying crisp to the edge of frame
+          float fade = 1.0 - smoothstep( 0.010, 0.16, direction.y );
+          vec3 hazeCol = mix( uHazeColor, uHazeTint, pow( azAlign, 2.6 ) ) *
+            uHazeStrength * ( 0.55 + 0.9 * sunLumV ) + col * 0.55;
+          cc = mix( cc, hazeCol, fade * 0.66 );
+
+          float aL = d * uCloudOpacity;
+          col = mix( col, cc, aL );
+          coverA = coverA + aL - coverA * aL;
+        }
       }
 
-      // --- horizon haze band -------------------------------------------------
-      float hz = pow( 1.0 - abs( direction.y ), 7.0 );
-      float sunSide = 0.30 + 0.70 * pow( max( dot( normalize( direction.xz + 1e-5 ), normalize( vSunDirection.xz + 1e-5 ) ) * 0.5 + 0.5, 0.0 ), 2.2 );
-      col += uHazeTint * hz * uHazeStrength * sunSide * ( 0.35 + 0.55 * sunLumV );
+      // A little of the break-through glow survives the deck — thin cloud lights
+      // up from behind instead of reading as a flat cut-out.
+      col += glowCol * coverA * 0.45 * sunUp;
+
+      // --- horizon haze -------------------------------------------------------
+      // Two terms: a wide value lift that removes the hard sky/ground line, and
+      // a tight bright band sitting right on it.
+      float below = 1.0 - abs( direction.y );
+      float wide = pow( clamp( below, 0.0, 1.0 ), 5.5 );
+      float band = pow( clamp( below, 0.0, 1.0 ), 26.0 );
+      float sunSide = 0.40 + 0.60 * pow( azAlign, 1.8 );
+      vec3 hazeMix = mix( uHazeColor, uHazeTint, clamp( pow( azAlign, 2.2 ) * ( 0.35 + 0.65 * ( 1.0 - sunUp * 0.6 ) ), 0.0, 1.0 ) );
+      col = mix( col, hazeMix * ( 0.5 + 1.2 * sunLumV ), wide * uHazeStrength * sunSide * 0.80 );
+      col += hazeMix * band * uHazeStrength * sunSide * ( 0.4 + 0.8 * sunLumV );
 
       // --- twilight ----------------------------------------------------------
       // Preetham's earth-shadow hack drops to zero the moment the sun sets, so
       // hand back the residual scattered light that makes blue hour readable.
       float twilight = smoothstep( 0.11, -0.15, vSunDirection.y ) * uTwilightStrength;
       if ( twilight > 0.001 ) {
-        float azim = dot( normalize( direction.xz + 1e-5 ), normalize( vSunDirection.xz + 1e-5 ) ) * 0.5 + 0.5;
-        vec3 tw = uTwilightColor * ( 0.42 + 0.58 * pow( 1.0 - abs( direction.y ), 2.4 ) );
-        tw *= 0.55 + 0.85 * pow( azim, 2.0 );
+        vec3 tw = uTwilightColor * ( 0.42 + 0.58 * pow( clamp( below, 0.0, 1.0 ), 2.4 ) );
+        tw *= 0.55 + 0.85 * pow( azAlign, 2.0 );
         // low warm afterglow hugging the horizon on the sun side
-        tw += uHazeTint * uTwilightColor.b * 2.6 * pow( azim, 5.0 ) * pow( max( 1.0 - abs( direction.y ) * 3.4, 0.0 ), 2.0 );
+        tw += uHazeTint * uTwilightColor.b * 2.6 * pow( azAlign, 5.0 ) * pow( max( 1.0 - abs( direction.y ) * 3.4, 0.0 ), 2.0 );
         // specified in post-exposure units so the presets stay readable
         col += tw * twilight / max( uSkyIntensity, 1e-3 );
       }
 
       // --- ground bounce hemisphere (drives the lower half of the IBL) -------
-      if ( direction.y < 0.02 ) {
-        float t = smoothstep( 0.02, -0.16, direction.y );
-        // albedo/pi * (direct sun on a flat lot + sky ambient)
+      // Rolled off over a wide arc so the dome never draws a line where the
+      // real ground plane ends; the first few degrees below the horizon stay
+      // haze-coloured and the bounce only takes over well down.
+      if ( direction.y < 0.10 ) {
+        float t = smoothstep( 0.10, -0.34, direction.y );
         vec3 g = uGroundColor * uGroundGain * ( sunIrr * 0.318 * max( vSunDirection.y, 0.0 ) + col * 0.62 );
-        // a little forward glint back toward the sun
-        g *= 1.0 + 0.55 * pow( max( dot( normalize( direction.xz + 1e-5 ), normalize( vSunDirection.xz + 1e-5 ) ), 0.0 ), 3.0 );
-        col = mix( col, g, t );
+        g *= 1.0 + 0.55 * pow( max( dot( viewAz, sunAz ), 0.0 ), 3.0 );
+        // blend through the haze colour, not straight to dirt
+        vec3 nearGround = mix( col, hazeMix * ( 0.42 + 0.9 * sunLumV ), 0.55 );
+        col = mix( col, mix( nearGround, g, smoothstep( 0.0, -0.22, direction.y ) ), t );
       }
 
       // --- stars at dusk ------------------------------------------------------
@@ -429,29 +580,31 @@ const SkyShader = {
         vec2 sf = fract( suv ) - 0.5;
         float pick = hash21( sc + 3.0 );
         vec2 jitter = ( vec2( hash21( sc + 11.0 ), hash21( sc + 23.0 ) ) - 0.5 ) * 0.7;
-        float d = length( sf - jitter );
-        float star = step( 0.9855, pick ) * exp( -d * d * 90.0 ) * ( 0.35 + 0.65 * hash21( sc + 41.0 ) );
-        col += vec3( 0.82, 0.88, 1.0 ) * star * uNight * 0.09 * smoothstep( 0.02, 0.28, direction.y );
+        float dd = length( sf - jitter );
+        float star = step( 0.9855, pick ) * exp( -dd * dd * 90.0 ) * ( 0.35 + 0.65 * hash21( sc + 41.0 ) );
+        col += vec3( 0.82, 0.88, 1.0 ) * star * uNight * 0.09 *
+          smoothstep( 0.02, 0.28, direction.y ) * ( 1.0 - coverA * 0.9 );
       }
 
       // Sky exposure, then a soft shoulder. Preetham radiance spans four orders
       // of magnitude; without this the whole sun side clips to flat white under
-      // ACES at exposure 1.05.
+      // ACES at exposure 1.0.
       col *= uSkyTint * uSkyIntensity;
       // Compress on luminance, not per channel, so the aureole rolls off as a
       // warm gradient instead of clipping to flat white. A little per-channel
       // compression is blended back in so the very core still whitens.
-      float skyL = dot( col, vec3( 0.2126, 0.7152, 0.0722 ) );
+      float skyL = dot( col, LUMA );
       float skyLc = skyL / ( 1.0 + skyL * uSkyRolloff );
       col = mix( col * ( skyLc / max( skyL, 1e-5 ) ), col / ( 1.0 + col * uSkyRolloff ), 0.22 );
 
       // --- sun disc, added past the shoulder so it still blows out and blooms --
+      // Behind a covered deck it is mostly hidden; that is the point.
       float discMask = smoothstep( sunAngularDiameterCos, sunAngularDiameterCos + 0.000018, cosTheta );
       float limb = 0.55 + 0.45 * sqrt( max( 0.0, 1.0 - pow( ( 1.0 - cosTheta ) / ( 1.0 - sunAngularDiameterCos ), 2.0 ) ) );
       vec3 discHue = Fex / max( max( Fex.r, max( Fex.g, Fex.b ) ), 1e-4 );
       vec3 disc = discHue * uSunDiscIntensity * uShowSunDisc *
         ( discMask * limb + 0.055 * pow( max( cosTheta, 0.0 ), 380.0 ) );
-      col += min( disc, vec3( 90.0 ) );
+      col += min( disc, vec3( 90.0 ) ) * ( 1.0 - coverA * 0.88 );
 
       gl_FragColor = vec4( max( col, 0.0 ), 1.0 );
 
@@ -461,13 +614,15 @@ const SkyShader = {
   `,
 };
 
-// Additive aureole billboard that sits on the sun direction. Cheap stand-in for
-// volumetric god rays; it also feeds the bloom pass so low sun blooms properly.
+// Additive aureole + crepuscular-ray billboard parked on the sun direction.
+// One quad; the angular noise gives shafts that read as light spilling through
+// gaps in the deck, and the whole thing feeds the bloom pass.
 const SunHazeShader = {
   uniforms: {
     uColor: { value: new THREE.Color(1.0, 0.72, 0.42) },
     uIntensity: { value: 1.0 },
-    uStreak: { value: 0.55 },
+    uShafts: { value: 0.55 },
+    uTime: { value: 0 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -479,18 +634,41 @@ const SunHazeShader = {
   fragmentShader: /* glsl */`
     uniform vec3 uColor;
     uniform float uIntensity;
-    uniform float uStreak;
+    uniform float uShafts;
+    uniform float uTime;
     varying vec2 vUv;
+
+    float hash21( vec2 p ) {
+      p = fract( p * vec2( 233.34, 851.73 ) );
+      p += dot( p, p + 23.45 );
+      return fract( p.x * p.y );
+    }
+    float vnoise( vec2 p ) {
+      vec2 i = floor( p ), f = fract( p );
+      f = f * f * ( 3.0 - 2.0 * f );
+      return mix( mix( hash21( i ), hash21( i + vec2( 1.0, 0.0 ) ), f.x ),
+                  mix( hash21( i + vec2( 0.0, 1.0 ) ), hash21( i + vec2( 1.0, 1.0 ) ), f.x ), f.y );
+    }
+
     void main() {
       vec2 p = vUv * 2.0 - 1.0;
       float r = length( p );
-      float core = exp( -r * r * 64.0 ) * 1.9;
-      float aureole = exp( -r * 5.4 ) * 0.30;
-      float streak = exp( -abs( p.x ) * 3.2 ) * exp( -abs( p.y ) * 60.0 ) * uStreak;
-      float ring = smoothstep( 0.58, 0.45, r ) * smoothstep( 0.32, 0.45, r ) * 0.05;
-      float a = ( core + aureole + streak + ring ) * uIntensity;
-      a *= smoothstep( 1.0, 0.55, r );
-      gl_FragColor = vec4( uColor * max( a, 0.0 ), 1.0 );
+      vec2 dir = p / max( r, 1e-4 );
+
+      float core = exp( -r * r * 70.0 ) * 1.7;
+      float aureole = exp( -r * 5.0 ) * 0.34;
+
+      // Crepuscular rays: 1D noise sampled on the unit circle, so it is seamless
+      // by construction. Two bands give thick shafts with finer ones inside.
+      vec2 a = dir * 9.0 + uTime * 0.013;
+      vec2 b = dir * 23.0 - uTime * 0.021;
+      float rays = vnoise( a ) * 0.70 + vnoise( b ) * 0.30;
+      rays = pow( clamp( rays * 1.55 - 0.34, 0.0, 1.0 ), 1.7 );
+      rays *= smoothstep( 0.02, 0.30, r ) * exp( -r * 2.4 ) * uShafts;
+
+      float amount = ( core + aureole + rays ) * uIntensity;
+      amount *= smoothstep( 1.0, 0.48, r );
+      gl_FragColor = vec4( uColor * max( amount, 0.0 ), 1.0 );
     }
   `,
 };
@@ -525,6 +703,15 @@ const BulbShader = {
 // ---------------------------------------------------------------------------
 // Time-of-day keyframes. Colours are authored in sRGB and converted to the
 // linear working space on load; everything between stops is lerped.
+//
+// The reference frame is the `golden` stop: broken-overcast dusk. Read that stop
+// as the art direction and the others as excursions from it.
+//   - `fog` / `fogSun` are the two ends of the aerial-perspective haze; the
+//     frame update blends between them by how far the camera is turned into the
+//     sun, which is what a single fog colour cannot do.
+//   - `sunIntensity` is deliberately modest and `hemiIntensity` large: light
+//     through a cloud deck is mostly ambient. A key/fill ratio near 2:1 is what
+//     keeps the ramp faces off black.
 // ---------------------------------------------------------------------------
 
 function srgb(hex) { return new THREE.Color().setHex(hex, THREE.SRGBColorSpace); }
@@ -532,104 +719,132 @@ function srgb(hex) { return new THREE.Color().setHex(hex, THREE.SRGBColorSpace);
 const TOD_STOPS = [
   { // 0.00 — dawn
     t: 0.00, elev: 1.2, azim: 84,
-    turbidity: 4.2, rayleigh: 3.3, mie: 0.0075, mieG: 0.9, skyIntensity: 0.28, skyRolloff: 0.5, sunDisc: 20, cloudGain: 4.5, groundGain: 1.5,
-    sun: srgb(0xff9a58), sunIntensity: 0.9,
-    hemiSky: srgb(0x5d7196), hemiGround: srgb(0x4a3a2e), hemiIntensity: 0.30,
-    rim: srgb(0x7f9ecb), rimIntensity: 0.22, bounce: srgb(0x8a6a4a), bounceIntensity: 0.16,
-    fog: srgb(0x6e5347), fogDensity: 0.0092,
-    haze: srgb(0xff8a4a), hazeStrength: 0.3, ground: srgb(0x3a3028),
-    cloudCover: 0.4, cirrus: 0.34, cloudLit: srgb(0xffd9b8), cloudShadow: srgb(0x5a5a78),
-    exposure: 0.98, envIntensity: 1.0, practical: 0.55, night: 0.28, hazeGlow: 0.9, twilight: srgb(0x22345c), twilightStrength: 1.05,
+    turbidity: 4.2, rayleigh: 3.3, mie: 0.0075, mieG: 0.9, skyIntensity: 0.27, skyRolloff: 0.50, sunDisc: 20,
+    cloudGain: 4.2, groundGain: 1.5,
+    sun: srgb(0xff9a58), sunIntensity: 0.85,
+    hemiSky: srgb(0x66799c), hemiGround: srgb(0x4a3a2e), hemiIntensity: 0.62,
+    rim: srgb(0x8aa4cd), rimIntensity: 0.26, bounce: srgb(0x8a6a4a), bounceIntensity: 0.22,
+    fog: srgb(0x59606e), fogSun: srgb(0xa8785f), fogDensity: 0.0086,
+    haze: srgb(0xff9a5e), hazeColor: srgb(0x8792a6), hazeStrength: 0.26, ground: srgb(0x3a3028),
+    cloudCover: 0.66, cloudHigh: 0.52, cloudLit: srgb(0xffd9b8), cloudShadow: srgb(0x646c80),
+    silver: 1.8, warmUnder: 0.85, sunGlow: 0.9, cloudSat: 0.66,
+    exposure: 1.00, envIntensity: 1.10, practical: 0.55, night: 0.28, hazeGlow: 0.9,
+    twilight: srgb(0x22345c), twilightStrength: 1.05,
   },
   { // 0.14 — morning
     t: 0.14, elev: 15, azim: 95,
-    turbidity: 3.2, rayleigh: 2.5, mie: 0.0052, mieG: 0.885, skyIntensity: 0.17, skyRolloff: 0.44, sunDisc: 44, cloudGain: 1.5, groundGain: 1.6,
-    sun: srgb(0xffc78d), sunIntensity: 2.35,
-    hemiSky: srgb(0x8fb0dd), hemiGround: srgb(0x5c4b3a), hemiIntensity: 0.45,
-    rim: srgb(0x9dbde8), rimIntensity: 0.26, bounce: srgb(0x9a7a55), bounceIntensity: 0.18,
-    fog: srgb(0xc7b3a2), fogDensity: 0.0082,
-    haze: srgb(0xffb27a), hazeStrength: 0.2, ground: srgb(0x4a4038),
-    cloudCover: 0.43, cirrus: 0.44, cloudLit: srgb(0xfff0dc), cloudShadow: srgb(0x6c7896),
-    exposure: 1.00, envIntensity: 1.0, practical: 0.08, night: 0.0, hazeGlow: 0.55, twilight: srgb(0x22345c), twilightStrength: 0.0,
+    turbidity: 3.2, rayleigh: 2.5, mie: 0.0052, mieG: 0.885, skyIntensity: 0.155, skyRolloff: 0.44, sunDisc: 44,
+    cloudGain: 1.5, groundGain: 1.6,
+    sun: srgb(0xffc78d), sunIntensity: 2.05,
+    hemiSky: srgb(0x9ab8de), hemiGround: srgb(0x5c4b3a), hemiIntensity: 0.80,
+    rim: srgb(0xa4c2e8), rimIntensity: 0.30, bounce: srgb(0x9a7a55), bounceIntensity: 0.24,
+    fog: srgb(0x9aa5b4), fogSun: srgb(0xd6b295), fogDensity: 0.0068,
+    haze: srgb(0xffc191), hazeColor: srgb(0xa8b3c2), hazeStrength: 0.20, ground: srgb(0x4a4038),
+    cloudCover: 0.60, cloudHigh: 0.50, cloudLit: srgb(0xfff0dc), cloudShadow: srgb(0x76808f),
+    silver: 1.5, warmUnder: 0.45, sunGlow: 0.7, cloudSat: 0.50,
+    exposure: 1.00, envIntensity: 1.05, practical: 0.08, night: 0.0, hazeGlow: 0.55,
+    twilight: srgb(0x22345c), twilightStrength: 0.0,
   },
   { // 0.33 — noon
     t: 0.33, elev: 66, azim: 176,
-    turbidity: 2.3, rayleigh: 1.7, mie: 0.0035, mieG: 0.86, skyIntensity: 0.145, skyRolloff: 0.4, sunDisc: 55, cloudGain: 1.0, groundGain: 1.6,
-    sun: srgb(0xfff4e6), sunIntensity: 3.55,
-    hemiSky: srgb(0xaecdf5), hemiGround: srgb(0x6a5b48), hemiIntensity: 0.40,
-    rim: srgb(0xb7d2f7), rimIntensity: 0.22, bounce: srgb(0xa08a68), bounceIntensity: 0.20,
-    fog: srgb(0xb9c8da), fogDensity: 0.0048,
-    haze: srgb(0xd8dbe0), hazeStrength: 0.13, ground: srgb(0x565049),
-    cloudCover: 0.36, cirrus: 0.34, cloudLit: srgb(0xffffff), cloudShadow: srgb(0x7c8aa8),
-    exposure: 1.00, envIntensity: 1.0, practical: 0.0, night: 0.0, hazeGlow: 0.35, twilight: srgb(0x2a3a60), twilightStrength: 0.0,
+    turbidity: 2.3, rayleigh: 1.7, mie: 0.0035, mieG: 0.86, skyIntensity: 0.135, skyRolloff: 0.40, sunDisc: 55,
+    cloudGain: 1.0, groundGain: 1.6,
+    sun: srgb(0xfff4e6), sunIntensity: 3.15,
+    hemiSky: srgb(0xb4d0f5), hemiGround: srgb(0x6a5b48), hemiIntensity: 0.72,
+    rim: srgb(0xbdd6f7), rimIntensity: 0.24, bounce: srgb(0xa08a68), bounceIntensity: 0.26,
+    fog: srgb(0xa8b6c6), fogSun: srgb(0xc4ccd4), fogDensity: 0.0042,
+    haze: srgb(0xd8dbe0), hazeColor: srgb(0xb4c0cd), hazeStrength: 0.14, ground: srgb(0x565049),
+    cloudCover: 0.50, cloudHigh: 0.40, cloudLit: srgb(0xffffff), cloudShadow: srgb(0x8a94a2),
+    silver: 1.2, warmUnder: 0.22, sunGlow: 0.45, cloudSat: 0.42,
+    exposure: 0.98, envIntensity: 1.05, practical: 0.0, night: 0.0, hazeGlow: 0.35,
+    twilight: srgb(0x2a3a60), twilightStrength: 0.0,
   },
   { // 0.52 — afternoon
-    t: 0.52, elev: 43, azim: 226,
-    turbidity: 2.6, rayleigh: 2.0, mie: 0.004, mieG: 0.87, skyIntensity: 0.156, skyRolloff: 0.41, sunDisc: 52, cloudGain: 1.05, groundGain: 1.6,
-    sun: srgb(0xffe9c9), sunIntensity: 3.30,
-    hemiSky: srgb(0xa6c6ee), hemiGround: srgb(0x6d5a44), hemiIntensity: 0.40,
-    rim: srgb(0xa8c8f2), rimIntensity: 0.24, bounce: srgb(0xa88a62), bounceIntensity: 0.22,
-    fog: srgb(0xc2c6c9), fogDensity: 0.0055,
-    haze: srgb(0xeccfa8), hazeStrength: 0.16, ground: srgb(0x554d43),
-    cloudCover: 0.39, cirrus: 0.38, cloudLit: srgb(0xfff6e8), cloudShadow: srgb(0x74809c),
-    exposure: 1.02, envIntensity: 1.0, practical: 0.0, night: 0.0, hazeGlow: 0.5, twilight: srgb(0x2a3a60), twilightStrength: 0.0,
+    t: 0.52, elev: 40, azim: 232,
+    turbidity: 2.7, rayleigh: 2.0, mie: 0.0042, mieG: 0.87, skyIntensity: 0.145, skyRolloff: 0.41, sunDisc: 52,
+    cloudGain: 1.08, groundGain: 1.6,
+    sun: srgb(0xffe9c9), sunIntensity: 2.90,
+    hemiSky: srgb(0xaac9ee), hemiGround: srgb(0x6d5a44), hemiIntensity: 0.78,
+    rim: srgb(0xaccbf2), rimIntensity: 0.28, bounce: srgb(0xa89070), bounceIntensity: 0.28,
+    fog: srgb(0xa4b0bc), fogSun: srgb(0xcbc0b2), fogDensity: 0.0046,
+    haze: srgb(0xe8ceb0), hazeColor: srgb(0xaab6c4), hazeStrength: 0.17, ground: srgb(0x554d43),
+    cloudCover: 0.56, cloudHigh: 0.44, cloudLit: srgb(0xfff6e8), cloudShadow: srgb(0x7f8896),
+    silver: 1.4, warmUnder: 0.32, sunGlow: 0.6, cloudSat: 0.46,
+    exposure: 1.00, envIntensity: 1.05, practical: 0.0, night: 0.0, hazeGlow: 0.5,
+    twilight: srgb(0x2a3a60), twilightStrength: 0.0,
   },
-  { // 0.68 — GOLDEN HOUR (default boot state, sun ~22 degrees)
-    t: 0.68, elev: 22, azim: 252,
-    turbidity: 3.1, rayleigh: 2.7, mie: 0.0046, mieG: 0.895, skyIntensity: 0.15, skyRolloff: 0.4, sunDisc: 40, cloudGain: 1.35, groundGain: 1.7,
-    sun: srgb(0xffdcb4), sunIntensity: 3.05,
-    hemiSky: srgb(0x8fb4e8), hemiGround: srgb(0x7a5a3a), hemiIntensity: 0.42,
-    rim: srgb(0x8fb2e6), rimIntensity: 0.30, bounce: srgb(0xc08d54), bounceIntensity: 0.28,
-    fog: srgb(0xc6a583), fogDensity: 0.0046,
-    haze: srgb(0xffb069), hazeStrength: 0.24, ground: srgb(0x4e4237),
-    cloudCover: 0.42, cirrus: 0.42, cloudLit: srgb(0xffd8a8), cloudShadow: srgb(0x5b6688),
-    exposure: 1.05, envIntensity: 1.0, practical: 0.0, night: 0.0, hazeGlow: 1.0, twilight: srgb(0x243a66), twilightStrength: 0.0,
+  { // 0.68 — THE REFERENCE FRAME: broken-overcast dusk, sun low behind the deck
+    t: 0.68, elev: 13, azim: 246,
+    turbidity: 3.4, rayleigh: 2.5, mie: 0.0050, mieG: 0.895, skyIntensity: 0.162, skyRolloff: 0.40, sunDisc: 34,
+    cloudGain: 1.45, groundGain: 1.7,
+    sun: srgb(0xffd9ac), sunIntensity: 2.30,
+    hemiSky: srgb(0x9fbadd), hemiGround: srgb(0x726557), hemiIntensity: 1.05,
+    rim: srgb(0x93b3e2), rimIntensity: 0.34, bounce: srgb(0xb59372), bounceIntensity: 0.40,
+    fog: srgb(0x99a3b1), fogSun: srgb(0xceb098), fogDensity: 0.0044,
+    haze: srgb(0xffcda4), hazeColor: srgb(0x9fabbb), hazeStrength: 0.22, ground: srgb(0x4e4237),
+    cloudCover: 0.74, cloudHigh: 0.58, cloudLit: srgb(0xffeada), cloudShadow: srgb(0x717c90),
+    silver: 1.9, warmUnder: 0.55, sunGlow: 1.0, cloudSat: 0.44,
+    exposure: 1.06, envIntensity: 1.12, practical: 0.0, night: 0.0, hazeGlow: 1.0,
+    twilight: srgb(0x243a66), twilightStrength: 0.0,
   },
-  { // 0.84 — low sun
-    t: 0.84, elev: 6, azim: 268,
-    turbidity: 4.2, rayleigh: 3.4, mie: 0.0065, mieG: 0.905, skyIntensity: 0.18, skyRolloff: 0.45, sunDisc: 28, cloudGain: 3.6, groundGain: 1.7,
-    sun: srgb(0xff9f61), sunIntensity: 1.95,
-    hemiSky: srgb(0x7a94c8), hemiGround: srgb(0x7d5334), hemiIntensity: 0.30,
-    rim: srgb(0x8098d0), rimIntensity: 0.30, bounce: srgb(0xc07a42), bounceIntensity: 0.26,
-    fog: srgb(0xcc8f66), fogDensity: 0.0066,
-    haze: srgb(0xff8a44), hazeStrength: 0.34, ground: srgb(0x453a31),
-    cloudCover: 0.38, cirrus: 0.3, cloudLit: srgb(0xffdcc0), cloudShadow: srgb(0x545e84),
-    exposure: 1.06, envIntensity: 1.0, practical: 0.22, night: 0.0, hazeGlow: 1.35, twilight: srgb(0x243a66), twilightStrength: 0.06,
+  { // 0.84 — low sun raking under the deck
+    t: 0.84, elev: 5, azim: 262,
+    turbidity: 4.2, rayleigh: 3.2, mie: 0.0066, mieG: 0.905, skyIntensity: 0.168, skyRolloff: 0.44, sunDisc: 26,
+    cloudGain: 2.4, groundGain: 1.7,
+    sun: srgb(0xffa970), sunIntensity: 1.65,
+    hemiSky: srgb(0x8296c6), hemiGround: srgb(0x7a5f45), hemiIntensity: 0.82,
+    rim: srgb(0x8497cf), rimIntensity: 0.34, bounce: srgb(0xc08a56), bounceIntensity: 0.36,
+    fog: srgb(0x7e8496), fogSun: srgb(0xc08a68), fogDensity: 0.0064,
+    haze: srgb(0xffa76c), hazeColor: srgb(0x8b93a6), hazeStrength: 0.28, ground: srgb(0x453a31),
+    cloudCover: 0.72, cloudHigh: 0.54, cloudLit: srgb(0xffdcc0), cloudShadow: srgb(0x666e82),
+    silver: 2.2, warmUnder: 0.95, sunGlow: 1.25, cloudSat: 0.64,
+    exposure: 1.02, envIntensity: 1.10, practical: 0.22, night: 0.0, hazeGlow: 1.35,
+    twilight: srgb(0x243a66), twilightStrength: 0.06,
   },
   { // 0.93 — dusk
-    t: 0.93, elev: -1.6, azim: 276,
-    turbidity: 5.2, rayleigh: 3.7, mie: 0.008, mieG: 0.91, skyIntensity: 0.195, skyRolloff: 0.5, sunDisc: 13, cloudGain: 6.5, groundGain: 1.6,
-    sun: srgb(0xff7a4e), sunIntensity: 0.52,
-    hemiSky: srgb(0x5a6a9c), hemiGround: srgb(0x5c4030), hemiIntensity: 0.24,
-    rim: srgb(0x6d80b8), rimIntensity: 0.26, bounce: srgb(0x9a6038), bounceIntensity: 0.18,
-    fog: srgb(0x4a3d48), fogDensity: 0.0108,
-    haze: srgb(0xff6f3c), hazeStrength: 0.3, ground: srgb(0x332c27),
-    cloudCover: 0.4, cirrus: 0.32, cloudLit: srgb(0xffcbb0), cloudShadow: srgb(0x424c70),
-    exposure: 1.10, envIntensity: 1.05, practical: 0.85, night: 0.35, hazeGlow: 1.1, twilight: srgb(0x27406e), twilightStrength: 0.95,
+    t: 0.93, elev: -1.6, azim: 272,
+    turbidity: 5.0, rayleigh: 3.6, mie: 0.008, mieG: 0.91, skyIntensity: 0.175, skyRolloff: 0.48, sunDisc: 12,
+    cloudGain: 5.6, groundGain: 1.6,
+    sun: srgb(0xff7a4e), sunIntensity: 0.48,
+    hemiSky: srgb(0x63739f), hemiGround: srgb(0x5c4030), hemiIntensity: 0.64,
+    rim: srgb(0x7183b8), rimIntensity: 0.30, bounce: srgb(0x9a6038), bounceIntensity: 0.28,
+    fog: srgb(0x454c60), fogSun: srgb(0x8a5a4c), fogDensity: 0.0098,
+    haze: srgb(0xff7346), hazeColor: srgb(0x5e6780), hazeStrength: 0.26, ground: srgb(0x332c27),
+    cloudCover: 0.72, cloudHigh: 0.54, cloudLit: srgb(0xffcbb0), cloudShadow: srgb(0x505874),
+    silver: 2.0, warmUnder: 0.9, sunGlow: 1.1, cloudSat: 0.70,
+    exposure: 1.06, envIntensity: 1.12, practical: 0.85, night: 0.35, hazeGlow: 1.1,
+    twilight: srgb(0x27406e), twilightStrength: 0.95,
   },
   { // 1.00 — blue hour
     t: 1.00, elev: -8, azim: 284,
-    turbidity: 4.2, rayleigh: 3.0, mie: 0.007, mieG: 0.9, skyIntensity: 0.2, skyRolloff: 0.56, sunDisc: 4, cloudGain: 5.0, groundGain: 1.5,
+    turbidity: 4.2, rayleigh: 3.0, mie: 0.007, mieG: 0.9, skyIntensity: 0.19, skyRolloff: 0.54, sunDisc: 4,
+    cloudGain: 4.5, groundGain: 1.5,
     sun: srgb(0x6f83b4), sunIntensity: 0.10,
-    hemiSky: srgb(0x3f4e77), hemiGround: srgb(0x3b2c22), hemiIntensity: 0.18,
-    rim: srgb(0x4c5e90), rimIntensity: 0.20, bounce: srgb(0x6a4630), bounceIntensity: 0.12,
-    fog: srgb(0x1e2740), fogDensity: 0.0125,
-    haze: srgb(0x8a6a86), hazeStrength: 0.18, ground: srgb(0x22201f),
-    cloudCover: 0.4, cirrus: 0.34, cloudLit: srgb(0x9aa4c8), cloudShadow: srgb(0x2c3450),
-    exposure: 1.16, envIntensity: 1.15, practical: 1.0, night: 1.0, hazeGlow: 0.5, twilight: srgb(0x1d3260), twilightStrength: 1.05,
+    hemiSky: srgb(0x46557f), hemiGround: srgb(0x3b2c22), hemiIntensity: 0.34,
+    rim: srgb(0x506394), rimIntensity: 0.22, bounce: srgb(0x6a4630), bounceIntensity: 0.14,
+    fog: srgb(0x232c46), fogSun: srgb(0x3d3a56), fogDensity: 0.0118,
+    haze: srgb(0x8a6a86), hazeColor: srgb(0x3c4664), hazeStrength: 0.17, ground: srgb(0x22201f),
+    cloudCover: 0.66, cloudHigh: 0.50, cloudLit: srgb(0x9aa4c8), cloudShadow: srgb(0x363d52),
+    silver: 1.4, warmUnder: 0.5, sunGlow: 0.5, cloudSat: 0.60,
+    exposure: 1.12, envIntensity: 1.18, practical: 1.0, night: 1.0, hazeGlow: 0.5,
+    twilight: srgb(0x1d3260), twilightStrength: 1.05,
   },
 ];
 
-const DEFAULT_TOD = 0.68;   // golden hour
+const DEFAULT_TOD = 0.68;   // the reference frame
 
 const _numericKeys = [
   'elev', 'azim', 'turbidity', 'rayleigh', 'mie', 'mieG', 'skyIntensity',
   'skyRolloff', 'sunDisc', 'cloudGain', 'groundGain',
   'sunIntensity', 'hemiIntensity', 'rimIntensity', 'bounceIntensity',
-  'fogDensity', 'hazeStrength', 'cloudCover', 'cirrus',
+  'fogDensity', 'hazeStrength', 'cloudCover', 'cloudHigh',
+  'silver', 'warmUnder', 'sunGlow', 'cloudSat',
   'exposure', 'envIntensity', 'practical', 'night', 'hazeGlow', 'twilightStrength',
 ];
-const _colorKeys = ['sun', 'hemiSky', 'hemiGround', 'rim', 'bounce', 'fog', 'haze', 'ground', 'cloudLit', 'cloudShadow', 'twilight'];
+const _colorKeys = [
+  'sun', 'hemiSky', 'hemiGround', 'rim', 'bounce', 'fog', 'fogSun',
+  'haze', 'hazeColor', 'ground', 'cloudLit', 'cloudShadow', 'twilight',
+];
 
 function makeBlankPreset() {
   const p = {};
@@ -663,6 +878,7 @@ const _fwd = new THREE.Vector3();
 const _box = new THREE.Box3();
 const _center = new THREE.Vector3();
 const _snapped = new THREE.Vector3();
+const _fogTarget = new THREE.Color();
 const WORLD_UP = new THREE.Vector3(0, 1, 0);
 const FALLBACK_UP = new THREE.Vector3(0, 0, 1);
 
@@ -695,7 +911,7 @@ export function createEnvironment(ctx) {
   sky.frustumCulled = false;
   // Drawn last among the opaques with depth test on: the dome sits exactly on
   // the far plane, so it only shades pixels no geometry claimed. That keeps the
-  // (expensive) scattering + cloud shader off ~60% of the frame.
+  // (expensive) scattering + two-deck cloud shader off ~60% of the frame.
   sky.renderOrder = 1000;
   sky.matrixAutoUpdate = false;
   sky.updateMatrix();
@@ -722,7 +938,7 @@ export function createEnvironment(ctx) {
 
   function regenerateEnvironment() {
     const prevDisc = SU.uShowSunDisc.value;
-    // The disc is 40x brighter than the sky; leaving it in produces ringing in
+    // The disc is 34x brighter than the sky; leaving it in produces ringing in
     // the roughness mips. The DirectionalLight already carries that energy.
     SU.uShowSunDisc.value = 0;
     const prevRT = envRT;
@@ -736,12 +952,12 @@ export function createEnvironment(ctx) {
 
   // --- sun -----------------------------------------------------------------
   const shadowSize = clamp((engine.tier?.shadowMap ?? 2048) * 2, 1024, 4096);
-  const sun = new THREE.DirectionalLight(0xffdcb4, 3.05);
+  const sun = new THREE.DirectionalLight(0xffd9ac, 2.30);
   sun.name = 'SunLight';
   sun.castShadow = true;
   sun.shadow.mapSize.set(shadowSize, shadowSize);
-  sun.shadow.bias = -0.00028;
-  sun.shadow.normalBias = 0.028;
+  sun.shadow.bias = -0.00026;
+  sun.shadow.normalBias = 0.026;
   sun.shadow.radius = 2.2;
   sun.shadow.blurSamples = 12;
   {
@@ -759,22 +975,26 @@ export function createEnvironment(ctx) {
   engine.sunLight = sun;
 
   // --- fill / bounce -------------------------------------------------------
-  const hemi = new THREE.HemisphereLight(0x8fb4e8, 0x7a5a3a, 0.42);
+  // Under a deck this carries most of the illumination, so it is much stronger
+  // than a clear-sky rig would want. It is what keeps the ramps off black.
+  const hemi = new THREE.HemisphereLight(0x9fbadd, 0x726557, 0.95);
   hemi.name = 'SkyBounce';
   scene.add(hemi);
 
   // Cool rim from the anti-sun side — separates the rider from warm concrete.
-  const rimLight = new THREE.DirectionalLight(0x8fb2e6, 0.30);
+  const rimLight = new THREE.DirectionalLight(0x93b3e2, 0.34);
   rimLight.name = 'SkyRim';
   scene.add(rimLight, rimLight.target);
 
-  // Warm ground bounce, aimed upward, keeps undersides from going black.
-  const bounceLight = new THREE.DirectionalLight(0xc08d54, 0.28);
+  // Warm ground bounce, aimed upward, keeps undersides off black. The lot is a
+  // huge mid-grey concrete reflector; without this term nothing under a ramp lip
+  // or a rider's arm reads at all.
+  const bounceLight = new THREE.DirectionalLight(0xb59372, 0.34);
   bounceLight.name = 'GroundBounce';
   scene.add(bounceLight, bounceLight.target);
 
   // --- fog -----------------------------------------------------------------
-  const fog = new THREE.FogExp2(0xd0b18c, 0.0094);
+  const fog = new THREE.FogExp2(0x9aa4b2, 0.0050);
   scene.fog = fog;
 
   // --- sun haze billboard --------------------------------------------------
@@ -791,7 +1011,7 @@ export function createEnvironment(ctx) {
   });
   const sunHaze = new THREE.Mesh(hazeGeometry, hazeMaterial);
   sunHaze.name = 'SunHaze';
-  sunHaze.scale.setScalar(230);
+  sunHaze.scale.setScalar(260);
   sunHaze.renderOrder = 6;
   scene.add(sunHaze);
 
@@ -877,7 +1097,10 @@ export function createEnvironment(ctx) {
   const sunDir = new THREE.Vector3();
   let timeOfDay = DEFAULT_TOD;
   let cloudTime = 0;
-  const wind = new THREE.Vector2(0.0155, 0.0068);   // cloud-plane units per second
+  // Cloud-plane units per second. The two decks share a wind direction but the
+  // low one is closer, so it sweeps across the frame noticeably faster — that
+  // differential is the whole parallax cue.
+  const wind = new THREE.Vector2(0.0165, 0.0072);
 
   function applyPreset() {
     const el = preset.elev * deg;
@@ -901,10 +1124,15 @@ export function createEnvironment(ctx) {
     SU.uCloudGain.value = preset.cloudGain;
     SU.uGroundGain.value = preset.groundGain;
     SU.uCloudCover.value = preset.cloudCover;
-    SU.uCirrusCover.value = preset.cirrus;
+    SU.uCloudCoverHigh.value = preset.cloudHigh;
     SU.uCloudLitTint.value.copy(preset.cloudLit);
     SU.uCloudShadowTint.value.copy(preset.cloudShadow);
+    SU.uSilver.value = preset.silver;
+    SU.uWarmUnder.value = preset.warmUnder;
+    SU.uSunGlow.value = preset.sunGlow;
+    SU.uCloudSat.value = preset.cloudSat;
     SU.uHazeTint.value.copy(preset.haze);
+    SU.uHazeColor.value.copy(preset.hazeColor);
     SU.uHazeStrength.value = preset.hazeStrength;
     SU.uGroundColor.value.copy(preset.ground);
     SU.uTwilightColor.value.copy(preset.twilight);
@@ -935,7 +1163,7 @@ export function createEnvironment(ctx) {
 
     // sun haze
     hazeMaterial.uniforms.uColor.value.copy(preset.sun);
-    hazeMaterial.uniforms.uStreak.value = lerp(0.25, 0.85, clamp(1 - preset.elev / 45, 0, 1));
+    hazeMaterial.uniforms.uShafts.value = lerp(0.25, 1.15, clamp(1 - preset.elev / 42, 0, 1));
 
     // practicals
     bulbMaterial.uniforms.uColor.value.setRGB(1.0, 0.66, 0.36);
@@ -998,30 +1226,51 @@ export function createEnvironment(ctx) {
   regenerateEnvironment();
 
   // --- frame update --------------------------------------------------------
+  let fogBlend = 0;
+
   function update(dt, c = ctx) {
     const step = Math.min(dt, 0.1);
 
-    // drift the cloud decks; wrap to keep noise coords in a friendly range
+    // Drift both decks. The low deck is nearer, so it moves ~2.3x faster across
+    // the frame; wrap to keep the noise coordinates in a friendly float range.
     cloudTime += step;
-    const drift = SU.uCloudDrift.value;
-    drift.x = (drift.x + wind.x * step) % 4096;
-    drift.y = (drift.y + wind.y * step) % 4096;
+    const dLow = SU.uDriftLow.value;
+    dLow.x = (dLow.x + wind.x * step) % 4096;
+    dLow.y = (dLow.y + wind.y * step) % 4096;
+    const dHigh = SU.uDriftHigh.value;
+    dHigh.x = (dHigh.x + wind.x * 0.43 * step) % 4096;
+    dHigh.y = (dHigh.y + wind.y * 0.43 * step) % 4096;
 
     // follow the player with the shadow frustum
     const pos = c.player?.physics?.state?.position;
     recenterShadows(pos || _v2.set(0, 0, 0));
 
-    // sun haze billboard: park it on the sun ray in front of the camera
     const cam = c.camera;
     if (cam) {
-      sunHaze.position.copy(cam.position).addScaledVector(sunDir, 340);
-      sunHaze.quaternion.copy(cam.quaternion);
+      // --- steer the aerial-perspective haze ------------------------------
+      // A single fog colour cannot be both the cool grey of the anti-sun
+      // distance and the warm wash in front of a low sun. Blend the two ends of
+      // the preset by how far the camera is turned into the sun, damped so a
+      // fast whip-pan does not strobe the whole frame.
       cam.getWorldDirection(_v1);
+      const fa = Math.hypot(_v1.x, _v1.z) || 1;
+      const sa = Math.hypot(sunDir.x, sunDir.z) || 1;
+      const align = clamp(((_v1.x * sunDir.x + _v1.z * sunDir.z) / (fa * sa)) * 0.5 + 0.5, 0, 1);
+      const lowSun = clamp(1 - Math.abs(preset.elev) / 46, 0, 1);
+      const wantBlend = Math.pow(align, 2.4) * (0.30 + 0.70 * lowSun);
+      fogBlend += (wantBlend - fogBlend) * (1 - Math.exp(-2.6 * step));
+      _fogTarget.copy(preset.fog).lerp(preset.fogSun, fogBlend);
+      fog.color.copy(_fogTarget);
+
+      // --- sun haze / crepuscular billboard --------------------------------
+      sunHaze.position.copy(cam.position).addScaledVector(sunDir, 360);
+      sunHaze.quaternion.copy(cam.quaternion);
       const facing = clamp(_v1.dot(sunDir), 0, 1);
-      const lowSun = clamp(1 - Math.abs(preset.elev) / 40, 0, 1);
       const above = clamp((preset.elev + 4) / 8, 0, 1);
-      const amount = preset.hazeGlow * (0.18 + 0.82 * Math.pow(facing, 2.2)) * (0.35 + 0.65 * lowSun) * above;
+      const amount = preset.hazeGlow * (0.14 + 0.86 * Math.pow(facing, 2.0)) *
+        (0.30 + 0.70 * lowSun) * above;
       hazeMaterial.uniforms.uIntensity.value = amount;
+      hazeMaterial.uniforms.uTime.value = cloudTime;
       sunHaze.visible = amount > 0.002;
     }
 
@@ -1073,7 +1322,7 @@ export function createEnvironment(ctx) {
     sunDirection: sunDir,
     get timeOfDay() { return timeOfDay; },
     get envMap() { return envRT ? envRT.texture : null; },
-    /** Cloud wind in cloud-plane units/second. */
+    /** Cloud wind in cloud-plane units/second (low deck; the high deck follows). */
     setWind(x, y) { wind.set(x, y); },
     /** Force an IBL rebuild on the next update (e.g. after a park rebuild). */
     invalidateEnvironment() { envDirty = true; },

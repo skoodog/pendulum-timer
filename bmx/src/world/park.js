@@ -324,6 +324,34 @@ function createBuild(ctx) {
     envMapIntensity: 1.6, name: 'park_poolTile',
   });
 
+  // Ramp sheet. Skatelite is near-black and under this sky it collapsed into a
+  // flat navy panel with no material read at all — every ramp was a cut-out
+  // silhouette. Plywood in its place read as swirling cathedral grain, which is
+  // worse. The riding surface is therefore what the reference actually shows:
+  // a troweled concrete transition, a shade cooler and darker than the slab, at
+  // 3.2 m per tile so the aggregate is the right size on a 3.6 m radius. The
+  // structure behind it stays raw ply, so sheet / cheek / frame still read as
+  // three different materials.
+  const rampSheet = M.variant('concreteWorn', {
+    tile: 3.2, color: 0xc3c7c9, roughness: 0.86, normalScale: 0.85,
+    macro: { scale: 0.055, colour: 0.20, rough: 0.20, warm: 0.10 }, name: 'park_rampSheet',
+  });
+  const rampStruct = M.variant('plywood', {
+    color: 0xb2a289, roughness: 0.95,
+    macro: { scale: 0.085, colour: 0.22, rough: 0.14, warm: 0.18 }, name: 'park_rampStruct',
+  });
+
+  // Patch repairs: a second, greyer concrete pour laid over the slab. Cloned
+  // rather than `variant()`d so the polygon offset that keeps a 8 mm-proud patch
+  // off the slab's depth values cannot leak into any shared material.
+  const patchMat = M.get('concreteWorn').clone();
+  patchMat.name = 'park_patch';
+  patchMat.color = new THREE.Color(0xcfc9bb);
+  patchMat.roughness = 0.96;
+  patchMat.polygonOffset = true;
+  patchMat.polygonOffsetFactor = -2;
+  patchMat.polygonOffsetUnits = -2;
+
   // The slab and the lot are the two biggest surfaces in frame; they get extra
   // low-frequency world-space variation so the 4-5 m texture tile stops reading.
   const padMat = M.variant('concrete', {
@@ -341,9 +369,10 @@ function createBuild(ctx) {
     ['ground_pad', padMat, false, true, { type: 'ground', friction: 0.96 }, 0.331],
     ['ground_lot', lotMat, false, true, { type: 'ground', friction: 0.90 }, -0.214],
     ['ground_dirt', dirtMat, true, true, { type: 'ground', friction: 0.78 }, 0.472],
-    ['ramp_ride', M.get('skatelite'), true, true, { type: 'ramp', friction: 1.00 }],
-    ['ramp_struct', M.get('plywood'), true, true, { type: 'wall', friction: 0.72 }],
+    ['ramp_ride', rampSheet, true, true, { type: 'ramp', friction: 1.00 }],
+    ['ramp_struct', rampStruct, true, true, { type: 'wall', friction: 0.72 }],
     ['park_concrete', M.get('concreteWorn'), true, true, { type: 'ramp', friction: 0.97 }],
+    ['patch_slab', patchMat, false, true, null],
     ['pool_tile', tileMat, true, true, { type: 'ramp', friction: 0.92 }],
     ['brick_wall', M.get('brick'), true, true, { type: 'wall', friction: 0.55 }],
     ['coping', copingMat, true, true, { type: 'ramp', friction: 0.55 }],
@@ -361,7 +390,10 @@ function createBuild(ctx) {
   return {
     M, buckets,
     rails: [],
-    decals: [],                     // { name, matrix }
+    // { cell, matrix|geo, layer, tint, alpha, uvRot } — see the surfacing section
+    decals: [],
+    copings: [],                    // { a, b, m, rows, W, R, H } for wear passes
+    ownMats: [patchMat],            // materials this module allocated itself
     add(bucket, geo) {
       if (!geo) return;
       const b = buckets.get(bucket);
@@ -378,7 +410,10 @@ function createBuild(ctx) {
     ring(pts, radius, type) {
       this.rails.push({ curve: new THREE.CatmullRomCurve3(pts, true, 'centripetal', 0.5), radius, type });
     },
-    decal(name, matrix) { this.decals.push({ name, matrix }); },
+    /** Flat decal quad: `matrix` maps the unit square (centred, +Z front). */
+    decal(cell, matrix, opts = {}) { this.decals.push({ cell, matrix, ...opts }); },
+    /** Decal that follows a surface: `geo` carries uv in the cell's 0..1 space. */
+    decalGeo(cell, geo, opts = {}) { if (geo) this.decals.push({ cell, geo, ...opts }); },
   };
 }
 
@@ -489,7 +524,7 @@ function backFrame(build, m, W, H, zBack) {
 }
 
 /** Steel coping tube at the lip, plus its grind curve. */
-function copingAt(build, m, W, R, H, railType = 'coping') {
+function copingAt(build, m, W, R, H, railType = 'coping', deck = 0) {
   const zc = R - COPING_R * 0.55;
   const yc = H + COPING_R * 0.30;
   const a = new THREE.Vector3(-W * 0.5, yc, zc).applyMatrix4(m);
@@ -502,6 +537,7 @@ function copingAt(build, m, W, R, H, railType = 'coping') {
     a.clone().addScaledVector(dir, inset),
     b.clone().addScaledVector(dir, -inset),
   ], COPING_R, railType);
+  build.copings.push({ a, b, m, W, R, H, deck });
 }
 
 /** Painted tube guard rail with posts, following world-space deck-edge points. */
@@ -561,7 +597,7 @@ function quarterPipe(build, opts) {
 
   if (panels.minus) sidePanel(build, m, W, rows, deck, -1);
   if (panels.plus) sidePanel(build, m, W, rows, deck, 1);
-  if (coping) copingAt(build, m, W, R, H, railType);
+  if (coping) copingAt(build, m, W, R, H, railType, deck);
 
   if (guard && deck > 0) {
     const corner = (lx, lz) => new THREE.Vector3(lx, 0, lz).applyMatrix4(m);
@@ -573,7 +609,7 @@ function quarterPipe(build, opts) {
       corner(W * 0.5 - inset, R + 0.5),
     ], H);
   }
-  return { m, W, H, R, frame: f };
+  return { m, W, H, R, rows, deck, frame: f };
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +702,14 @@ function bankRamp(build, opts) {
     }
     build.add(cb, c.geometry());
   }
+
+  // face frame for the surfacing pass: `right` across the ramp, `up` up-slope,
+  // `right x up` = the outward (rideable) normal, origin at the bottom edge.
+  const right = new THREE.Vector3().subVectors(lo1, lo0).normalize();
+  const up = new THREE.Vector3().subVectors(hi0, lo0).normalize();
+  const o = new THREE.Vector3().addVectors(lo0, lo1).multiplyScalar(0.5);
+  if (right.clone().cross(up).dot(nrm) < 0) right.negate();
+  return { o, right, up, n: nrm, len: wid, run: (run0 + run1) * 0.5 };
 }
 
 /** Rectangular grind ledge with both top edges registered as ledge rails. */
@@ -687,6 +731,7 @@ function flatLedge(build, opts) {
       ], 0.055, 'ledge');
     }
   }
+  return { x0, z0, x1, z1, width, height, base, ux, uz, px, pz, len };
 }
 
 // ---------------------------------------------------------------------------
@@ -758,7 +803,7 @@ function rollIn(build, opts) {
     corner(W * 0.5 - 0.14, zTop + 0.3),
   ], H);
 
-  return { m, W, H, zTop };
+  return { m, W, H, zTop, rows, deck };
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +817,7 @@ function spine(build, opts) {
     { p1: [x1, z - split], p2: [x0, z - split] },   // deck side +Z: rider from the north
     { p1: [x0, z + split], p2: [x1, z + split] },   // deck side -Z: rider from the south
   ];
+  const out = [];
   for (const fc of faces) {
     const f = lipFrame(fc.p1, fc.p2);
     const m = baseMatrix(f, R);
@@ -780,6 +826,7 @@ function spine(build, opts) {
     sidePanel(build, m, f.len, rows, 0, -1);
     sidePanel(build, m, f.len, rows, 0, 1);
     copingAt(build, m, f.len, R, H);
+    out.push({ m, rows, W: f.len, R, H });
   }
   // narrow flat cap between the two copings + the two end slivers
   const cap = new Surf();
@@ -799,6 +846,7 @@ function spine(build, opts) {
       V(x, H, z - split, sgn, 0, 0, z - split, H));
   }
   build.add('ramp_struct', ends.geometry());
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +861,7 @@ function hip(build, opts) {
     { p1: corner, p2: east, outer: -1 },
   ];
   const inner = [];
+  const out = [];
 
   for (const fc of faces) {
     const f = lipFrame(fc.p1, fc.p2);
@@ -821,7 +870,8 @@ function hip(build, opts) {
     transitionSurface(build, m, f.len, rows);
     // only the outer cheek is exposed; the corner side is closed by the mitre fill
     sidePanel(build, m, f.len, rows, 0, fc.outer);
-    copingAt(build, m, f.len, R, H);
+    copingAt(build, m, f.len, R, H, 'coping', 3.0);      // pentagon deck behind the lip
+    out.push({ m, rows, W: f.len, R, H });
 
     // sample the inner edge for the mitre
     const edge = [];
@@ -864,6 +914,7 @@ function hip(build, opts) {
     new THREE.Vector3(east[0] - 0.18, 0, backZ + 0.18),
     new THREE.Vector3(east[0] - 0.18, 0, east[1] - 0.4),
   ], H);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,7 +1060,48 @@ function buildBowl(build, opts) {
       new THREE.Matrix4().makeTranslation(centre.x + off, centre.y + 0.046, centre.z)));
   }
 
-  return { rim: rim.slice(0, samples).map((r) => r.p), centre };
+  // Surface sampler for the surfacing pass. `u` is metres travelled around the
+  // rim (wrapping), `s` metres down the swept profile from the coping, so a
+  // decal patch built on it follows the transition exactly instead of hovering
+  // over it or stretching where the bowl gets deeper.
+  const total = rim[samples].u;
+  const rowAt = (idx, s) => {
+    const rw = cache[idx];
+    const q = clamp(s, 0, rw[ROWS].s);
+    let j = 0;
+    while (j + 2 <= ROWS && rw[j + 1].s < q) j++;
+    const a = rw[j], b = rw[j + 1];
+    const t = b.s > a.s ? (q - a.s) / (b.s - a.s) : 0;
+    return { h: lerp(a.h, b.h, t), y: lerp(a.y, b.y, t), nh: lerp(a.nh, b.nh, t), ny: lerp(a.ny, b.ny, t) };
+  };
+  const sample = (u, s) => {
+    const uu = ((u % total) + total) % total;
+    let lo = 0, hi = samples;
+    while (lo + 1 < hi) { const mid = (lo + hi) >> 1; if (rim[mid].u <= uu) lo = mid; else hi = mid; }
+    const a = rim[lo], b = rim[Math.min(samples, lo + 1)];
+    const t = b.u > a.u ? (uu - a.u) / (b.u - a.u) : 0;
+    const qa = rowAt(lo, s), qb = rowAt(Math.min(samples, lo + 1), s);
+    const h = lerp(qa.h, qb.h, t), nh = lerp(qa.nh, qb.nh, t);
+    const ix = lerp(a.inw.x, b.inw.x, t), iz = lerp(a.inw.y, b.inw.y, t);
+    return {
+      p: new THREE.Vector3(
+        lerp(a.p.x, b.p.x, t) + ix * h, lerp(qa.y, qb.y, t), lerp(a.p.z, b.p.z, t) + iz * h),
+      n: new THREE.Vector3(ix * nh, lerp(qa.ny, qb.ny, t), iz * nh).normalize(),
+    };
+  };
+
+  return {
+    rim: rim.slice(0, samples).map((r) => r.p),
+    inward: rim.slice(0, samples).map((r) => r.inw),
+    us: rim.slice(0, samples).map((r) => r.u),
+    centre, sample, perimeter: total,
+    depthAt: (u) => {
+      const uu = ((u % total) + total) % total;
+      let lo = 0, hi = samples;
+      while (lo + 1 < hi) { const mid = (lo + hi) >> 1; if (rim[mid].u <= uu) lo = mid; else hi = mid; }
+      return rim[lo].D;
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,6 +1495,276 @@ function boundaryRing(build, B) {
 }
 
 // ---------------------------------------------------------------------------
+// surfacing: graffiti, paint and wear
+// ---------------------------------------------------------------------------
+// Everything painted on the park comes out of the material library's 16-cell
+// decal atlas. Two rules make it look placed rather than stamped:
+//
+//   * every decal is a SQUARE quad, so the artwork keeps its own aspect and can
+//     never be stretched. Size is quoted in metres of cell; CELL_ART records the
+//     fraction of the cell the ink actually covers, which is what lets a call
+//     ask for "a 3 m wide piece" and get a believable one.
+//   * every decal carries a tint and an alpha in a vertex-colour attribute, so a
+//     hundred marks from sixteen cells still read as a hundred different hands,
+//     and the whole park's paint costs four draw calls (one per wear layer).
+//
+// Curved surfaces (bowl walls, transitions) take a subdivided patch built on the
+// same parametrisation as the surface itself, offset a centimetre along the
+// normal — no floating quads, no decal sliding off a radius.
+
+const CELL_ART = {
+  tagMirra: [0.78, 0.52], throwBmx: [0.76, 0.40], arrow: [0.68, 0.44],
+  stencilStar: [0.68, 0.68], crack: [0.92, 0.92], oilStain: [0.90, 0.90],
+  skid: [0.86, 0.22], waterStain: [0.90, 0.90], laneLine: [0.30, 1.00],
+  dashYellow: [0.46, 0.92], noSkating: [0.76, 0.42], sponsor: [0.90, 0.36],
+  number540: [0.82, 0.46], stencilDiy: [0.72, 0.32], splatter: [1.00, 1.00],
+  sprayX: [0.86, 0.86],
+};
+
+// `sponsor` is the one cell with a solid printed panel behind it, so it is an
+// event banner, never a piece — it is placed by hand, twice, and never enters
+// the random rotation where it would read as a repeated advert hoarding.
+const PIECE_CELLS = ['tagMirra', 'throwBmx', 'number540', 'stencilDiy'];
+const TAG_CELLS = ['sprayX', 'stencilStar', 'stencilDiy', 'tagMirra', 'throwBmx'];
+const GRIME_CELLS = ['waterStain', 'oilStain', 'splatter'];
+
+// Multiplied over the cell art, so a white numeral becomes a cyan one and a blue
+// throw-up becomes a muddy green: sixteen cells x eleven hands is enough that
+// the same piece never reads twice in a frame.
+const PAINT_TINTS = [
+  0xf2efe6, 0xd8d4c6, 0x74b0ff, 0xff8f4e, 0x6fdc84, 0xffcc3d, 0xd07dff,
+  0x8b9db2, 0xff5f5f, 0x4fd2d2, 0xb9a15e,
+];
+
+const pick = (arr) => arr[Math.min(arr.length - 1, (rng() * arr.length) | 0)];
+
+/**
+ * Decal frame: quad centred on `p`, `w` x `h` metres, facing `n`, with `up`
+ * mapped to +V, lifted `off` metres clear of the surface.
+ */
+function decalMatrix(p, n, up, w, h, off = 0.012, roll = 0) {
+  const nz = n.clone().normalize();
+  let uy = (up || new THREE.Vector3(0, 1, 0)).clone();
+  uy.addScaledVector(nz, -uy.dot(nz));
+  if (uy.lengthSq() < 1e-8) {
+    uy.set(0, 0, 1).addScaledVector(nz, -nz.z);
+    if (uy.lengthSq() < 1e-8) uy.set(1, 0, 0).addScaledVector(nz, -nz.x);
+  }
+  uy.normalize();
+  const ux = new THREE.Vector3().crossVectors(uy, nz).normalize();
+  if (roll) {
+    const c = Math.cos(roll), s = Math.sin(roll);
+    const rx = ux.clone().multiplyScalar(c).addScaledVector(uy, s);
+    uy = uy.clone().multiplyScalar(c).addScaledVector(ux, -s);
+    ux.copy(rx);
+  }
+  return new THREE.Matrix4()
+    .makeBasis(ux.multiplyScalar(w), uy.multiplyScalar(h), nz)
+    .setPosition(p.x + nz.x * off, p.y + nz.y * off, p.z + nz.z * off);
+}
+
+/**
+ * Decal that follows a parametric surface. `sample(u, v)` returns `{ p, n }`
+ * for the patch footprint; `nu`/`nv` control how finely it hugs the curvature.
+ */
+function patchDecal(build, cell, sample, opts = {}) {
+  const { nu = 6, nv = 5, off = 0.014 } = opts;
+  const s = new Surf();
+  s.grid(nu, nv, (i, j) => {
+    const u = i / nu, v = j / nv;
+    const { p, n } = sample(u, v);
+    return V(p.x + n.x * off, p.y + n.y * off, p.z + n.z * off, n.x, n.y, n.z, u, v);
+  });
+  build.decalGeo(cell, s.geometry(), opts);
+}
+
+/** Point/normal on a transition sheet, by local x and arc length s from the base. */
+function transitionAt(m, rows) {
+  const sMin = rows[1].s, sMax = rows[rows.length - 1].s;
+  return (x, s) => {
+    const q = clamp(s, sMin, sMax);
+    let i = 1;
+    while (i + 2 < rows.length && rows[i + 1].s < q) i++;
+    const a = rows[i], b = rows[i + 1];
+    const t = b.s > a.s ? (q - a.s) / (b.s - a.s) : 0;
+    return {
+      p: new THREE.Vector3(x, lerp(a.y, b.y, t), lerp(a.z, b.z, t)).applyMatrix4(m),
+      n: new THREE.Vector3(0, lerp(a.ny, b.ny, t), lerp(a.nz, b.nz, t)).transformDirection(m),
+    };
+  };
+}
+
+/**
+ * Paint on a transition. `s` is measured up the arc from the base of the ramp,
+ * `size` is the cell size in metres and the artwork stays upright (its +V points
+ * up the transition), which is how a piece on a curved wall reads as painted on
+ * rather than projected through.
+ */
+function rampPaint(build, face, opts) {
+  const { cell, x, s, size, sx = 1, uvRot = 0 } = opts;
+  const at = transitionAt(face.m, face.rows);
+  const w = size * sx;
+  patchDecal(build, cell, (u, v) => at(x + (u - 0.5) * w, s + (0.5 - v) * size), {
+    nu: Math.max(2, Math.round(w / 0.7)), nv: Math.max(3, Math.round(size / 0.35)),
+    off: opts.off ?? 0.013,
+    layer: opts.layer || 'graf', tint: opts.tint ?? 0xffffff, alpha: opts.alpha ?? 1, uvRot,
+  });
+}
+
+/**
+ * Paints a rectangular face. `o` is the centre of its bottom edge ON the
+ * surface; `right` and `up` are unit vectors in the face with `right x up`
+ * pointing out of it, so one routine covers a wall, a deck fascia and a bank.
+ *
+ * The composition is always the same because that is how a wall actually fills
+ * up: big pieces low and spread along the run, a later piece half over an older
+ * one, tags crowding the ends where people can reach off the deck or the fence,
+ * and grime washing up from the base.
+ */
+function paintWall(build, opts) {
+  const {
+    o, right, up, len, hgt,
+    density = 1, pieces = null, tags = true, grime = true, streaks = 0,
+    off = 0.014, layer = 'graf', access = null,
+  } = opts;
+  if (len < 0.6 || hgt < 0.35) return;
+  const n = new THREE.Vector3().crossVectors(right, up).normalize();
+  const at = (t, y) => new THREE.Vector3(
+    o.x + right.x * t + up.x * y, o.y + right.y * t + up.y * y, o.z + right.z * t + up.z * y);
+  const put = (cell, t, y, size, o2 = {}) => {
+    build.decal(cell, decalMatrix(at(t, y), n, up,
+      size * (o2.sx || 1), size, o2.off ?? off, o2.roll || 0), {
+      layer: o2.layer || layer, tint: o2.tint ?? 0xffffff,
+      alpha: o2.alpha ?? 1, uvRot: o2.uvRot || 0,
+    });
+  };
+
+  const np = pieces ?? clamp(Math.round((len / 4.8) * density), 1, 14);
+  for (let k = 0; k < np; k++) {
+    const cell = pick(PIECE_CELLS);
+    const a = CELL_ART[cell];
+    const maxS = Math.min((len * 1.05) / a[0], (hgt * 0.92) / a[1]);
+    if (maxS < 0.45) break;
+    const size = Math.min(maxS, rand(2.6, 5.2));
+    const slot = len / np;
+    const t = -len * 0.5 + slot * (k + 0.5) + rand(-slot * 0.34, slot * 0.34);
+    const half = size * a[1] * 0.5;
+    const y = clamp(hgt * rand(0.20, 0.60), half + 0.04, hgt - half - 0.04);
+    put(cell, t, y, size, { roll: rand(-0.05, 0.05), tint: pick(PAINT_TINTS), alpha: rand(0.72, 1) });
+    // dirt dragged back over the top of it: paint on a skatepark is never clean,
+    // and breaking the letterforms is what stops a cell reading as a sticker
+    if (rng() < 0.75) {
+      put(pick(GRIME_CELLS), t + rand(-0.2, 0.2) * size, y + rand(-0.2, 0.2) * size,
+        size * rand(0.5, 0.95), {
+          sx: rand(0.8, 1.6), roll: rand(0, TAU), tint: 0x54503f,
+          alpha: rand(0.16, 0.34), layer: 'wear', off: off + 0.010,
+        });
+    }
+
+    // the layers that came later, half over the first — this is the difference
+    // between a wall that has been painted and a wall with a sticker on it
+    for (let l = 0; l < 2; l++) {
+      if (rng() > (l ? 0.42 : 0.85) * density) continue;
+      const c2 = pick(l ? TAG_CELLS : PIECE_CELLS);
+      const b = CELL_ART[c2];
+      const s2 = Math.min(size * rand(l ? 0.28 : 0.5, l ? 0.5 : 0.85), (hgt * 0.88) / b[1]);
+      const h2 = s2 * b[1] * 0.5;
+      put(c2, t + rand(-0.5, 0.5) * size * a[0],
+        clamp(y + rand(-0.45, 0.55) * size * a[1], h2 + 0.03, hgt - h2 - 0.03), s2,
+        {
+          roll: rand(-0.14, 0.14), tint: pick(PAINT_TINTS),
+          off: off + 0.005 + l * 0.004, alpha: rand(0.65, 1),
+        });
+    }
+  }
+
+  if (tags) {
+    const spots = access ? access.slice() : [-len * 0.5 + 1.0, len * 0.5 - 1.0];
+    for (let i = 1; i * 9 < len; i++) spots.push(-len * 0.5 + i * 9 + rand(-1.5, 1.5));
+    for (const c of spots) {
+      const nt = 3 + ((rng() * 3) | 0);
+      for (let i = 0; i < nt; i++) {
+        const cell = pick(TAG_CELLS);
+        const a = CELL_ART[cell];
+        const size = Math.min(rand(0.5, 1.4), (hgt * 0.6) / a[1], (len * 0.5) / a[0]);
+        const half = size * a[1] * 0.5;
+        put(cell, clamp(c + rand(-2.6, 2.6), -len * 0.5 + 0.15, len * 0.5 - 0.15),
+          clamp(rand(0.18, 0.88) * hgt, half + 0.02, hgt - half - 0.02), size,
+          { roll: rand(-0.45, 0.45), tint: pick(PAINT_TINTS), alpha: rand(0.5, 0.9), off: off + 0.008 });
+      }
+    }
+  }
+
+  if (grime) {
+    const ng = Math.max(1, Math.round(len / 7));
+    for (let i = 0; i < ng; i++) {
+      const h = Math.min(rand(0.7, 1.7), hgt * 0.9);
+      put(pick(GRIME_CELLS), rand(-len * 0.45, len * 0.45), rand(0.16, 0.46) * hgt, h,
+        { sx: rand(1.6, 3.4), tint: 0x585349, alpha: rand(0.20, 0.40), layer: 'paint', off: off - 0.006 });
+    }
+  }
+
+  for (let i = 0; i < streaks; i++) {                  // rain/rust wash off the top
+    const h = rand(hgt * 0.42, hgt * 0.95);
+    put('skid', rand(-len * 0.46, len * 0.46), hgt - h * 0.5, h,
+      { sx: rand(0.10, 0.26), uvRot: 1, tint: 0x403c34, alpha: rand(0.16, 0.36), layer: 'paint', off: off - 0.006 });
+  }
+}
+
+/**
+ * Wax and grind polish along one grind edge: the band the pegs ride on top, the
+ * top 12 cm of the face under it, and the chips knocked out of the arris.
+ * `a`/`b` are the two ends of the top edge (they may differ in height, so a
+ * hubba is dressed by the same call as a flat ledge) and `out` points away from
+ * the mass. The frame is built from the edge itself, so the strip never lifts
+ * off a slope or clips into it.
+ */
+function dressLedgeEdge(build, a, b, out, opts = {}) {
+  const len = a.distanceTo(b);
+  if (len < 0.4) return;
+  const along = new THREE.Vector3().subVectors(b, a).normalize();
+  const side = out.clone().setY(0).normalize();
+  const up = new THREE.Vector3().crossVectors(side, along);
+  if (up.y < 0) up.negate();
+  up.normalize();
+  const mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
+  const wax = opts.tint ?? 0x6f6a60;
+
+  // polished top band, inset from the arris
+  build.decal('skid', decalMatrix(mid.clone().addScaledVector(side, -0.06), up, along,
+    0.17, len * 0.94, 0.010), { layer: 'wax', tint: wax, alpha: 0.55, uvRot: 1 });
+  // the face right under it, where the peg actually rubs
+  build.decal('skid', decalMatrix(mid.clone().addScaledVector(up, -0.07), side, up,
+    len * 0.94, 0.13, 0.010), { layer: 'wax', tint: wax, alpha: 0.45 });
+  // chips and impact marks along the lip
+  const nc = Math.max(1, Math.round(len / 1.4));
+  for (let i = 0; i < nc; i++) {
+    const p = new THREE.Vector3().lerpVectors(a, b, rand(0.06, 0.94)).addScaledVector(side, -0.04);
+    build.decal('crack', decalMatrix(p, up, along, rand(0.22, 0.5), rand(0.22, 0.5), 0.011, rand(0, TAU)),
+      { layer: 'wear', tint: 0x2a2622, alpha: rand(0.25, 0.5) });
+  }
+}
+
+/** Irregular repair pour on the slab: a different concrete, a different pour. */
+function concretePatch(build, cx, cz, rx, rz, y = 0.008) {
+  const pts = [];
+  const n = 7 + ((rng() * 4) | 0);
+  const rot = rand(0, TAU);
+  const uo = rand(-40, 40), vo = rand(-40, 40);
+  const cr = Math.cos(rot), sr = Math.sin(rot);
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * TAU + rand(-0.12, 0.12);
+    const k = rand(0.78, 1.12);
+    const x = cx + Math.cos(a) * rx * k, z = cz + Math.sin(a) * rz * k;
+    // rotated/offset UVs so the repair never lines up with the slab beneath it
+    pts.push(V(x, y, z, 0, 1, 0, x * cr - z * sr + uo, x * sr + z * cr + vo));
+  }
+  const s = new Surf();
+  s.fan(pts);
+  build.add('patch_slab', s.geometry());
+}
+
+// ---------------------------------------------------------------------------
 // createPark
 // ---------------------------------------------------------------------------
 
@@ -1417,17 +1779,17 @@ export async function createPark(ctx) {
   const LIP_Z = -35.6;
   const BACK_Z = -42.6;
 
-  quarterPipe(build, {                                   // 3.6 m quarterpipe
+  const qpBig = quarterPipe(build, {                     // 3.6 m quarterpipe
     p1: [-21, LIP_Z], p2: [-13, LIP_Z], radius: 3.6, deck: 7, guard: true,
   });
-  quarterPipe(build, {                                   // 2.4 m + 1.2 m vert wall
+  const qpVert = quarterPipe(build, {                    // 2.4 m + 1.2 m vert wall
     p1: [-13, LIP_Z], p2: [-7.5, LIP_Z], radius: 2.4, vert: 1.2, deck: 7, guard: true,
     panels: { minus: true, plus: false },
   });
-  quarterPipe(build, {                                   // 2.4 m quarterpipe
+  const qpEast = quarterPipe(build, {                    // 2.4 m quarterpipe
     p1: [4, LIP_Z], p2: [12, LIP_Z], radius: 2.4, deck: 6, guard: true,
   });
-  hip(build, {
+  const hipFaces = hip(build, {
     west: [-6, LIP_Z], corner: [-1.75, -32.6], east: [2.5, LIP_Z], radius: 2.4, backZ: -41.6,
   });
 
@@ -1438,11 +1800,11 @@ export async function createPark(ctx) {
   });
 
   // === spine ===============================================================
-  spine(build, { x0: 6, x1: 18, z: -16, radius: 1.8 });
+  const spineFaces = spine(build, { x0: 6, x1: 18, z: -16, radius: 1.8 });
 
   // === mini ramp (two facing transitions, 12.4 m of flat between) ==========
-  quarterPipe(build, { p1: [-40, 22], p2: [-40, 10], radius: 1.8, deck: 3.0, guard: true });
-  quarterPipe(build, { p1: [-24, 10], p2: [-24, 22], radius: 1.8, deck: 3.0, guard: true });
+  const miniW = quarterPipe(build, { p1: [-40, 22], p2: [-40, 10], radius: 1.8, deck: 3.0, guard: true });
+  const miniE = quarterPipe(build, { p1: [-24, 10], p2: [-24, 22], radius: 1.8, deck: 3.0, guard: true });
 
   // === roll-in =============================================================
   const roll = rollIn(build, { p1: [3.5, 18], p2: [-3.5, 18], height: 3.0, deck: 6.2 });
@@ -1453,11 +1815,11 @@ export async function createPark(ctx) {
     pts: [[FB.x0, FB.zTopA], [FB.x1, FB.zTopA], [FB.x1, FB.zTopB], [FB.x0, FB.zTopB]],
     yTop: FB.h, skirt: [false, true, false, true],
   });
-  bankRamp(build, {
+  const fbBankS = bankRamp(build, {
     a0: [FB.x0, 0, FB.zHi], a1: [FB.x1, 0, FB.zHi],
     b0: [FB.x0, FB.h, FB.zTopB], b1: [FB.x1, FB.h, FB.zTopB],
   });
-  bankRamp(build, {
+  const fbBankN = bankRamp(build, {
     a0: [FB.x1, 0, FB.zLo], a1: [FB.x0, 0, FB.zLo],
     b0: [FB.x1, FB.h, FB.zTopA], b1: [FB.x0, FB.h, FB.zTopA],
   });
@@ -1467,9 +1829,10 @@ export async function createPark(ctx) {
       new THREE.Vector3(sx * FB.x1, FB.h, FB.zTopB),
     ], 0.055, 'ledge');
   }
-  flatLedge(build, {
+  const ledges = [];
+  ledges.push(flatLedge(build, {
     x0: -3.9, z0: FB.zTopA, x1: -3.9, z1: FB.zTopB, width: 0.45, height: 1.26, base: FB.h,
-  });
+  }));
   const fbHeight = (x, z) => {
     if (x < FB.x0 || x > FB.x1) return 0;
     if (z >= FB.zTopA && z <= FB.zTopB) return FB.h;
@@ -1491,7 +1854,7 @@ export async function createPark(ctx) {
   build.rail([new THREE.Vector3(PLZ.x0, PLZ.h, PLZ.z0), new THREE.Vector3(PLZ.x0, PLZ.h, PLZ.z1)], 0.055, 'ledge');
   build.rail([new THREE.Vector3(PLZ.x1, PLZ.h, PLZ.z0), new THREE.Vector3(PLZ.x1, PLZ.h, PLZ.z1)], 0.055, 'ledge');
   // bank on to the plaza from the west so the deck is not a dead end
-  bankRamp(build, {
+  const plzBank = bankRamp(build, {
     a0: [4.4, 0, -7.6], a1: [4.4, 0, -3.0],
     b0: [PLZ.x0, PLZ.h, -7.6], b1: [PLZ.x0, PLZ.h, -3.0],
   });
@@ -1526,7 +1889,7 @@ export async function createPark(ctx) {
     pts: [[WALL.x, WALL.z0], [WALL.x + WALL.thick, WALL.z0], [WALL.x + WALL.thick, WALL.z1], [WALL.x, WALL.z1]],
     yTop: WALL.h, topBucket: 'brick_wall', sideBucket: 'brick_wall',
   });
-  bankRamp(build, {
+  const wallBank = bankRamp(build, {
     a0: [19.6, 0, -32], a1: [19.6, 0, -22],
     b0: [WALL.x, 1.35, -32], b1: [WALL.x, 1.35, -22],
   });
@@ -1534,13 +1897,13 @@ export async function createPark(ctx) {
     0.06, 'ledge');
 
   // === street furniture: flat ledges and a flat rail =======================
-  flatLedge(build, { x0: -16, z0: -2, x1: -16, z1: 6, width: 0.6, height: 0.42 });
-  flatLedge(build, { x0: -11.5, z0: 12, x1: -5.5, z1: 12, width: 0.6, height: 0.36 });
+  ledges.push(flatLedge(build, { x0: -16, z0: -2, x1: -16, z1: 6, width: 0.6, height: 0.42 }));
+  ledges.push(flatLedge(build, { x0: -11.5, z0: 12, x1: -5.5, z1: 12, width: 0.6, height: 0.36 }));
   roundRail(build, [
     new THREE.Vector3(-9, 0.44, 2), new THREE.Vector3(-9, 0.44, 10),
   ], { postEvery: 2.6 });
   // manual pad by the roll-in run-out
-  flatLedge(build, { x0: 8.5, z0: 14, x1: 14.5, z1: 14, width: 2.6, height: 0.22, rails: false });
+  const manualPad = flatLedge(build, { x0: 8.5, z0: 14, x1: 14.5, z1: 14, width: 2.6, height: 0.22, rails: false });
   build.rail([new THREE.Vector3(8.5, 0.22, 15.3), new THREE.Vector3(14.5, 0.22, 15.3)], 0.05, 'ledge');
 
   // === dirt jump line ======================================================
@@ -1566,27 +1929,95 @@ export async function createPark(ctx) {
   // soil half of the bank simply grows out of.
   boundaryRing(build, BOUNDARY);
 
-  // === painted lines, stains and graffiti =================================
-  const flatDecal = (name, x, z, w, h, rot = 0, y = 0.012) => {
-    build.decal(name, new THREE.Matrix4().makeRotationY(rot)
-      .multiply(new THREE.Matrix4().makeRotationX(-HALF_PI))
-      .multiply(new THREE.Matrix4().makeScale(w, h, 1))
-      .premultiply(new THREE.Matrix4().makeTranslation(x, y, z)));
-  };
-  const wallDecal = (name, x, y, z, w, h, yaw) => {
-    build.decal(name, new THREE.Matrix4().makeRotationY(yaw)
-      .multiply(new THREE.Matrix4().makeScale(w, h, 1))
-      .premultiply(new THREE.Matrix4().makeTranslation(x, y, z)));
+  // === surfacing: paint, graffiti, wear ====================================
+  // Nothing in this park is allowed to be a clean surface. Road paint goes down
+  // first, then the walls get painted, then wear goes over the top of both.
+  const UPV = new THREE.Vector3(0, 1, 0);
+
+  /** Decal lying on a horizontal surface; `w` x `h` metres, `rot` about +Y. */
+  const flatDecal = (cell, x, z, w, h, rot = 0, opts = {}) => build.decal(cell,
+    decalMatrix(new THREE.Vector3(x, opts.y ?? 0, z), UPV,
+      new THREE.Vector3(Math.sin(rot), 0, Math.cos(rot)), w, h, opts.off ?? 0.011),
+    {
+      layer: opts.layer || 'paint', tint: opts.tint ?? 0xffffff,
+      alpha: opts.alpha ?? 1, uvRot: opts.uvRot || 0,
+    });
+
+  /** One mark on an axis-aligned vertical face; `yaw` points along the normal. */
+  const mark = (cell, x, y, z, yaw, w, h, opts = {}) => build.decal(cell,
+    decalMatrix(new THREE.Vector3(x, y, z), new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw)),
+      UPV, w, h, opts.off ?? 0.016, opts.roll || 0),
+    {
+      layer: opts.layer || 'graf', tint: opts.tint ?? 0xffffff,
+      alpha: opts.alpha ?? 1, uvRot: opts.uvRot || 0,
+    });
+
+  /** Paint a rectangular vertical face; `o` is its bottom-edge centre. */
+  const face = (x, y, z, yaw, len, hgt, opts = {}) => paintWall(build, {
+    o: new THREE.Vector3(x, y, z),
+    right: new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw)),
+    up: UPV.clone(), len, hgt, ...opts,
+  });
+
+  /** One big graphic centred on a bank face, sized to fit the ramp it sits on. */
+  const bankMark = (b, cell, opts = {}) => {
+    const a = CELL_ART[cell];
+    const size = Math.min((b.len * 0.88) / a[0], (b.run * (opts.fit ?? 0.80)) / a[1]);
+    const p = b.o.clone()
+      .addScaledVector(b.up, (opts.t ?? 0.5) * b.run)
+      .addScaledVector(b.right, opts.s ?? 0);
+    build.decal(cell, decalMatrix(p, b.n, b.up, size * (opts.sx || 1), size, 0.012, opts.roll || 0),
+      { layer: opts.layer || 'graf', tint: opts.tint ?? 0xffffff, alpha: opts.alpha ?? 1 });
+    return size;
   };
 
-  // parking bays and edge paint out on the asphalt
+  /** Paint on a bowl wall; `u` is metres around the rim, `s` metres down. */
+  const bowlPaint = (cell, u, s, size, opts = {}) => {
+    const w = size * (opts.sx || 1);
+    patchDecal(build, cell, (uu, vv) => bowl.sample(u + (uu - 0.5) * w, s + (0.5 - vv) * size), {
+      nu: clamp(Math.round(w / 0.5), 3, 14), nv: clamp(Math.round(size / 0.35), 3, 12),
+      off: opts.off ?? 0.014, layer: opts.layer || 'graf',
+      tint: opts.tint ?? 0xffffff, alpha: opts.alpha ?? 1, uvRot: opts.uvRot || 0,
+    });
+  };
+  /** Rim arc-length nearest a world point — for painting a named part of the bowl. */
+  const bowlU = (x, z) => {
+    let best = 0, bd = Infinity;
+    for (let i = 0; i < bowl.rim.length; i++) {
+      const d = (bowl.rim[i].x - x) ** 2 + (bowl.rim[i].z - z) ** 2;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return bowl.us[best];
+  };
+
+  /** Tyre and peg wear on a transition: rub line under the lip, streaks below it. */
+  const rampWear = (fc, n = 5) => {
+    const sMax = fc.rows[fc.rows.length - 1].s;
+    rampPaint(build, fc, {
+      cell: 'skid', x: 0, s: sMax - 0.20, size: 0.30, sx: (fc.W * 0.92) / 0.30,
+      layer: 'wear', tint: 0x2b2824, alpha: 0.42,
+    });
+    for (let i = 0; i < n; i++) {
+      const h = rand(0.45, 1.25);
+      rampPaint(build, fc, {
+        cell: 'skid', x: rand(-fc.W * 0.44, fc.W * 0.44),
+        s: clamp(sMax - rand(0.2, 1.0) - h * 0.5, h * 0.5, sMax - h * 0.5),
+        size: h, sx: rand(0.12, 0.36), uvRot: 1,
+        layer: 'wear', tint: 0x272420, alpha: rand(0.22, 0.5),
+      });
+    }
+  };
+
+  // --- road paint out on the asphalt ---------------------------------------
   for (let i = 0; i < 11; i++) flatDecal('laneLine', -52 + i * 2.7, 41, 0.20, 5.2, 0);
   for (let i = 0; i < 8; i++) flatDecal('laneLine', 6 + i * 2.7, 41, 0.20, 5.2, 0);
   for (let i = 0; i < 12; i++) flatDecal('dashYellow', -50 + i * 9, 49.5, 4.2, 0.24, 0);
   for (let i = 0; i < 7; i++) flatDecal('laneLine', -58, -32 + i * 9, 0.20, 8.0, 0);
   for (let i = 0; i < 7; i++) flatDecal('laneLine', 61, -32 + i * 9, 0.20, 8.0, 0);
 
-  // line-of-travel paint on the pad itself
+  // --- painted graphics on the flat ----------------------------------------
+  // Event marks laid on the slab where a run passes over them, so they are worn
+  // through by the wheel line rather than sitting on the concrete like stickers.
   flatDecal('arrow', 0, 13.5, 2.6, 4.2, 0);
   flatDecal('arrow', 0, -14.5, 2.6, 4.2, 0);
   flatDecal('arrow', 33, 26, 2.6, 4.2, -0.5);
@@ -1594,8 +2025,19 @@ export async function createPark(ctx) {
   flatDecal('number540', 21, 20, 4.4, 4.4, 0.2);
   flatDecal('stencilDiy', -13, -25, 3.6, 3.6, -0.35);
   flatDecal('splatter', -30, -27.5, 5, 5, 0.4);
+  // ground paint is old paint: half worn through, and never in a saturated colour
+  flatDecal('stencilDiy', -1.0, 7.5, 5.0, 5.0, 0.06, { alpha: 0.34 });
+  flatDecal('number540', -1.5, -22.5, 4.6, 4.6, 0.1, { alpha: 0.30 });
+  flatDecal('stencilStar', 14.5, 8.0, 2.4, 2.4, 0.3, { alpha: 0.32 });
+  flatDecal('tagMirra', -29, 6.5, 5.0, 5.0, -0.22, { alpha: 0.16 });
+  // the wheel line scrubbing the flat paint back off again
+  for (let i = 0; i < 26; i++) {
+    const t = i / 25;
+    flatDecal('skid', rand(-2.6, 2.6), lerp(1.5, 12.0, t), rand(1.4, 3.2), rand(0.5, 1.1),
+      rand(-0.25, 0.25), { layer: 'wear', tint: 0x37332d, alpha: rand(0.12, 0.30) });
+  }
 
-  // scattered wear: kept clear of the bowl void and the trails soil
+  // --- scattered wear on the slab ------------------------------------------
   const openSpot = () => {
     for (let i = 0; i < 24; i++) {
       const x = rand(PAD.minX + 3, PAD.maxX - 3);
@@ -1605,56 +2047,307 @@ export async function createPark(ctx) {
     }
     return [0, 20];
   };
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 14; i++) {
     const [x, z] = openSpot();
-    flatDecal('skid', x, z, rand(1.6, 3.4), rand(0.7, 1.4), rand(-0.4, 0.4));
+    flatDecal('skid', x, z, rand(1.6, 3.4), rand(0.7, 1.4), rand(-0.4, 0.4),
+      { layer: 'wear', tint: 0x2f2c27, alpha: rand(0.18, 0.42) });
   }
   for (let i = 0; i < 6; i++) {
-    flatDecal('oilStain', rand(-60, -50), rand(-30, 28), rand(2, 3.6), rand(2, 3.6), rand(0, 3));
+    flatDecal('oilStain', rand(-60, -50), rand(-30, 28), rand(2, 3.6), rand(2, 3.6), rand(0, 3),
+      { alpha: rand(0.5, 0.8) });
   }
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 10; i++) {
     const [x, z] = openSpot();
-    flatDecal('waterStain', x, z, rand(2.4, 4.6), rand(2.4, 4.6), rand(0, 3));
+    flatDecal('waterStain', x, z, rand(2.4, 4.6), rand(2.4, 4.6), rand(0, 3), { alpha: rand(0.35, 0.7) });
   }
-  for (let i = 0; i < 8; i++) {
+  // Broad, soft tonal staining. A concrete slab this size is never one tone —
+  // without this the flat reads as a clean sheet no matter how good the texture
+  // is, and it is the low-frequency variation the reference frame lives on.
+  for (let i = 0; i < 38; i++) {
     const [x, z] = openSpot();
-    flatDecal('crack', x, z, rand(2.4, 5), rand(2.4, 5), rand(0, 3));
+    const s = rand(4.5, 10.0);
+    flatDecal(pick(GRIME_CELLS), x, z, s, s * rand(0.6, 1.0), rand(0, 3),
+      { tint: 0x76705f, alpha: rand(0.10, 0.26), off: 0.009 });
+  }
+  // and the darker band the whole session rides down, over the top of it
+  for (let i = 0; i < 16; i++) {
+    const t = i / 15;
+    flatDecal('waterStain', lerp(0.5, -1.5, t) + rand(-3.2, 3.2), lerp(16, -26, t) + rand(-3, 3),
+      rand(5, 9), rand(4, 8), rand(0, 3), { tint: 0x6b6558, alpha: rand(0.10, 0.22), off: 0.009 });
+  }
+  // cracks run in lines, the way a slab actually fails, with moss in the open ones
+  const crackLines = [
+    [[-46, 6], [-30, 9], [-14, 7.5], [-2, 11]],
+    [[-44, -30], [-30, -31], [-16, -29]],
+    [[6, 4], [12, 10], [16, 18], [20, 26]],
+    [[-8, 20], [2, 22], [14, 25], [24, 24]],
+    [[-46, 18], [-38, 24], [-28, 27]],
+  ];
+  for (const line of crackLines) {
+    for (let i = 0; i + 1 < line.length; i++) {
+      const [ax, az] = line[i], [bx, bz] = line[i + 1];
+      const n = Math.max(2, Math.round(Math.hypot(bx - ax, bz - az) / 3.2));
+      for (let k = 0; k <= n; k++) {
+        const t = k / n;
+        const x = lerp(ax, bx, t) + rand(-0.5, 0.5), z = lerp(az, bz, t) + rand(-0.5, 0.5);
+        flatDecal('crack', x, z, rand(2.2, 3.6), rand(2.2, 3.6), rand(0, 3),
+          { layer: 'wear', alpha: rand(0.24, 0.46) });
+        if (rng() < 0.4) {
+          flatDecal('splatter', x + rand(-0.6, 0.6), z + rand(-0.6, 0.6), rand(0.7, 1.5), rand(0.7, 1.5),
+            rand(0, 3), { tint: 0x5c7a3a, alpha: rand(0.18, 0.36) });    // weed / moss growth
+        }
+      }
+    }
   }
 
-  // graffiti / sponsor art on the vertical faces the camera actually sees
-  wallDecal('sponsor', WALL.x - 0.02, 2.7, -30, 6.2, 2.4, -HALF_PI);
-  wallDecal('tagMirra', WALL.x - 0.02, 2.4, -21.5, 5.6, 2.1, -HALF_PI);
-  wallDecal('sprayX', WALL.x - 0.02, 3.6, -25.6, 2.0, 2.0, -HALF_PI);
-  wallDecal('throwBmx', PLZ.x0 - 0.02, 0.85, -4.0, 5.0, 1.35, -HALF_PI);
-  wallDecal('sprayX', PLZ.x1 + 0.02, 0.9, -6.0, 1.3, 1.3, HALF_PI);
-  wallDecal('stencilDiy', 4.48, 0.5, -6.0, 1.5, 0.75, HALF_PI);
-  wallDecal('sprayX', -40.02, 1.0, 22.02, 1.7, 1.7, 0);              // mini ramp cheek
-  wallDecal('throwBmx', -30, 1.0, 22.02, 4.4, 1.8, 0);
-  wallDecal('sponsor', 0, 1.7, 18 + roll.zTop + 6.2 + 0.02, 6.0, 2.2, 0);
-  wallDecal('tagMirra', -17, 1.9, BACK_Z - 0.02, 6.4, 2.4, Math.PI);  // ramp backs
-  wallDecal('throwBmx', 8, 1.5, -41.62, 5.0, 2.0, Math.PI);
+  // --- concrete patch repairs ----------------------------------------------
+  // The lip of a bowl is the first thing to blow out and the first thing to get
+  // re-poured; the repairs are a different, greyer batch that never matches.
+  const patchAt = (x, z, rx, rz) => {
+    concretePatch(build, x, z, rx, rz);
+    // the saw-cut joint round the repair, which is what actually reads as a patch
+    const nj = 4 + ((rng() * 3) | 0);
+    for (let j = 0; j < nj; j++) {
+      const a = (j / nj) * TAU + rand(-0.2, 0.2);
+      flatDecal('crack', x + Math.cos(a) * rx * 0.95, z + Math.sin(a) * rz * 0.95,
+        rand(1.1, 2.0), rand(1.1, 2.0), rand(0, 3), { layer: 'wear', alpha: rand(0.2, 0.4) });
+    }
+  };
+  for (let i = 0; i < 14; i++) {
+    const k = Math.round(((i + 0.5) / 14) * bowl.rim.length) % bowl.rim.length;
+    const r = bowl.rim[k], inw = bowl.inward[k];
+    const d = rand(0.55, 2.6);
+    patchAt(r.x - inw.x * d, r.z - inw.y * d, rand(0.6, 1.7), rand(0.5, 1.5));
+  }
+  for (let i = 0; i < 9; i++) {
+    const [x, z] = openSpot();
+    patchAt(x, z, rand(0.7, 2.2), rand(0.6, 1.9));
+  }
+  patchAt(0, -12.6, 3.0, 1.3);                                 // funbox run-out
+  patchAt(0, 20.0, 2.6, 1.6);                                  // roll-in landing
 
-  // the boundary wall is the lot's permanent canvas — every run of it is painted,
-  // which is also what stops it reading as a bare containment slab
+  // --- the wallride wall: the lot's production wall -------------------------
+  // The one wall in the park that carries an event banner, painted over by the
+  // locals everywhere it does not cover — which is what the banner is for.
+  face(WALL.x, 1.42, -27.0, -HALF_PI, 13.2, 2.68, { density: 1.6, streaks: 2 });
+  face(WALL.x, 0, -33.0, -HALF_PI, 1.7, 1.28, { pieces: 1, tags: false });
+  face(WALL.x, 0, -20.0, -HALF_PI, 3.4, 1.28, { pieces: 1 });
+  face(WALL.x + WALL.thick, 0, -26.0, HALF_PI, 15.2, 4.1, { density: 0.8, streaks: 3 });
+  mark('sponsor', WALL.x, 2.95, -27.6, -HALF_PI, 8.4, 8.4, { alpha: 0.88, off: 0.010 });
+  mark('sprayX', WALL.x, 2.10, -24.0, -HALF_PI, 2.2, 2.2, { tint: 0xffcc3d, alpha: 0.85, roll: 0.2 });
+  mark('tagMirra', WALL.x, 3.60, -31.4, -HALF_PI, 3.6, 3.6, { tint: 0x4fd2d2, alpha: 0.8, roll: -0.06 });
+  mark('throwBmx', WALL.x, 3.55, -21.0, -HALF_PI, 3.4, 3.4, { tint: 0xff8f4e, alpha: 0.82 });
+
+  // --- plaza deck fascias ---------------------------------------------------
+  face(PLZ.x0, 0, -0.6, -HALF_PI, 4.4, 1.54, { density: 1.5 });
+  face(PLZ.x1, 0, -3.0, HALF_PI, 9.2, 1.54, { density: 1.1 });
+  face(15.0, 0, PLZ.z0, Math.PI, 13.2, 1.54, { density: 1.2, streaks: 2 });
+  face(10.0, 0, PLZ.z1, 0, 3.5, 1.54, { pieces: 1, density: 1.2 });
+  face(19.7, 0, PLZ.z1, 0, 4.4, 1.54, { pieces: 1, density: 1.2 });
+  // stair cheek + hubba flank: tags only, they are too broken up for a piece
+  mark('sprayX', 12 - 0.01, 0.72, 2.9, -HALF_PI, 0.9, 0.9, { roll: 0.2, tint: 0xc6d9ff });
+  mark('stencilDiy', 12 - 0.01, 0.42, 4.1, -HALF_PI, 1.1, 1.1, { roll: -0.15 });
+  mark('throwBmx', 17.4, 1.30, 2.6, HALF_PI, 1.9, 1.9, { tint: 0xffd0ac, alpha: 0.9 });
+  mark('sprayX', 17.4, 0.70, 4.6, HALF_PI, 0.85, 0.85, { roll: -0.3 });
+
+  // --- funbox skirts --------------------------------------------------------
+  face(FB.x1, 0, -6, HALF_PI, 5.6, 0.86, { density: 1.3 });
+  face(FB.x0, 0, -6, -HALF_PI, 5.6, 0.86, { density: 1.3 });
+
+  // --- north wall of transitions: cheeks and backs --------------------------
+  face(-21, 0, -39.1, -HALF_PI, 6.4, 3.45, { density: 1.4, streaks: 1 });
+  face(-7.5, 0, -39.1, HALF_PI, 6.4, 3.45, { density: 1.4 });
+  face(4, 0, -38.6, -HALF_PI, 5.6, 2.3, { density: 1.3 });
+  face(12, 0, -38.6, HALF_PI, 5.6, 2.3, { density: 1.3 });
+  face(-14.25, 0, BACK_Z, Math.PI, 13.0, 3.4, { density: 0.8, streaks: 2 });
+  face(8, 0, -41.6, Math.PI, 7.4, 2.3, { density: 0.7 });
+  face(-1.75, 0, -41.6, Math.PI, 8.0, 2.3, { density: 0.7 });
+
+  // --- mini ramp ------------------------------------------------------------
+  face(-41.5, 0, 22, 0, 2.6, 1.72, { pieces: 1, density: 1.2 });
+  face(-41.5, 0, 10, Math.PI, 2.6, 1.72, { pieces: 1, density: 1.2 });
+  face(-43, 0, 16, -HALF_PI, 11.4, 1.74, { density: 1.0 });
+  face(-22.5, 0, 10, Math.PI, 2.6, 1.72, { pieces: 1, density: 1.2 });
+  face(-22.5, 0, 22, 0, 2.6, 1.72, { pieces: 1, density: 1.2 });
+  face(-21, 0, 16, HALF_PI, 11.4, 1.74, { density: 1.4, streaks: 1 });
+
+  // --- roll-in --------------------------------------------------------------
+  const rollBackZ = 18 + roll.zTop + roll.deck;
+  face(0, 0, rollBackZ, 0, 6.6, 2.9, { density: 1.6, streaks: 2 });
+  mark('sponsor', 0, 2.28, rollBackZ, 0, 6.4, 6.4, { alpha: 0.8, off: 0.010 });
+  face(3.5, 0, rollBackZ - roll.deck * 0.5, HALF_PI, 5.6, 2.9, { density: 1.2 });
+  face(-3.5, 0, rollBackZ - roll.deck * 0.5, -HALF_PI, 5.6, 2.9, { density: 1.2 });
+
+  // --- banks: big painted marks, then the wheel line through them -----------
+  bankMark(fbBankN, 'sponsor', { alpha: 0.88 });
+  bankMark(fbBankS, 'number540', { alpha: 0.8, fit: 0.66 });
+  bankMark(plzBank, 'throwBmx', { alpha: 0.85, fit: 0.62 });
+  bankMark(wallBank, 'tagMirra', { alpha: 0.85, fit: 0.6 });
+  for (const b of [fbBankN, fbBankS, plzBank, wallBank]) {
+    for (let i = 0; i < 5; i++) {
+      const p = b.o.clone()
+        .addScaledVector(b.up, rand(0.12, 0.92) * b.run)
+        .addScaledVector(b.right, rand(-0.42, 0.42) * b.len);
+      const h = rand(0.4, 1.1);
+      build.decal('skid', decalMatrix(p, b.n, b.up, h * rand(0.14, 0.4), h, 0.013),
+        { layer: 'wear', tint: 0x2a2723, alpha: rand(0.22, 0.5), uvRot: 1 });
+    }
+  }
+
+  // --- transitions: pieces that follow the radius, then tyre wear -----------
+  rampPaint(build, qpBig, { cell: 'tagMirra', x: -0.8, s: 2.7, size: 5.0, alpha: 0.92, tint: 0xff8f4e });
+  rampPaint(build, qpBig, { cell: 'throwBmx', x: 1.6, s: 2.1, size: 3.6, alpha: 0.85, tint: 0x6fdc84 });
+  rampPaint(build, qpBig, { cell: 'sprayX', x: 3.0, s: 1.5, size: 1.5, alpha: 0.9, tint: 0xffcc3d });
+  rampPaint(build, qpBig, { cell: 'splatter', x: 0.4, s: 2.4, size: 3.2, sx: 1.4, layer: 'wear', tint: 0x4f4b3d, alpha: 0.26 });
+  rampPaint(build, qpVert, { cell: 'throwBmx', x: 0.2, s: 2.4, size: 4.0, alpha: 0.9, tint: 0xd07dff });
+  rampPaint(build, qpVert, { cell: 'stencilDiy', x: -1.2, s: 1.4, size: 2.4, alpha: 0.8, tint: 0x74b0ff });
+  rampPaint(build, qpEast, { cell: 'tagMirra', x: -0.4, s: 1.9, size: 3.4, alpha: 0.9, tint: 0x74b0ff });
+  rampPaint(build, qpEast, { cell: 'stencilDiy', x: 2.6, s: 1.0, size: 1.7, alpha: 0.9, tint: 0xffcc3d });
+  rampPaint(build, qpEast, { cell: 'number540', x: -2.6, s: 1.1, size: 2.2, alpha: 0.75, tint: 0xff5f5f });
+  rampPaint(build, miniW, { cell: 'stencilDiy', x: -1.0, s: 1.4, size: 2.6, alpha: 0.9, tint: 0xffcc3d });
+  rampPaint(build, miniW, { cell: 'sprayX', x: 2.4, s: 1.1, size: 1.3, alpha: 0.85, tint: 0x6fdc84 });
+  rampPaint(build, miniE, { cell: 'throwBmx', x: 0.8, s: 1.4, size: 2.6, alpha: 0.9, tint: 0xd07dff });
+  rampPaint(build, miniE, { cell: 'tagMirra', x: -2.6, s: 1.3, size: 2.4, alpha: 0.8, tint: 0x4fd2d2 });
+  rampPaint(build, roll, { cell: 'number540', x: 0.4, s: 2.2, size: 3.2, alpha: 0.8 });
+  rampPaint(build, roll, { cell: 'throwBmx', x: -1.8, s: 1.5, size: 2.6, alpha: 0.82, tint: 0xff8f4e });
+  for (const fc of [qpBig, qpVert, qpEast, miniW, miniE, roll, ...spineFaces, ...hipFaces]) rampWear(fc, 5);
+  rampPaint(build, hipFaces[0], { cell: 'sprayX', x: 0.4, s: 1.5, size: 1.6, alpha: 0.9, tint: 0xff5f5f });
+  rampPaint(build, hipFaces[1], { cell: 'stencilDiy', x: -0.6, s: 1.2, size: 2.0, alpha: 0.8, tint: 0x6fdc84 });
+  rampPaint(build, spineFaces[1], { cell: 'stencilDiy', x: -2.0, s: 1.3, size: 2.2, alpha: 0.85 });
+  rampPaint(build, spineFaces[0], { cell: 'sprayX', x: 3.0, s: 1.2, size: 1.4, alpha: 0.85, tint: 0x4fd2d2 });
+
+  // --- coping and rail wear -------------------------------------------------
+  for (const c of build.copings) {
+    const fwd = new THREE.Vector3(0, 0, 1).transformDirection(c.m);
+    if (c.deck > 0.5) {                                  // polished band on the deck
+      build.decal('skid', decalMatrix(
+        new THREE.Vector3(0, c.H, c.R + 0.30).applyMatrix4(c.m), UPV, fwd,
+        c.W * 0.92, 0.36, 0.010), { layer: 'wax', tint: 0x6b6660, alpha: 0.5 });
+    }
+    for (let i = 0; i < 3; i++) {                        // approach marks on the flat
+      const p = new THREE.Vector3(rand(-c.W * 0.42, c.W * 0.42), 0, -rand(0.5, 3.0)).applyMatrix4(c.m);
+      build.decal('skid', decalMatrix(p, UPV, fwd, rand(0.5, 1.1), rand(1.4, 2.8), 0.010),
+        { layer: 'wear', tint: 0x312e29, alpha: rand(0.2, 0.45) });
+    }
+  }
+
+  // --- ledges: wax on every grind edge, dirt under every one ---------------
+  const ledgeEdges = (L) => {
+    for (const s of [-1, 1]) {
+      dressLedgeEdge(build,
+        new THREE.Vector3(L.x0 + s * L.px, L.height, L.z0 + s * L.pz),
+        new THREE.Vector3(L.x1 + s * L.px, L.height, L.z1 + s * L.pz),
+        new THREE.Vector3(s * L.px, 0, s * L.pz));
+    }
+  };
+  for (const L of ledges) ledgeEdges(L);
+  ledgeEdges(manualPad);
+  flatDecal('stencilStar', 11.5, 14, 2.0, 2.0, 0, { y: manualPad.height, alpha: 0.55 });
+  // plaza deck edges and the wallride cap are grind edges too
+  dressLedgeEdge(build, new THREE.Vector3(PLZ.x0, PLZ.h, PLZ.z0 + 0.3),
+    new THREE.Vector3(PLZ.x0, PLZ.h, PLZ.z1 - 0.3), new THREE.Vector3(-1, 0, 0));
+  dressLedgeEdge(build, new THREE.Vector3(PLZ.x1, PLZ.h, PLZ.z0 + 0.3),
+    new THREE.Vector3(PLZ.x1, PLZ.h, PLZ.z1 - 0.3), new THREE.Vector3(1, 0, 0));
+  dressLedgeEdge(build, new THREE.Vector3(WALL.x, WALL.h, WALL.z0 + 0.4),
+    new THREE.Vector3(WALL.x, WALL.h, WALL.z1 - 0.4), new THREE.Vector3(-1, 0, 0));
+  dressLedgeEdge(build,                                   // hubba, sloped
+    new THREE.Vector3(17.4, PLZ.h + 0.30, PLZ.z1 - 0.55),
+    new THREE.Vector3(17.4, stairs.yEnd + 0.30, stairs.zEnd + 0.40), new THREE.Vector3(1, 0, 0));
+  // handrail: the ground under a rail is always scrubbed black at both ends
+  for (const [x, z0, z1] of [[11.6, 1.2, 6.4], [-9, 1.6, 10.6], [2.2, -11.2, -0.8]]) {
+    for (let i = 0; i < 4; i++) {
+      const z = lerp(z0, z1, i / 3);
+      flatDecal('skid', x + rand(-0.3, 0.3), z, rand(1.0, 2.0), rand(0.5, 1.0), HALF_PI,
+        { layer: 'wear', tint: 0x2e2b26, alpha: rand(0.2, 0.45) });
+    }
+  }
+
+  // --- the bowl -------------------------------------------------------------
   {
-    const B = BOUNDARY, e = 0.03;
-    const north = (n, x, y, w, h) => wallDecal(n, x, y, B.minZ + e, w, h, 0);
-    const south = (n, x, y, w, h) => wallDecal(n, x, y, B.maxZ - e, w, h, Math.PI);
-    const east = (n, z, y, w, h) => wallDecal(n, B.maxX - e, y, z, w, h, -HALF_PI);
-    const west = (n, z, y, w, h) => wallDecal(n, B.minX + e, y, z, w, h, HALF_PI);
-    north('sponsor', -26, 3.5, 9.0, 3.2);
-    north('tagMirra', -4, 3.3, 7.2, 2.7);
-    north('sprayX', 12, 4.0, 2.4, 2.4);
-    north('throwBmx', 30, 3.4, 8.0, 3.0);
-    east('stencilDiy', -30, 3.2, 3.0, 3.0);
-    east('tagMirra', 4, 3.5, 7.6, 2.9);
-    east('sponsor', 28, 3.4, 8.6, 3.1);
-    south('throwBmx', 22, 3.4, 8.4, 3.2);
-    south('sprayX', -6, 4.0, 2.6, 2.6);
-    south('number540', -34, 3.5, 3.6, 3.6);
-    west('sponsor', -20, 3.5, 9.0, 3.2);
-    west('throwBmx', 8, 3.3, 7.4, 2.8);
-    west('stencilDiy', 30, 3.4, 3.2, 3.2);
+    const P = bowl.perimeter;
+    for (let i = 0; i < 11; i++) {
+      // Pieces sit at every height on a bowl wall, not in a neat band at coping
+      // height, and they are painted over each other until none of them is quite
+      // legible — which is what stops them reading as stuck-on lettering.
+      const cell = pick(PIECE_CELLS);
+      const a = CELL_ART[cell];
+      const size = Math.min(rand(2.6, 4.6), 2.05 / a[1]);
+      const u = P * ((i + 0.5) / 11) + rand(-1.6, 1.6);
+      const s = rand(0.7, 1.85);
+      bowlPaint(cell, u, s, size, { tint: pick(PAINT_TINTS), alpha: rand(0.42, 0.78) });
+      for (let k = 0; k < 2; k++) {
+        if (rng() > 0.62) continue;
+        const c2 = pick(k ? TAG_CELLS : PIECE_CELLS);
+        bowlPaint(c2, u + rand(-1.8, 1.8), clamp(s + rand(-0.7, 0.7), 0.4, 2.1),
+          size * rand(0.35, 0.8),
+          { tint: pick(PAINT_TINTS), alpha: rand(0.4, 0.75), off: 0.018 + k * 0.004 });
+      }
+      bowlPaint(pick(GRIME_CELLS), u + rand(-0.8, 0.8), clamp(s + rand(-0.4, 0.4), 0.4, 2.1),
+        size * rand(0.5, 0.9),
+        { sx: rand(0.9, 1.7), layer: 'wear', tint: 0x4f4b3d, alpha: rand(0.18, 0.36), off: 0.026 });
+    }
+    // tags crowd the shallow-end drop-in, which is where everyone stands
+    const uShallow = bowlU(-22.5, -8.0);
+    for (let i = 0; i < 8; i++) {
+      const cell = pick(TAG_CELLS);
+      const a = CELL_ART[cell];
+      const size = Math.min(rand(0.5, 1.2), 1.0 / a[1]);
+      bowlPaint(cell, uShallow + rand(-6, 6), rand(0.45, 1.4), size,
+        { tint: pick(PAINT_TINTS), alpha: rand(0.45, 0.8), off: 0.02 });
+    }
+    for (let i = 0; i < 7; i++) {
+      const cell = pick(TAG_CELLS);
+      bowlPaint(cell, P * rng(), rand(0.4, 1.6), rand(0.5, 1.1),
+        { tint: pick(PAINT_TINTS), alpha: rand(0.4, 0.75), off: 0.02 });
+    }
+    for (let i = 0; i < 22; i++) {                       // tyre wear up the walls
+      const h = rand(0.5, 1.5);
+      bowlPaint('skid', P * rng(), rand(0.35, 1.2) + h * 0.5, h,
+        { sx: rand(0.10, 0.3), uvRot: 1, layer: 'wear', tint: 0x272420, alpha: rand(0.2, 0.5) });
+    }
+    for (let i = 0; i < 10; i++) {                       // stains weeping down the wall
+      bowlPaint(pick(GRIME_CELLS), P * rng(), rand(0.5, 1.6), rand(0.8, 1.8),
+        { sx: rand(1.2, 2.4), layer: 'paint', tint: 0x5b564d, alpha: rand(0.18, 0.36) });
+    }
+    // deep-end floor: a painted mark, half scrubbed off by the wheels
+    flatDecal('number540', bowl.centre.x, bowl.centre.z, 4.6, 4.6, 0.35,
+      { y: bowl.centre.y, alpha: 0.55 });
+    for (let i = 0; i < 6; i++) {
+      flatDecal('skid', bowl.centre.x + rand(-2.6, 2.6), bowl.centre.z + rand(-2.6, 2.6),
+        rand(1.4, 2.8), rand(0.6, 1.2), rand(0, 3),
+        { y: bowl.centre.y, layer: 'wear', tint: 0x2d2a25, alpha: rand(0.25, 0.5) });
+    }
+  }
+
+  // --- the boundary wall: the lot's permanent canvas ------------------------
+  // Painted end to end. It is also what stops the containment ring reading as a
+  // bare slab, and the wash streaks under the fence line date the whole lot.
+  {
+    const B = BOUNDARY;
+    const yb = B.bankH + 0.06, hb = B.wallTop - B.bankH - 0.14;
+    const runs = [
+      { yaw: 0, along: 'x', fixed: B.minZ, a: B.minX + B.corner, b: B.maxX - B.corner, d: 1.0 },
+      { yaw: Math.PI, along: 'x', fixed: B.maxZ, a: B.minX + B.corner, b: B.maxX - B.corner, d: 0.8 },
+      { yaw: HALF_PI, along: 'z', fixed: B.minX, a: B.minZ + B.corner, b: B.maxZ - B.corner, d: 0.9 },
+      { yaw: -HALF_PI, along: 'z', fixed: B.maxX, a: B.minZ + B.corner, b: B.maxZ - B.corner, d: 0.8 },
+    ];
+    for (const r of runs) {
+      const total = r.b - r.a;
+      const nSeg = Math.max(2, Math.round(total / 15));
+      for (let i = 0; i < nSeg; i++) {
+        const c = r.a + total * ((i + 0.5) / nSeg);
+        const len = total / nSeg - 1.4;
+        const x = r.along === 'x' ? c : r.fixed;
+        const z = r.along === 'x' ? r.fixed : c;
+        face(x, yb, z, r.yaw, len, hb, {
+          density: r.d * rand(0.7, 1.15), streaks: 1 + ((rng() * 3) | 0),
+        });
+        // grime washing off the bank on to the toe of the wall
+        const nx = Math.sin(r.yaw), nz = Math.cos(r.yaw);
+        flatDecal(pick(GRIME_CELLS), x + nx * rand(2.6, 3.6), z + nz * rand(2.6, 3.6),
+          rand(3, 6), rand(2, 4), rand(0, 3), { tint: 0x6a6255, alpha: rand(0.2, 0.4) });
+      }
+    }
   }
 
   // === assemble ===========================================================
@@ -1682,25 +2375,72 @@ export async function createPark(ctx) {
     if (b.collider) colliders.push({ mesh, type: b.collider.type, friction: b.collider.friction });
   }
 
-  // decals: one merged mesh per atlas cell so the whole set costs a handful of calls
-  const byCell = new Map();
+  // Decals: every mark in the park is a quad (or a surface-following patch) with
+  // its atlas cell baked into the UVs and its tint/alpha baked into a vertex
+  // colour, so the whole lot merges down to ONE mesh per wear layer — four draw
+  // calls for several hundred pieces of paint, rather than one per atlas cell.
+  const DECAL_LAYERS = [
+    { id: 'paint', order: 2, roughness: 0.93 },   // road paint, stains, grime
+    { id: 'graf', order: 3, roughness: 0.62 },    // spray paint sits over stains
+    { id: 'wear', order: 4, roughness: 0.97 },    // tyre and peg marks over paint
+    { id: 'wax', order: 5, roughness: 0.24 },     // polished grind edges, glossy
+  ];
+  const layerGeos = new Map(DECAL_LAYERS.map((l) => [l.id, []]));
+  const cellIndex = new Map(build.M.decals.map((n, i) => [n, i]));
+  const _dc = new THREE.Color();
+
   for (const d of build.decals) {
-    if (!byCell.has(d.name)) byCell.set(d.name, []);
-    const quad = mergeable(new THREE.PlaneGeometry(1, 1));
-    quad.applyMatrix4(d.matrix);
-    byCell.get(d.name).push(quad);
+    const bin = layerGeos.get(d.layer || 'paint');
+    if (!bin) continue;
+    const geo = d.geo || (() => {
+      const s = new Surf();
+      s.quad(V(-0.5, -0.5, 0, 0, 0, 1, 0, 0), V(0.5, -0.5, 0, 0, 0, 1, 1, 0),
+        V(0.5, 0.5, 0, 0, 0, 1, 1, 1), V(-0.5, 0.5, 0, 0, 0, 1, 0, 1));
+      return s.geometry(d.matrix);
+    })();
+    // atlas cell + quarter turns, inset a few texels so mips cannot bleed a
+    // neighbouring cell into the edge of a piece
+    const { offset, repeat } = build.M.decalUV(cellIndex.get(d.cell) ?? 0);
+    const inset = 0.0035;
+    const ox = offset.x + inset, oy = offset.y + inset;
+    const rx = repeat.x - inset * 2, ry = repeat.y - inset * 2;
+    const uv = geo.attributes.uv;
+    const turns = (d.uvRot || 0) & 3;
+    for (let i = 0; i < uv.count; i++) {
+      let u = uv.getX(i), v = uv.getY(i);
+      for (let k = 0; k < turns; k++) { const t = u; u = v; v = 1 - t; }
+      uv.setXY(i, ox + u * rx, oy + v * ry);
+    }
+    _dc.set(d.tint ?? 0xffffff);
+    const a = d.alpha ?? 1;
+    const n = geo.attributes.position.count;
+    const col = new Float32Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      col[i * 4] = _dc.r; col[i * 4 + 1] = _dc.g; col[i * 4 + 2] = _dc.b; col[i * 4 + 3] = a;
+    }
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 4));
+    bin.push(geo);
   }
+
   const decalGroup = new THREE.Group();
   decalGroup.name = 'park_decals';
-  for (const [name, geos] of byCell) {
+  for (const L of DECAL_LAYERS) {
+    const geos = layerGeos.get(L.id);
+    if (!geos.length) continue;
     const geo = geos.length === 1 ? geos[0] : mergeGeometries(geos, false);
     if (!geo) continue;
     if (geos.length > 1) for (const g of geos) g.dispose();
-    const mesh = new THREE.Mesh(geo, build.M.decalMaterial(name, { roughness: 0.86 }));
-    mesh.name = `decal_${name}`;
+    const mat = build.M.get('decal').clone();
+    mat.name = `park_decal_${L.id}`;
+    mat.vertexColors = true;
+    mat.roughness = L.roughness;
+    mat.envMapIntensity = L.id === 'wax' ? 1.15 : 0.85;
+    build.ownMats.push(mat);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.name = `decal_${L.id}`;
     mesh.castShadow = false;
-    mesh.receiveShadow = false;
-    mesh.renderOrder = 2;
+    mesh.receiveShadow = true;                 // paint has to go dark in shadow
+    mesh.renderOrder = L.order;
     mesh.matrixAutoUpdate = false;
     mesh.updateMatrix();
     decalGroup.add(mesh);
@@ -1783,6 +2523,7 @@ export async function createPark(ctx) {
     dispose() {
       props?.dispose?.();
       for (const g of disposables) g.dispose();
+      for (const m of build.ownMats) m.dispose();   // textures stay with the library
       group.clear();
     },
   };
