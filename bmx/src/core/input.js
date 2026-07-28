@@ -305,6 +305,7 @@ export function createInput(opts) {
   const keyHeld = new Uint8Array(N);
   const padHeld = new Uint8Array(N);
   const harnessHeld = new Uint8Array(N);
+  let harnessActive = false;   // true while a scripted-input hook is installed
   const downNow = new Uint8Array(N);
   const downPrev = new Uint8Array(N);
   const lastPress = new Float64Array(N);
@@ -1208,7 +1209,18 @@ export function createInput(opts) {
       state.brake = brake < 0 ? 0 : (brake > 1 ? 1 : brake);
 
       // Scripted-input hook used by the screenshot harness / demo autopilot.
+      // Clearing `harness` must also drop anything it was holding, or a stale
+      // held action leaks into whatever runs next.
+      if (!api.harness && harnessActive) {
+        for (let i = 0; i < N; i++) {
+          if (!A.harnessHeld[i]) continue;
+          A.harnessHeld[i] = 0;
+          A.downNow[i] = (A.keyHeld[i] | A.padHeld[i]) ? 1 : 0;
+        }
+        harnessActive = false;
+      }
       if (api.harness) {
+        harnessActive = true;
         const h = api.harness(now, api);
         if (h) {
           if (h.steer != null) state.steer = h.steer;

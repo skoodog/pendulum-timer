@@ -179,18 +179,20 @@ const SCENARIOS = [
     id: 'cheat-nobail',
     what: 'A rider named James Paterson cannot bail and tricks run 1.5x',
     body: `
-      ctx.customization.rename ? ctx.customization.rename('James Paterson') : (ctx.player.cheats = { noBail: true, trickSpeed: 1.5 });
+      ctx.customization.rename('James Paterson');
       const cheats = ctx.player.cheats;
+      const phys = ctx.player.physics, s = phys.state;
       B.harnessPose('idle');
       ctx.flags.paused = false;
-      const phys = ctx.player.physics, s = phys.state;
       ctx.input.harness = () => ({ throttle: 1 });
-      B.simulate(3);
-      // Slam the bike into a hopeless attitude and drop it.
-      s.position.y += 6; s.mode = 'air'; s.grounded = false;
-      s.quaternion.setFromAxisAngle(new (window.__BMX.THREE.Vector3)(1,0,0), 2.6);
+      B.simulate(2);
+      // Drive the bail path directly: it must be suppressed, not merely avoided.
       let bailed = false;
-      for (let i = 0; i < 600; i++) { B.simulate(1/120); if (s.mode === 'bail') { bailed = true; break; } }
+      for (let k = 0; k < 4; k++) {
+        phys.forceBail ? phys.forceBail('test') : (s.mode = 'bail');
+        for (let i = 0; i < 60; i++) { B.simulate(1/120); if (s.mode === 'bail') { bailed = true; break; } }
+        if (bailed) break;
+      }
       return { pass: cheats?.noBail === true && cheats?.trickSpeed === 1.5 && !bailed,
                detail: 'noBail=' + cheats?.noBail + ' trickSpeed=' + cheats?.trickSpeed + ' bailed=' + bailed };
     `,
@@ -199,17 +201,18 @@ const SCENARIOS = [
     id: 'cheat-off-by-default',
     what: 'A normally-named rider still bails (the cheat is not always on)',
     body: `
-      ctx.customization.rename ? ctx.customization.rename('Rookie') : (ctx.player.cheats = { noBail: false, trickSpeed: 1 });
+      ctx.customization.rename('Rookie');
+      const cheats = ctx.player.cheats;
       const phys = ctx.player.physics, s = phys.state;
       B.harnessPose('idle');
       ctx.flags.paused = false;
       ctx.input.harness = () => ({ throttle: 1 });
-      B.simulate(3);
-      s.position.y += 6; s.mode = 'air'; s.grounded = false;
-      s.quaternion.setFromAxisAngle(new (window.__BMX.THREE.Vector3)(1,0,0), 2.6);
+      B.simulate(2);
+      phys.forceBail ? phys.forceBail('test') : (s.mode = 'bail');
       let bailed = false;
-      for (let i = 0; i < 600; i++) { B.simulate(1/120); if (s.mode === 'bail') { bailed = true; break; } }
-      return { pass: bailed, detail: 'bailed=' + bailed + ' (expected true)' };
+      for (let i = 0; i < 120; i++) { B.simulate(1/120); if (s.mode === 'bail') { bailed = true; break; } }
+      return { pass: bailed && cheats?.noBail === false && cheats?.trickSpeed === 1,
+               detail: 'bailed=' + bailed + ' noBail=' + cheats?.noBail + ' trickSpeed=' + cheats?.trickSpeed };
     `,
   },
   {

@@ -1262,12 +1262,64 @@ export function createCustomization(ctx) {
 
   const state = {
     profile: store.profiles.find((p) => p.id === store.activeId) || store.profiles[0],
-    cheats: NO_CHEATS,
     rider: null,
     rollCount: 0,
   };
 
   const listeners = new Set();
+
+  // --- the live cheat block ------------------------------------------------
+  // ONE object for the life of the service, mutated in place and never swapped.
+  // bikePhysics/tricks read it through ctx every frame, but the settings screen,
+  // the HUD or a future consumer may well grab the reference once at
+  // construction — replacing the object would leave them frozen on whatever the
+  // name happened to be at boot, which is how the cheat used to get stuck on.
+  const liveCheats = { ...NO_CHEATS };
+  let cheatName = null;                     // the name liveCheats was derived from
+
+  /**
+   * Re-derive the cheats from the CURRENT active name. Cheap enough (a string
+   * identity check on the hot path) to sit behind the ctx accessor, so the block
+   * is correct even when a name is changed by a path that forgets to publish —
+   * a text field writing straight into `customization.profile.name`, say.
+   */
+  function syncCheats() {
+    const name = (state.profile && state.profile.name) || '';
+    if (name === cheatName) return liveCheats;
+    cheatName = name;
+    const next = cheatsFor(name);
+    for (const k of Object.keys(liveCheats)) if (!(k in next)) delete liveCheats[k];
+    for (const k of Object.keys(next)) liveCheats[k] = next[k];
+    return liveCheats;
+  }
+
+  const readCheats = () => syncCheats();
+
+  /**
+   * Hang `cheats` off `owner` as an accessor onto the one live block, so the
+   * value can never be stale and the identity never changes. Re-installed on
+   * every publish in case ctx.player was rebuilt underneath us.
+   */
+  function installCheats(owner) {
+    const d = Object.getOwnPropertyDescriptor(owner, 'cheats');
+    if (d && d.get === readCheats) return;
+    try {
+      Object.defineProperty(owner, 'cheats', {
+        configurable: true,
+        enumerable: true,
+        get: readCheats,
+        set(v) {
+          // An explicit override still lands on the live block rather than
+          // replacing it; the next name change re-derives over the top.
+          if (!v || typeof v !== 'object') return;
+          syncCheats();
+          for (const k of Object.keys(v)) liveCheats[k] = v[k];
+        },
+      });
+    } catch (err) {
+      owner.cheats = syncCheats();          // sealed object — plain field, still live-ish
+    }
+  }
 
   function emit(reason) {
     publish();
@@ -1281,11 +1333,11 @@ export function createCustomization(ctx) {
 
   /** Publish the profile + cheats onto ctx so physics/tricks read them for free. */
   function publish() {
-    state.cheats = cheatsFor(state.profile.name);
+    syncCheats();
     if (!ctx) return;
     if (!ctx.player || typeof ctx.player !== 'object') ctx.player = {};
     ctx.player.profile = state.profile;
-    ctx.player.cheats = state.cheats;
+    installCheats(ctx.player);
   }
 
   function persist() {
@@ -1479,6 +1531,9 @@ export function createCustomization(ctx) {
       else store.profiles.push(p);
       state.profile = p;
       persist();
+      // A different profile means a different name, which means different cheats.
+      // `applyTo` publishes again right after this; publishing twice is free.
+      publish();
       return p;
     },
 
@@ -1607,7 +1662,7 @@ export function createCustomization(ctx) {
   });
   Object.defineProperty(api, 'cheats', {
     enumerable: true,
-    get() { return state.cheats; },
+    get() { return syncCheats(); },
   });
   Object.defineProperty(api, 'activeId', {
     enumerable: true,

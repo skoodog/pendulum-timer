@@ -10,9 +10,15 @@
 //
 // Rules of the road, exactly like the reference games:
 //   * Grabs and tweaks are HELD. Holding accrues a per-second bonus up to a cap, and
-//     you MUST tuck it back in before touchdown — landing with a grab still out is a
-//     bail. Rotational tricks (whips, barspins, flips) are IMPULSE: they run for a
-//     fixed duration and landing before they finish is also a bail.
+//     you MUST tuck it back in before touchdown — landing with a grab still out, once
+//     the game has had time to warn you about it, is a bail. Rotational tricks (whips,
+//     barspins, flips) are IMPULSE: they run for a fixed duration and landing before
+//     they finish is also a bail.
+//   * Every rotation lands square: inside the last fraction of a second the landing
+//     assist owns the yaw and puts the bike on the furthest half-rotation the air can
+//     still deliver, so a held spin lands a clean 360 rather than a 290 and a slam.
+//   * A trick counts towards the persistent trick list the moment the combo holding it
+//     is landed or banked — never on commit, so a bailed trick is never learned.
 //   * Repeating a trick inside one combo scores less every time (×0.5 per repeat,
 //     ×0.22 for the signature tricks that are flagged no-repeat).
 //   * Nothing in the update path allocates. The only runtime objects are one small
@@ -41,14 +47,23 @@ export const TRICK_TUNE = {
   spinRamp: 0.20,         // s to wind the spin up to full rate — stops instant snap-spins
   spinDecay: 4.0,         // 1/s the wind-up bleeds off after release
   spinNameTol: 14,        // ° short of a threshold that still reads as that spin
-  spinSnapWindow: 58,     // ° from a half-rotation inside which the landing assist engages
-  spinSnapGain: 2.6,      // 1/s proportional gain of that assist
-  spinSnapMax: 3.8,       // rad/s cap on the assist
+  spinLandHorizon: 0.62,  // s before touchdown that the landing assist takes the yaw over
+  spinSnapGain: 1.12,     // over-drive on the rate the assist asks for, so it arrives early
+  spinSnapMax: 9.0,       // rad/s cap on the assist (the physics caps trick rate at 9.42)
+  assistUpright: 0.35,    // chassis up·world-up below which the landing assist stands down
+  spinSnapDead: 3.5,      // ° of heading error the assist leaves alone — inside this the bike
+                          // is landable, and handing the chassis back lets the physics level
+                          // it out instead of holding it in a permanent "rotating" state
+  gravity: 17.5,          // m/s² fallback if the physics will not tell us its own value
+  groundProbe: 40,        // m the landing-height probe reaches down for the floor
   flipGain: 3.4,          // 1/s proportional gain of the closed-loop flip driver
   flipMin: 3.0,           // rad/s floor while a flip still has real angle to cover
   flipMax: 8.8,           // rad/s ceiling (physics caps at 9.42)
   flipDone: 16,           // ° of remaining rotation that counts as complete
   impulseGrace: 0.86,     // fraction of an impulse trick that still counts on touchdown
+  shortAirCommit: 0.55,   // fraction of `minAir` a grab must have been out for to still be
+                          // credited when the air ran out under it — a grab held for every
+                          // frame of a small pop is a trick, not a tap
   repeatFalloff: 0.50,    // score multiplier per repeat of a repeatable trick
   repeatFalloffHard: 0.22,// ...and of a signature (repeat:false) trick
   repeatFloor: 0.12,      // never scores below this fraction of base
@@ -56,6 +71,11 @@ export const TRICK_TUNE = {
   grindSwitchHold: 0.14,  // s a new grind direction must be held to switch mid-rail
   grindSwitchCool: 0.45,  // s between grind switches
   manualSwitchCool: 0.40, // s between manual ↔ nose manual switches
+  tuckWarnVy: -4.5,       // m/s of descent at which the HUD starts shouting "tuck it in"
+  tuckGrace: 0.12,        // s of that warning the rider must have been given before landing
+                          // with a grab still out is treated as a bail. Anything shorter —
+                          // a quick pop where the game never had time to warn anyone — is
+                          // tucked back in on touchdown and still counts.
   comboTextMax: 6,        // trick names kept in the HUD string before it elides
   stuckHold: 2.6,         // s of unbroken hold after which a modifier is treated as jammed
                           // (longer than any possible hang time — this only ever catches a
@@ -283,6 +303,7 @@ export function createTricks(ctx) {
   let actYaw0 = 0;
   let actRoll0 = 0;
   let actDone = false;
+  let actWarn = 0;           // s the "tuck it back in" warning has been up for this trick
 
   // grind / lip
   let grindEntry = null;
@@ -335,6 +356,7 @@ export function createTricks(ctx) {
     TRICKS,
     list: TRICKS,
     total: TRICKS.length,
+    totalCount: TRICKS.length,
     landed,
     landedCount: landed.size,
   };
@@ -520,6 +542,10 @@ export function createTricks(ctx) {
     const s = ctx.player?.scoring;
     const pts = comboPoints;
     const n = combo.length;
+    // Banking is the moment the combo is unquestionably the rider's: it survived to
+    // the score. Everything in it goes into the trick list — grinds, manuals and
+    // flatland lines bank straight off the ground and never see a landing event.
+    creditLanded();
     if (s) {
       if (typeof s.bankCombo === 'function') s.bankCombo();
       else if (typeof s.endCombo === 'function') s.endCombo();
@@ -542,15 +568,57 @@ export function createTricks(ctx) {
     rebuildText();
   }
 
+  /**
+   * Fold everything in the live combo into the persistent trick list. The Set does
+   * the de-duplication, and `landedCount` is a plain number the HUD can read every
+   * frame. Called on a clean landing and again when the combo banks, so a trick is
+   * only ever credited once it has actually been ridden out — a bail clears the
+   * combo without coming through here, so bailed tricks never count.
+   */
   function creditLanded() {
     for (let i = 0; i < combo.length; i++) {
       const id = combo[i].id;
-      if (!landed.has(id)) { landed.add(id); landedDirty = true; }
+      if (id && BY_ID.has(id) && !landed.has(id)) { landed.add(id); landedDirty = true; }
     }
     api.landedCount = landed.size;
   }
 
   // ------------------------------------------------------------- air rotation
+
+  // Landing prediction. `_probe` is a persistent bag so the collision query costs no
+  // allocation, and the ride-height offset is measured once per air so the estimate is
+  // "when do the WHEELS touch", not "when does the origin reach the floor".
+  const _probe = { x: 0, y: 0, z: 0 };
+  let landOffset = 0.4;
+
+  /** World Y of the floor straight below the rider, or NaN if there is none. */
+  function floorBelow(st) {
+    const col = ctx.world?.collision;
+    if (!col?.raycastDown) return NaN;
+    _probe.x = st.position.x;
+    _probe.y = st.position.y + 0.25;
+    _probe.z = st.position.z;
+    const hit = col.raycastDown(_probe, T.groundProbe);
+    return hit && hit.point ? hit.point.y : NaN;
+  }
+
+  /**
+   * Seconds of air left before the wheels touch down, from the ballistic arc and the
+   * floor that is actually under the rider — a drop lands sooner than a hop and the
+   * assist has to know the difference. Falls back to the launch height when there is
+   * nothing below (over a void), which is the conservative answer.
+   */
+  function timeToLand(st) {
+    const g = ctx.player?.physics?.TUNING?.gravity || T.gravity;
+    const floor = floorBelow(st);
+    const base = Number.isFinite(floor) ? floor + landOffset : st.launchHeight;
+    const h = st.position.y - base;
+    if (h <= 0) return 0;
+    const vy = st.velocity.y;
+    const disc = vy * vy + 2 * g * h;
+    if (disc <= 0) return 0;
+    return (vy + Math.sqrt(disc)) / g;
+  }
 
   function driveSpin(fdt, input, st) {
     // A trick that owns the yaw (flair) locks the spin buttons out for its duration.
@@ -560,21 +628,38 @@ export function createTricks(ctx) {
     const dir = (sr ? 1 : 0) - (sl ? 1 : 0);
     const r = execRate();
 
-    if (dir !== 0 && !trickOwnsYaw) {
-      spinWind = Math.min(1, spinWind + (fdt * r) / T.spinRamp);
-      phys?.applyTrickRotation?.('yaw', dir * T.spinRate * spinWind * r);
-    } else {
-      spinWind = Math.max(0, spinWind - T.spinDecay * fdt);
-      // Landing assist: once the buttons are out and the bike is coming down, nudge
-      // the heading onto the nearest half-rotation so a 360 actually lands a 360.
-      if (!trickOwnsYaw && st.airTime > 0.15 && st.velocity.y < 0.5) {
-        const target = Math.round(st.rotation.yaw / 180) * 180;
-        const err = target - st.rotation.yaw;
-        if (Math.abs(err) > 1.5 && Math.abs(err) < T.spinSnapWindow) {
-          const rate = clamp(err * deg * T.spinSnapGain, -T.spinSnapMax, T.spinSnapMax);
-          phys?.applyTrickRotation?.('yaw', rate);
-        }
+    if (dir !== 0 && !trickOwnsYaw) spinWind = Math.min(1, spinWind + (fdt * r) / T.spinRamp);
+    else spinWind = Math.max(0, spinWind - T.spinDecay * fdt);
+
+    // ---- landing assist ------------------------------------------------------
+    // Every rotation has to finish square. Inside the last fraction of a second the
+    // assist takes the yaw over — whether or not the spin buttons are still down,
+    // because a rider who holds the spin all the way to the floor should be snapped
+    // onto a landable heading, not slammed into the concrete — and drives the bike
+    // onto the furthest half-rotation the air that is left can still deliver. That is
+    // what makes a held spin land a clean 360 instead of a 290 and a bail.
+    // It stands down while the bike is upside down: there is no heading to save until
+    // the chassis comes round, and a yaw rate on an inverted bike rolls it instead.
+    const upright = !st.up || st.up.y > T.assistUpright;
+    const tLand = trickOwnsYaw || !upright ? Infinity : timeToLand(st);
+    if (tLand < T.spinLandHorizon) {
+      const yaw = st.rotation.yaw;
+      const span = (T.spinRate / deg) * r * tLand;      // ° the bike could still turn
+      // Where the spin would end up if the rider just kept holding it, rounded to the
+      // half-rotation it is closest to...
+      let target = Math.round((yaw + dir * span) / 180) * 180;
+      // ...pulled back to one the remaining air can actually deliver...
+      if (target > yaw + span) target = Math.floor((yaw + span) / 180) * 180;
+      else if (target < yaw - span) target = Math.ceil((yaw - span) / 180) * 180;
+      // ...and, when the air is too short to reach any of them, the nearest one.
+      if (Math.abs(target - yaw) > span) target = Math.round(yaw / 180) * 180;
+      const err = target - yaw;
+      if (Math.abs(err) > T.spinSnapDead) {
+        const rate = (err * deg * T.spinSnapGain) / Math.max(tLand, 0.05);
+        phys?.applyTrickRotation?.('yaw', clamp(rate, -T.spinSnapMax, T.spinSnapMax));
       }
+    } else if (dir !== 0 && !trickOwnsYaw) {
+      phys?.applyTrickRotation?.('yaw', dir * T.spinRate * spinWind * r);
     }
 
     // Name the rotation as soon as it is banked.
@@ -675,6 +760,7 @@ export function createTricks(ctx) {
     actTime = 0;
     actHold = 0;
     actDone = false;
+    actWarn = 0;
     actPitch0 = st.rotation.pitch;
     actYaw0 = st.rotation.yaw;
     actRoll0 = st.rotation.roll;
@@ -738,10 +824,20 @@ export function createTricks(ctx) {
     }
 
     // --- tuck warning --------------------------------------------------------
-    api.tuckWarning = !!(act && act.style === 'hold' && actEntry && st.velocity.y < -4.5);
+    // The rider is only ever bailed for a grab they were warned about, so the count
+    // of how long the warning has been up is what the landing rule reads.
+    const warn = !!(act && act.style === 'hold' && actEntry && st.velocity.y < T.tuckWarnVy);
+    if (warn) actWarn += fdt;
+    api.tuckWarning = warn;
   }
 
-  function onEnterAir(input) {
+  function onEnterAir(input, st) {
+    // How far the wheels ride above the floor, measured off the takeoff itself so the
+    // landing prediction is not hard-coded to one bike or one rider height.
+    if (st) {
+      const floor = floorBelow(st);
+      if (Number.isFinite(floor)) landOffset = clamp(st.position.y - floor, 0, 1.2);
+    }
     spinWind = 0;
     spinOffset = 0;
     spinStep = -1;
@@ -953,9 +1049,18 @@ export function createTricks(ctx) {
     const q = typeof quality === 'number' ? quality : (quality?.quality ?? detail?.quality ?? 1);
 
     // Landing with a grab still hanging out, or before a rotation has come round,
-    // is a bail — tuck it back in.
+    // is a bail — tuck it back in. A grab only counts as "still hanging out" once the
+    // rider has had the tuck warning up long enough to act on it: on a quick pop the
+    // game never asks for the tuck, so it tucks itself and the trick still counts.
     if (act && st) {
-      const held = act.style === 'hold' && actEntry;
+      // A grab that was still out when the wheels touched down was out for all the air
+      // there was. Short hops have less air than the trick's gate asks for, so credit it
+      // here rather than throwing away a trick the rider actually performed.
+      if (act.style === 'hold' && !actEntry && actTime >= gate(act.minAir) * T.shortAirCommit) {
+        actEntry = commit(act, 0);
+        setCurrent(act, actEntry);
+      }
+      const held = act.style === 'hold' && actEntry && actWarn >= gate(T.tuckGrace);
       const short = act.style === 'impulse' && !actDone && impulseProgress(st) < T.impulseGrace;
       if (held || short) {
         const reason = held ? 'notucked' : 'rotation';
@@ -970,6 +1075,7 @@ export function createTricks(ctx) {
 
     if (combo.length) {
       creditLanded();
+      saveLanded();
       const s = ctx.player?.scoring;
       if (s) {
         if (typeof s.land === 'function') s.land(q, combo);
@@ -1046,7 +1152,7 @@ export function createTricks(ctx) {
       if (prevMode === 'grind') stopGrindTrick('mode');
       if (prevMode === 'manual') stopManual('mode');
       if (prevMode === 'ride' && mode !== 'ride') stopFlat('mode');
-      if (mode === 'air') onEnterAir(input);
+      if (mode === 'air') onEnterAir(input, st);
       prevMode = mode;
     }
 

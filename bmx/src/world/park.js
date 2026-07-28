@@ -27,6 +27,10 @@
 //
 // Flow: roll-in → main run north → funbox → north transitions → east to the spine
 // and wallride → dirt line north → berm → back into the transitions / bowl.
+//
+// The whole lot is ringed by a bank-to-wall venue boundary (see BOUNDARY): the
+// play area is closed by geometry, not by an invisible plane, and the returned
+// bounds Box3 is the asphalt apron that sits outside it.
 
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -38,9 +42,37 @@ const TAU = Math.PI * 2;
 const HALF_PI = Math.PI * 0.5;
 
 // --- lot dimensions --------------------------------------------------------
-const LOT = { minX: -64, maxX: 64, minZ: -60, maxZ: 60 };
+// The asphalt reaches well past the boundary wall on every side. That apron is
+// what a bail is allowed to tumble across: the ragdoll ignores wall collision by
+// design, so it needs real ground under it for the second or two before the
+// respawn fires, instead of sliding off the edge of the world.
+const LOT = { minX: -70, maxX: 70, minZ: -66, maxZ: 66 };
 const PAD = { minX: -46, maxX: 28, minZ: -46, maxZ: 32 };   // concrete skatepark slab
 const DIRT = { minX: 28, maxX: 58, minZ: -46, maxZ: 32 };   // sculpted trails soil
+
+// --- venue boundary --------------------------------------------------------
+// The lot has to be closed for the physics, not just dressed with a fence, and it
+// has to be closed by geometry a rider can read and ride. The edge is therefore a
+// continuous bank-to-wall: a rideable bank (concrete, soil on the trails side)
+// rising out of the lot into a site wall with a capping beam. Riding the bank at
+// full speed throws you up the wall face, where bikePhysics' wall sweep either
+// takes the wallride or scrubs the outward velocity off — either way you come
+// back down inside. A bunnyhop cannot reach the capping, and no ramp in the park
+// points at it, so nothing crosses the line.
+//
+// `minX..maxZ` is the plan line of the VERTICAL WALL FACE; the bank stands inside
+// it and the wall thickness outside, so those numbers are the true edge of play.
+const BOUNDARY = {
+  minX: -54, maxX: 60, minZ: -52, maxZ: 48,
+  corner: 9.0,                        // plan radius of the corner sweeps
+  bankH: 2.1,                         // m of rideable bank in front of the wall
+  bankR: 2.6,                         // m radius of its blend out of the flat
+  bankAngle: 52 * Math.PI / 180,      // steepest part of the bank
+  wallTop: 5.0,                       // m to the top of the wall face (capping sits above)
+  thick: 0.6,                         // m through the wall
+  step: 2.0,                          // m between plan samples
+  pier: 7.6,                          // m between wall piers
+};
 
 // --- part radii ------------------------------------------------------------
 const COPING_R = 0.0325;   // 65 mm steel coping tube
@@ -1226,6 +1258,151 @@ function buildGround(build, bowlRim) {
 }
 
 // ---------------------------------------------------------------------------
+// venue boundary (bank-to-wall ring)
+// ---------------------------------------------------------------------------
+
+/**
+ * Samples the wall face as a closed rounded rectangle. Every sample carries the
+ * inward normal and its distance along the run, so the profile below can be swept
+ * along it without any matrix work and the wall texture never shifts scale.
+ * Returns `{ pts, total }`; `pts` does not repeat the first point.
+ */
+function boundaryPlan(B) {
+  const R = Math.min(B.corner, (B.maxX - B.minX) * 0.4, (B.maxZ - B.minZ) * 0.4);
+  const pts = [];
+  let u = 0;
+
+  const straight = (ax, az, bx, bz, nx, nz) => {
+    const len = Math.hypot(bx - ax, bz - az);
+    const n = Math.max(1, Math.round(len / B.step));
+    for (let i = 0; i < n; i++) {
+      const t = i / n;
+      pts.push({ x: ax + (bx - ax) * t, z: az + (bz - az) * t, nx, nz, u });
+      u += len / n;
+    }
+  };
+  const arc = (cx, cz, a0, a1) => {
+    const span = Math.abs(a1 - a0);
+    const n = Math.max(2, Math.round((span * R) / B.step));
+    for (let i = 0; i < n; i++) {
+      const a = a0 + (a1 - a0) * (i / n);
+      const c = Math.cos(a), s = Math.sin(a);
+      pts.push({ x: cx + c * R, z: cz + s * R, nx: -c, nz: -s, u });
+      u += (span * R) / n;
+    }
+  };
+
+  // walked clockwise in plan: north run, then east, south, west, closing on itself
+  straight(B.minX + R, B.minZ, B.maxX - R, B.minZ, 0, 1);
+  arc(B.maxX - R, B.minZ + R, -HALF_PI, 0);
+  straight(B.maxX, B.minZ + R, B.maxX, B.maxZ - R, -1, 0);
+  arc(B.maxX - R, B.maxZ - R, 0, HALF_PI);
+  straight(B.maxX - R, B.maxZ, B.minX + R, B.maxZ, 0, -1);
+  arc(B.minX + R, B.maxZ - R, HALF_PI, Math.PI);
+  straight(B.minX, B.maxZ - R, B.minX, B.minZ + R, 1, 0);
+  arc(B.minX + R, B.minZ + R, Math.PI, Math.PI + HALF_PI);
+
+  return { pts, total: u };
+}
+
+/**
+ * Cross-section of the boundary, in (d, y): `d` is metres INWARD from the wall
+ * face, so the bank has positive d and the wall body negative. Rows are listed
+ * bottom-inside to bottom-outside; repeated positions with different normals are
+ * the creases (the strip between them collapses and is dropped by Surf.tri).
+ */
+function boundaryProfile(B) {
+  const th = B.bankAngle;
+  const arcRise = B.bankR * (1 - Math.cos(th));
+  const straightRise = Math.max(0, B.bankH - arcRise);
+  const depth = B.bankR * Math.sin(th) + straightRise / Math.tan(th);
+
+  const rows = [];
+  let s = 0, pd = null, py = 0;
+  const add = (d, y, nd, ny, kind, bucket) => {
+    if (pd !== null) s += Math.hypot(d - pd, y - py);
+    rows.push({ d, y, nd, ny, s, kind, bucket });
+    pd = d; py = y;
+  };
+
+  // toe buried below grade so the joint with the slab/soil never shows a seam
+  add(depth + 0.30, -0.12, 0, 1, 'bank', 'park_concrete');
+  const segs = 6;
+  for (let i = 0; i <= segs; i++) {
+    const a = th * (i / segs);
+    add(depth - B.bankR * Math.sin(a), B.bankR * (1 - Math.cos(a)),
+      Math.sin(a), Math.cos(a), 'bank', 'park_concrete');
+  }
+  add(0, B.bankH, Math.sin(th), Math.cos(th), 'bank', 'park_concrete');   // straight to the wall
+  add(0, B.bankH, 1, 0, 'wall', 'brick_wall');                            // crease into the face
+  add(0, B.wallTop, 1, 0, 'wall', 'brick_wall');
+  // Weathered pitched capping. It is not a ledge: both faces are steep enough that
+  // a rider thrown up the wall by a wallride cannot come to rest on the top, and
+  // the inner pitch is the one that catches them, so they always shed back inside.
+  const ridge = B.thick * 0.55, rise = 0.26;
+  add(0, B.wallTop, rise, ridge, 'cap', 'brick_wall');
+  add(-ridge, B.wallTop + rise, rise, ridge, 'cap', 'brick_wall');
+  add(-ridge, B.wallTop + rise, -(rise - 0.04), B.thick - ridge, 'cap', 'brick_wall');
+  add(-B.thick, B.wallTop + 0.04, -(rise - 0.04), B.thick - ridge, 'cap', 'brick_wall');
+  add(-B.thick, B.wallTop + 0.04, -1, 0, 'wall', 'brick_wall');           // outside face
+  add(-B.thick, -0.12, -1, 0, 'wall', 'brick_wall');
+
+  return { rows, depth };
+}
+
+/**
+ * Builds the closed boundary: bank + wall + capping + piers. The bank goes into
+ * the rideable concrete bucket (soil where it stands on the trails), the wall and
+ * its capping into the brick bucket, which is tagged `type: 'wall'`.
+ */
+function boundaryRing(build, B) {
+  const { pts, total } = boundaryPlan(B);
+  const { rows, depth } = boundaryProfile(B);
+  const n = pts.length;
+
+  const surfs = new Map();
+  const surfFor = (name) => {
+    let s = surfs.get(name);
+    if (!s) { s = new Surf(); surfs.set(name, s); }
+    return s;
+  };
+  // the bank is soil, not concrete, where its toe stands on the trails
+  const onSoil = (p) => {
+    const x = p.x + p.nx * depth, z = p.z + p.nz * depth;
+    return x > DIRT.minX + 1 && x < DIRT.maxX + 2 && z > DIRT.minZ - 2 && z < DIRT.maxZ + 1;
+  };
+  const soil = pts.map(onSoil);
+  const vert = (p, r, u) => V(
+    p.x + p.nx * r.d, r.y, p.z + p.nz * r.d,
+    p.nx * r.nd, r.ny, p.nz * r.nd, u, r.s);
+
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    const ua = a.u, ub = (i + 1 === n) ? total : b.u;     // no UV jump at the seam
+    const dirt = soil[i] && soil[(i + 1) % n];
+    for (let j = 0; j + 1 < rows.length; j++) {
+      const r0 = rows[j], r1 = rows[j + 1];
+      const bucket = (r0.kind === 'bank' && dirt) ? 'ground_dirt' : r0.bucket;
+      surfFor(bucket).quad(vert(a, r0, ua), vert(b, r0, ub), vert(b, r1, ub), vert(a, r1, ua));
+    }
+  }
+  for (const [bucket, surf] of surfs) if (!surf.empty) build.add(bucket, surf.geometry());
+
+  // precast piers every few bays: relief on the face, and a read of scale
+  const pierH = B.wallTop - B.bankH + 0.25;
+  const pierY = B.bankH - 0.25 + pierH * 0.5;
+  let next = 0;
+  for (const p of pts) {
+    if (p.u < next) continue;
+    next = p.u + B.pier;
+    const m = new THREE.Matrix4().makeRotationY(Math.atan2(p.nx, p.nz))
+      .premultiply(new THREE.Matrix4().makeTranslation(
+        p.x + p.nx * 0.13, pierY, p.z + p.nz * 0.13));
+    build.add('brick_wall', boxGeo(0.8, pierH, 0.30, m));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // createPark
 // ---------------------------------------------------------------------------
 
@@ -1383,6 +1560,12 @@ export async function createPark(ctx) {
   // === ground =============================================================
   buildGround(build, bowl.rim);
 
+  // === venue boundary ======================================================
+  // Closes the lot on all four sides, well outside every feature: the nearest
+  // geometry to the bank toe is the slab edge (3 m) and the trails soil, which the
+  // soil half of the bank simply grows out of.
+  boundaryRing(build, BOUNDARY);
+
   // === painted lines, stains and graffiti =================================
   const flatDecal = (name, x, z, w, h, rot = 0, y = 0.012) => {
     build.decal(name, new THREE.Matrix4().makeRotationY(rot)
@@ -1451,9 +1634,33 @@ export async function createPark(ctx) {
   wallDecal('tagMirra', -17, 1.9, BACK_Z - 0.02, 6.4, 2.4, Math.PI);  // ramp backs
   wallDecal('throwBmx', 8, 1.5, -41.62, 5.0, 2.0, Math.PI);
 
+  // the boundary wall is the lot's permanent canvas — every run of it is painted,
+  // which is also what stops it reading as a bare containment slab
+  {
+    const B = BOUNDARY, e = 0.03;
+    const north = (n, x, y, w, h) => wallDecal(n, x, y, B.minZ + e, w, h, 0);
+    const south = (n, x, y, w, h) => wallDecal(n, x, y, B.maxZ - e, w, h, Math.PI);
+    const east = (n, z, y, w, h) => wallDecal(n, B.maxX - e, y, z, w, h, -HALF_PI);
+    const west = (n, z, y, w, h) => wallDecal(n, B.minX + e, y, z, w, h, HALF_PI);
+    north('sponsor', -26, 3.5, 9.0, 3.2);
+    north('tagMirra', -4, 3.3, 7.2, 2.7);
+    north('sprayX', 12, 4.0, 2.4, 2.4);
+    north('throwBmx', 30, 3.4, 8.0, 3.0);
+    east('stencilDiy', -30, 3.2, 3.0, 3.0);
+    east('tagMirra', 4, 3.5, 7.6, 2.9);
+    east('sponsor', 28, 3.4, 8.6, 3.1);
+    south('throwBmx', 22, 3.4, 8.4, 3.2);
+    south('sprayX', -6, 4.0, 2.6, 2.6);
+    south('number540', -34, 3.5, 3.6, 3.6);
+    west('sponsor', -20, 3.5, 9.0, 3.2);
+    west('throwBmx', 8, 3.3, 7.4, 2.8);
+    west('stencilDiy', 30, 3.4, 3.2, 3.2);
+  }
+
   // === assemble ===========================================================
   const colliders = [];
   const disposables = [];
+  const geoBox = new THREE.Box3();          // every piece of park geometry, props excluded
 
   for (const b of build.buckets.values()) {
     if (!b.geos.length) continue;
@@ -1463,6 +1670,7 @@ export async function createPark(ctx) {
     if (b.uvRotate) rotateUV(geo, b.uvRotate);
     geo.computeBoundingSphere();
     geo.computeBoundingBox();
+    geoBox.union(geo.boundingBox);
     const mesh = new THREE.Mesh(geo, b.material);
     mesh.name = `park_${b.name}`;
     mesh.castShadow = b.cast;
@@ -1537,9 +1745,19 @@ export async function createPark(ctx) {
     { name: 'plaza', position: new THREE.Vector3(15, 1.65, -5), yaw: S },
   ];
 
+  // === bounds =============================================================
+  // The out-of-bounds envelope, which must agree with what the geometry does: the
+  // asphalt slab (which runs past the boundary wall on every side) unioned with
+  // the real bounding box of everything built — decks, roll-in platform, bowl
+  // floor and the boundary itself — plus headroom for the biggest air in the park.
   const bounds = new THREE.Box3(
     new THREE.Vector3(LOT.minX, -4.0, LOT.minZ),
     new THREE.Vector3(LOT.maxX, 26.0, LOT.maxZ));
+  if (!geoBox.isEmpty()) {
+    bounds.union(geoBox);
+    bounds.min.y = Math.min(bounds.min.y, geoBox.min.y - 2.5);
+    bounds.max.y = Math.max(bounds.max.y, geoBox.max.y + 14);
+  }
 
   group.updateMatrixWorld(true);
   reseed(0x5eed1e);        // hand the deterministic stream back to main.js

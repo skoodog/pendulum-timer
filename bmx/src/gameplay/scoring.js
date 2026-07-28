@@ -28,11 +28,16 @@
 //
 // Events fired for the HUD and the results screen:
 //   'sessionStart' 'sessionEnd' 'countdown'
-//   'scoreBank' 'scoreLost' 'scoreGap' 'letterCollected' 'objectSmashed'
-//   'goalComplete' 'achievement' 'rankUp' 'specialReady'
+//   'scoreBank' 'scoreLost' 'scoreGap' 'letterCollected' 'collectibleFound'
+//   'objectSmashed' 'goalComplete' 'achievement' 'rankUp' 'specialReady'
+//
+// Collectibles, per the demo scope: FIVE letters spelling B-M-X-E-R placed on the
+// park's real lines (see LETTER_DEFS) and FIVE hidden spray cans tucked off them
+// (see COLLECT_DEFS). Both are per-run sets with their own goal; the goal's
+// completion persists in the profile, the pickups themselves reset every run.
 //
 // Allocation policy: fixedUpdate() allocates nothing. Combo slots, leaderboard rows,
-// goal records and the letter/smashable pickups are all pooled up front. The only
+// goal records and the letter/can/smashable pickups are all pooled up front. The only
 // runtime objects are the small detail payloads on discrete events (a few per second)
 // and the HUD strings, which are rebuilt on change, never per frame.
 
@@ -76,7 +81,12 @@ export const SCORE_TUNE = {
   specialScore: 2.0,         // score multiplier on tricks thrown while armed
 
   // pickups / smashables
-  letterRadius: 1.7,         // m pickup radius on the B-M-X letters
+  letterRadius: 1.55,        // m pickup radius on the B-M-X-E-R letters
+  letterPoints: 500,         // per letter
+  letterSetBonus: 5000,      // for the whole word
+  collectRadius: 1.35,       // m pickup radius on the hidden spray cans
+  collectPoints: 750,        // per hidden can
+  collectSetBonus: 7500,     // for finding all five
   smashRadius: 0.95,         // m
   smashMinSpeed: 2.6,        // m/s needed to actually break something
   smashPoints: 500,
@@ -87,20 +97,32 @@ export const SCORE_TUNE = {
 
 const T = SCORE_TUNE;
 const STORE_KEY = 'mirracity.profile.v2';
-const STORE_VERSION = 2;
+// v3 added totals.hidden and swapped the `combo25k` goal id for `hidden`. The key is
+// deliberately unchanged: loadProfile() salvages any older payload field by field, so
+// a v2 profile keeps its high scores, achievements, gaps and landed tricks.
+const STORE_VERSION = 3;
 
 // ---------------------------------------------------------------------------
 // Static data
 // ---------------------------------------------------------------------------
 
-/** Invented rivals — no real riders, no real events, no real brands. */
+/**
+ * Invented rivals — no real riders, no real events, no real brands.
+ *
+ * The HUD board is FIVE rows and the player owns one of them, so there are four
+ * rivals: the ranks the player reads are always 1..5 with no gap in the column and
+ * no phantom sixth place. The ladder is spaced for a 2:00 run — the bottom rung
+ * falls to a couple of decent lines, the top one takes a run that actually flows.
+ */
 const RIVALS = [
-  { name: 'Vance Corado', score: 150000 },
-  { name: 'Dez Mallory', score: 100000 },
-  { name: 'Kai Brenner', score: 85000 },
-  { name: 'Rook Deloso', score: 75000 },
-  { name: 'Tobi Vance', score: 60000 },
+  { name: 'Vance Corado', score: 165000 },
+  { name: 'Dez Mallory', score: 112000 },
+  { name: 'Kai Brenner', score: 74000 },
+  { name: 'Rook Deloso', score: 38000 },
 ];
+
+/** Rows in the competition table: the rivals plus the player. */
+const BOARD_ROWS = RIVALS.length + 1;
 
 /**
  * Named gap volumes, derived by hand from the City Lot layout in park.js
@@ -137,11 +159,43 @@ const GAP_DEFS = [
     min: [33.0, 1.20, -33.0], max: [49.0, 6.0, -19.0] },
 ];
 
-/** B-M-X letter pickups, placed on the main lines so they read as targets. */
+/**
+ * B-M-X-E-R letter pickups. Every position is authored off real park.js geometry
+ * (spawns, rail curves and the surface heights under them, all read back out of the
+ * built level) so nothing floats in a place the rider cannot get to, and nothing is
+ * buried inside a ramp. One per skill:
+ *
+ *   B  easy      — the run-out from the roll-in, at head height on the main line.
+ *   M  rail      — over the funbox flat rail (rail curve x=2.2, y=1.34, z -10.6..-1.4).
+ *   X  air       — out over the 3.6 m quarterpipe lip (coping y=3.62 at z=-35.58);
+ *                  a measured full-speed boost peaks around y=4.5 there, and the
+ *                  pickup only opens from y≈3.85 up, so it wants a real transfer of
+ *                  speed into height, not a roll up the transition.
+ *   E  gap       — hanging in the Plaza Stair Gap past the bottom step, where the
+ *                  stairs have already dropped away: you clear the set or you miss.
+ *   R  tucked    — the deep end of the bowl (floor y=-2.74), out of sight from the
+ *                  lot; you have to drop in and carry enough speed to get back out.
+ */
 const LETTER_DEFS = [
-  { id: 'B', pos: [0.0, 2.05, -6.0] },      // above the funbox deck
-  { id: 'M', pos: [14.0, 3.05, 3.4] },      // out over the plaza stair set
-  { id: 'X', pos: [47.0, 3.45, 19.6] },     // over the first dirt double
+  { id: 'B', pos: [0.0, 1.25, 16.5] },
+  { id: 'M', pos: [2.2, 2.20, -6.0] },
+  { id: 'X', pos: [-17.0, 6.00, -36.4] },
+  { id: 'E', pos: [14.3, 2.50, 5.0] },
+  { id: 'R', pos: [-30.0, -1.55, -14.0] },
+];
+
+/**
+ * The five hidden items: spray cans stashed in the pockets of the lot nobody rides
+ * through by accident. Each one sits on flat ground that was raycast out of the
+ * built park (all five columns are open to the sky, so none can be buried), but all
+ * five are off every line in the place — you go looking, or you never see them.
+ */
+const COLLECT_DEFS = [
+  { id: 'can_ramps', name: 'Behind the Quarterpipes', pos: [-17.0, 0.62, -43.0] },
+  { id: 'can_alley', name: 'Wallride Alley', pos: [26.8, 0.62, -26.0] },
+  { id: 'can_mini', name: 'Mini Ramp Corner', pos: [-48.0, 0.62, 20.0] },
+  { id: 'can_berm', name: 'Behind the Berm', pos: [52.0, 0.55, -30.0] },
+  { id: 'can_rollin', name: 'Under the Roll-In', pos: [0.0, 0.62, 30.2] },
 ];
 
 /** Cheap breakables scattered on the flat run-ups. */
@@ -158,12 +212,12 @@ const GOAL_DEFS = [
   { id: 'score_am', text: 'Score 50,000', target: 50000, kind: 'score' },
   { id: 'score_pro', text: 'Score 150,000', target: 150000, kind: 'score' },
   { id: 'score_sick', text: 'Score 400,000', target: 400000, kind: 'score' },
-  { id: 'letters', text: 'Collect B – M – X', target: 3, kind: 'count' },
+  { id: 'letters', text: 'Collect B – M – X – E – R', target: 5, kind: 'count' },
+  { id: 'hidden', text: 'Find the 5 Hidden Spray Cans', target: 5, kind: 'count' },
   { id: 'smash', text: 'Smash 5 Objects', target: 5, kind: 'count' },
   { id: 'gap', text: 'Clear the Plaza Stair Gap', target: 1, kind: 'flag' },
   { id: 'backflip', text: 'Backflip a Dirt Double', target: 1, kind: 'flag' },
   { id: 'grind5', text: 'Hold a 5.0s Grind', target: 1, kind: 'flag' },
-  { id: 'combo25k', text: 'Land a 25,000 Point Combo', target: 1, kind: 'flag' },
 ];
 
 const ACHIEVEMENT_DEFS = [
@@ -172,7 +226,8 @@ const ACHIEVEMENT_DEFS = [
   { id: 'ach_combo20', name: 'Chain Gang', desc: 'Land a 20-trick combo' },
   { id: 'ach_grind10', name: 'Rail Rider', desc: 'Hold a grind for 10 seconds' },
   { id: 'ach_allgrinds', name: 'Peg Collection', desc: 'Land every grind type' },
-  { id: 'ach_letters', name: 'Alphabet Soup', desc: 'Collect B, M and X in one run' },
+  { id: 'ach_letters', name: 'Alphabet Soup', desc: 'Spell B-M-X-E-R in one run' },
+  { id: 'ach_hidden', name: 'Tag Hunter', desc: 'Find all five hidden spray cans' },
   { id: 'ach_air5', name: 'Skyscraper', desc: 'Boost 5 metres out of a transition' },
   { id: 'ach_bail25', name: 'Concrete Burn', desc: 'Bail 25 times' },
   { id: 'ach_perfect10', name: 'Butter', desc: 'Stomp 10 perfect landings in a row' },
@@ -212,8 +267,9 @@ function glyphBar(list, sx, sy, sz, px, py, rz) {
 }
 
 /**
- * Blocky B / M / X built out of merged boxes — one draw call each, and they read
- * clean in silhouette from any angle, which matters more than letterform fidelity.
+ * Blocky B / M / X / E / R built out of merged boxes — one draw call each, and they
+ * read clean in silhouette from any angle, which matters more than letterform
+ * fidelity. Anything unrecognised falls back to the X cross.
  */
 function glyphGeometry(char, h) {
   const w = h * 0.62;
@@ -232,12 +288,42 @@ function glyphGeometry(char, h) {
     glyphBar(parts, t, h, d, w * 0.5 - t * 0.5, 0, 0);
     glyphBar(parts, t, h * 0.66, d, -w * 0.22, h * 0.16, 0.62);
     glyphBar(parts, t, h * 0.66, d, w * 0.22, h * 0.16, -0.62);
+  } else if (char === 'E') {
+    glyphBar(parts, t, h, d, -w * 0.5 + t * 0.5, 0, 0);
+    glyphBar(parts, w - t, t, d, t * 0.5, h * 0.5 - t * 0.5, 0);
+    glyphBar(parts, w - t * 1.7, t, d, t * 0.15, 0, 0);
+    glyphBar(parts, w - t, t, d, t * 0.5, -h * 0.5 + t * 0.5, 0);
+  } else if (char === 'R') {
+    glyphBar(parts, t, h, d, -w * 0.5 + t * 0.5, 0, 0);
+    glyphBar(parts, w - t, t, d, t * 0.5, h * 0.5 - t * 0.5, 0);
+    glyphBar(parts, w - t, t, d, t * 0.5, h * 0.04, 0);
+    glyphBar(parts, t, h * 0.46 - t, d, w * 0.5 - t * 0.5, h * 0.27, 0);
+    glyphBar(parts, t, h * 0.60, d, w * 0.14, -h * 0.26, -0.52);
   } else {
     glyphBar(parts, t, h * 1.12, d, 0, 0, 0.52);
     glyphBar(parts, t, h * 1.12, d, 0, 0, -0.52);
   }
   const merged = parts.length > 1 ? mergeGeometries(parts, false) : parts[0];
   if (parts.length > 1) for (let i = 0; i < parts.length; i++) parts[i].dispose();
+  merged.computeBoundingSphere();
+  return merged;
+}
+
+/**
+ * A spray can for the hidden set: body, shoulder, cap and nozzle merged into one
+ * geometry that every can instance shares. Small, but it spins and glows, so it
+ * still reads the moment it comes into view in a dark corner of the lot.
+ */
+function sprayCanGeometry() {
+  const parts = [];
+  const m = new THREE.Matrix4();
+  const push = (geo, y) => { m.makeTranslation(0, y, 0); geo.applyMatrix4(m); parts.push(geo); };
+  push(new THREE.CylinderGeometry(0.078, 0.078, 0.245, 14, 1), 0);
+  push(new THREE.CylinderGeometry(0.056, 0.078, 0.046, 14, 1), 0.145);
+  push(new THREE.CylinderGeometry(0.054, 0.054, 0.052, 12, 1), 0.194);
+  push(new THREE.BoxGeometry(0.036, 0.022, 0.036), 0.231);
+  const merged = mergeGeometries(parts, false);
+  for (let i = 0; i < parts.length; i++) parts[i].dispose();
   merged.computeBoundingSphere();
   return merged;
 }
@@ -251,7 +337,7 @@ function blankProfile() {
     v: STORE_VERSION,
     scores: [],            // top 5: { score, date, tricks, combo, goals, rank }
     best: { score: 0, combo: 0, grind: 0, air: 0, tricks: 0, goals: 0 },
-    totals: { runs: 0, bails: 0, smashes: 0, letters: 0, flips: 0 },
+    totals: { runs: 0, bails: 0, smashes: 0, letters: 0, hidden: 0, flips: 0 },
     achievements: [],
     goals: [],
     gaps: [],
@@ -275,7 +361,7 @@ function loadProfile() {
     for (let i = 0; i < data.scores.length && fresh.scores.length < 5; i++) {
       const s = data.scores[i];
       if (typeof s === 'number' && Number.isFinite(s)) {
-        fresh.scores.push({ score: Math.max(0, Math.round(s)), date: '', tricks: 0, combo: 0, goals: 0, rank: 6 });
+        fresh.scores.push({ score: Math.max(0, Math.round(s)), date: '', tricks: 0, combo: 0, goals: 0, rank: BOARD_ROWS });
       } else if (s && typeof s.score === 'number' && Number.isFinite(s.score)) {
         fresh.scores.push({
           score: Math.max(0, Math.round(s.score)),
@@ -283,7 +369,8 @@ function loadProfile() {
           tricks: Number(s.tricks) || 0,
           combo: Number(s.combo) || 0,
           goals: Number(s.goals) || 0,
-          rank: Number(s.rank) || 6,
+          // v2 stored ranks against a six-row board; clamp them into the five-row one.
+          rank: clamp(Math.round(Number(s.rank)) || BOARD_ROWS, 1, BOARD_ROWS),
         });
       }
     }
@@ -366,10 +453,14 @@ export function createScoring(ctx) {
     color: 0xffc63a, emissive: 0xff8a18, emissiveIntensity: 1.9,
     metalness: 0.35, roughness: 0.30,
   });
+  const canMat = new THREE.MeshStandardMaterial({
+    color: 0x2fd7a4, emissive: 0x14b57c, emissiveIntensity: 1.5,
+    metalness: 0.70, roughness: 0.28,
+  });
   const coneMat = new THREE.MeshStandardMaterial({ color: 0xff5a1e, roughness: 0.62, metalness: 0.0 });
   const bandMat = new THREE.MeshStandardMaterial({ color: 0xe8e4da, roughness: 0.75, metalness: 0.0 });
   const crateMat = new THREE.MeshStandardMaterial({ color: 0x8a6134, roughness: 0.88, metalness: 0.0 });
-  disposables.push(letterMat, coneMat, bandMat, crateMat);
+  disposables.push(letterMat, canMat, coneMat, bandMat, crateMat);
 
   const letters = new Array(LETTER_DEFS.length);
   for (let i = 0; i < LETTER_DEFS.length; i++) {
@@ -386,6 +477,26 @@ export function createScoring(ctx) {
       id: d.id, char: d.id, mesh,
       x: d.pos[0], y: d.pos[1], z: d.pos[2],
       got: false, phase: i * 2.1, pop: 0,
+    };
+  }
+
+  // The hidden set: one shared geometry + material, five meshes, no instancing
+  // needed at this count and each can keeps its own spin/bob/pop.
+  const canGeo = sprayCanGeometry();
+  disposables.push(canGeo);
+  const collectibles = new Array(COLLECT_DEFS.length);
+  for (let i = 0; i < COLLECT_DEFS.length; i++) {
+    const d = COLLECT_DEFS[i];
+    const mesh = new THREE.Mesh(canGeo, canMat);
+    mesh.name = `hidden_${d.id}`;
+    mesh.position.set(d.pos[0], d.pos[1], d.pos[2]);
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    group.add(mesh);
+    collectibles[i] = {
+      id: d.id, name: d.name, kind: 'sprayCan', mesh,
+      x: d.pos[0], y: d.pos[1], z: d.pos[2],
+      got: false, phase: i * 1.37, pop: 0,
     };
   }
 
@@ -453,14 +564,17 @@ export function createScoring(ctx) {
 
   // ---------------------------------------------------------------- leaderboard
 
-  const board = new Array(RIVALS.length + 1);
+  // Four rivals + the player = the five rows the HUD draws. Because the player IS
+  // one of the rows, the rank column is always the contiguous 1..5 and the player's
+  // number is their real position — no sixth place under a five-row table.
+  const board = new Array(BOARD_ROWS);
   for (let i = 0; i < RIVALS.length; i++) {
     board[i] = { name: RIVALS[i].name, score: RIVALS[i].score, target: RIVALS[i].score, isPlayer: false, rank: i + 1 };
   }
-  const playerRow = { name: 'PLAYER', score: 0, target: 0, isPlayer: true, rank: board.length };
+  const playerRow = { name: 'PLAYER', score: 0, target: 0, isPlayer: true, rank: BOARD_ROWS };
   board[RIVALS.length] = playerRow;
-  const boardView = new Array(5);
-  for (let i = 0; i < 5; i++) boardView[i] = board[i];
+  const boardView = new Array(BOARD_ROWS);
+  for (let i = 0; i < BOARD_ROWS; i++) boardView[i] = board[i];
 
   // ---------------------------------------------------------------- run state
 
@@ -471,7 +585,7 @@ export function createScoring(ctx) {
 
   const stats = {
     score: 0, bestCombo: 0, bestComboTricks: 0, longestGrind: 0, biggestAir: 0,
-    tricksLanded: 0, bails: 0, gaps: 0, letters: 0, smashes: 0,
+    tricksLanded: 0, bails: 0, gaps: 0, letters: 0, hidden: 0, smashes: 0,
     goalsCompleted: 0, bestMultiplier: 0, longestManual: 0, perfectStreak: 0,
     bestPerfectStreak: 0, flips: 0,
   };
@@ -502,9 +616,10 @@ export function createScoring(ctx) {
     landQuality: 1,
     landLabel: '',
 
-    rank: board.length,
+    rank: BOARD_ROWS,
     leaderboard: board,
     boardView,
+    boardRows: BOARD_ROWS,
 
     goals,
     goalsDone: 0,
@@ -516,6 +631,9 @@ export function createScoring(ctx) {
     letters,
     lettersCollected: 0,
     lettersTotal: letters.length,
+    collectibles,
+    collectiblesFound: 0,
+    collectiblesTotal: collectibles.length,
     smashables,
     smashed: 0,
     smashTotal: smashables.length,
@@ -718,7 +836,7 @@ export function createScoring(ctx) {
 
   function sortBoard() {
     playerRow.score = api.score;
-    // insertion sort over 6 rows — stable, in place, zero allocation
+    // insertion sort over the five rows — stable, in place, zero allocation
     for (let i = 1; i < board.length; i++) {
       const row = board[i];
       let j = i - 1;
@@ -741,14 +859,10 @@ export function createScoring(ctx) {
     }
     api.rank = rank;
 
-    // Five-row window for the reference HUD: the leaders, with the player's row
-    // always present — pushed into the bottom slot while they are still climbing.
-    if (rank <= 5) {
-      for (let i = 0; i < 5; i++) boardView[i] = board[i];
-    } else {
-      for (let i = 0; i < 4; i++) boardView[i] = board[i];
-      boardView[4] = playerRow;
-    }
+    // The reference HUD draws five rows and the table IS five rows, so the view is
+    // the board: ranks read 1,2,3,4,5 top to bottom with the player sitting in the
+    // slot they have actually earned, moving up a row each time they pass a rival.
+    for (let i = 0; i < board.length; i++) boardView[i] = board[i];
   }
 
   // ---------------------------------------------------------------- banking
@@ -792,7 +906,6 @@ export function createScoring(ctx) {
     });
     audio('bank', { points: gained });
 
-    if (gained >= 25000) setGoalProgress('combo25k', 1);
     setGoalProgress('score_am', api.score);
     setGoalProgress('score_pro', api.score);
     setGoalProgress('score_sick', api.score);
@@ -979,23 +1092,40 @@ export function createScoring(ctx) {
     }
   }
 
-  function updateLetters(fdt, st) {
+  /**
+   * Pickup points. Inside a live combo they ride the multiplier like a gap or a
+   * smash does (blank id, so the falloff table and the trick list stay clean);
+   * standing still on the flat they just bank.
+   */
+  function awardPickup(points, label) {
+    const p = Math.round(Number(points) || 0);
+    if (p <= 0) return;
+    if (slotCount > 0) pushSlot(null, '', label, p, true);
+    else { api.score += p; stats.score = api.score; sortBoard(); }
+  }
+
+  /** Spin/bob a live pickup, or run the collected pop-out. Returns true if live. */
+  function animatePickup(P, fdt, spin, bob) {
+    if (P.got) {
+      if (P.pop > 0) {
+        P.pop = Math.max(0, P.pop - fdt * 2.4);
+        P.mesh.scale.setScalar(1 + (1 - P.pop) * 1.6);
+        P.mesh.position.y = P.y + (1 - P.pop) * 1.1;
+        if (P.pop <= 0) P.mesh.visible = false;
+      }
+      return false;
+    }
+    P.phase += fdt;
+    P.mesh.rotation.y += fdt * spin;
+    P.mesh.position.y = P.y + Math.sin(P.phase * 2.3) * bob;
+    return true;
+  }
+
+  function updateLetters(fdt, st, live) {
     const p = st.position;
     for (let i = 0; i < letters.length; i++) {
       const L = letters[i];
-      if (L.got) {
-        if (L.pop > 0) {
-          L.pop = Math.max(0, L.pop - fdt * 2.4);
-          const s = 1 + (1 - L.pop) * 1.6;
-          L.mesh.scale.setScalar(s);
-          L.mesh.position.y = L.y + (1 - L.pop) * 1.1;
-          if (L.pop <= 0) L.mesh.visible = false;
-        }
-        continue;
-      }
-      L.phase += fdt;
-      L.mesh.rotation.y += fdt * 1.9;
-      L.mesh.position.y = L.y + Math.sin(L.phase * 2.3) * 0.13;
+      if (!animatePickup(L, fdt, 1.9, 0.13) || !live) continue;
       const dx = p.x - L.x, dy = p.y + 0.6 - L.mesh.position.y, dz = p.z - L.z;
       if (dx * dx + dy * dy + dz * dz > T.letterRadius * T.letterRadius) continue;
       collectLetter(L);
@@ -1009,15 +1139,58 @@ export function createScoring(ctx) {
     api.lettersCollected = stats.letters;
     profile.totals.letters++;
     queueSave();
-    setGoalProgress('letters', stats.letters);
+    const whole = stats.letters >= letters.length;
+    awardPickup(T.letterPoints, 'Letter ' + L.char);
     _v.set(L.x, L.mesh.position.y, L.z);
     _dir.set(0, 1, 0);
     ctx.fx?.spark?.(_v, _dir, 22, 1.2);
-    ctx.fx?.flash?.(0.10);
-    ctx.fx?.shake?.(0.045);
+    ctx.fx?.flash?.(whole ? 0.16 : 0.10);
+    ctx.fx?.shake?.(whole ? 0.07 : 0.045);
     emit('letterCollected', { id: L.id, collected: stats.letters, total: letters.length });
     audio('letter', { id: L.id });
-    if (stats.letters >= letters.length) unlock('ach_letters');
+    if (whole) {
+      awardPickup(T.letterSetBonus, 'B-M-X-E-R');
+      unlock('ach_letters');
+    }
+    // Last, so the goal's completion event lands after the points it paid out.
+    setGoalProgress('letters', stats.letters);
+  }
+
+  function updateCollectibles(fdt, st, live) {
+    const p = st.position;
+    for (let i = 0; i < collectibles.length; i++) {
+      const C = collectibles[i];
+      if (!animatePickup(C, fdt, 2.6, 0.09) || !live) continue;
+      const dx = p.x - C.x, dy = p.y + 0.6 - C.mesh.position.y, dz = p.z - C.z;
+      if (dx * dx + dy * dy + dz * dz > T.collectRadius * T.collectRadius) continue;
+      collectHidden(C);
+    }
+  }
+
+  function collectHidden(C) {
+    C.got = true;
+    C.pop = 1;
+    stats.hidden++;
+    api.collectiblesFound = stats.hidden;
+    profile.totals.hidden++;
+    queueSave();
+    const whole = stats.hidden >= collectibles.length;
+    awardPickup(T.collectPoints, 'Hidden Can');
+    _v.set(C.x, C.mesh.position.y, C.z);
+    _dir.set(0, 1, 0);
+    ctx.fx?.spark?.(_v, _dir, 26, 1.1);
+    ctx.fx?.flash?.(whole ? 0.16 : 0.11);
+    ctx.fx?.shake?.(whole ? 0.07 : 0.05);
+    emit('collectibleFound', {
+      id: C.id, name: C.name, kind: C.kind,
+      found: stats.hidden, total: collectibles.length,
+    });
+    audio('collectible', { id: C.id });
+    if (whole) {
+      awardPickup(T.collectSetBonus, 'All Five Cans');
+      unlock('ach_hidden');
+    }
+    setGoalProgress('hidden', stats.hidden);
   }
 
   function updateSmashables(st) {
@@ -1126,7 +1299,11 @@ export function createScoring(ctx) {
       bails: stats.bails,
       gaps: stats.gaps,
       letters: stats.letters,
+      lettersTotal: letters.length,
+      collectibles: stats.hidden,
+      collectiblesTotal: collectibles.length,
       smashes: stats.smashes,
+      smashTotal: smashables.length,
       goalsCompleted: api.goalsDone,
       goalsTotal: goals.length,
       goals,
@@ -1158,7 +1335,7 @@ export function createScoring(ctx) {
     api.gapFlash.name = '';
     api.gapFlash.time = 0;
     api.gapFlash.alpha = 0;
-    api.rank = board.length;
+    api.rank = BOARD_ROWS;
     countdownMark = -1;
     lastSecond = -1;
     airDirtGap = false;
@@ -1171,12 +1348,21 @@ export function createScoring(ctx) {
     for (let i = 0; i < gaps.length; i++) {
       gaps[i].inside = false; gaps[i].comboMark = -1; gaps[i].clearedThisRun = false;
     }
+    // Both pickup sets are per-run: the meshes come back for every session while the
+    // goals' `everDone` flags (and the profile totals) keep what the player has done.
     for (let i = 0; i < letters.length; i++) {
       const L = letters[i];
       L.got = false; L.pop = 0;
       L.mesh.visible = true;
       L.mesh.scale.setScalar(1);
       L.mesh.position.set(L.x, L.y, L.z);
+    }
+    for (let i = 0; i < collectibles.length; i++) {
+      const C = collectibles[i];
+      C.got = false; C.pop = 0;
+      C.mesh.visible = true;
+      C.mesh.scale.setScalar(1);
+      C.mesh.position.set(C.x, C.y, C.z);
     }
     for (let i = 0; i < smashables.length; i++) {
       smashables[i].smashed = false;
@@ -1185,12 +1371,13 @@ export function createScoring(ctx) {
     for (let i = 0; i < goals.length; i++) { goals[i].progress = 0; goals[i].done = false; }
     api.goalsDone = 0;
     api.lettersCollected = 0;
+    api.collectiblesFound = 0;
     api.smashed = 0;
     api.gapsCleared = 0;
 
     stats.score = 0; stats.bestCombo = 0; stats.bestComboTricks = 0;
     stats.longestGrind = 0; stats.biggestAir = 0; stats.tricksLanded = 0;
-    stats.bails = 0; stats.gaps = 0; stats.letters = 0; stats.smashes = 0;
+    stats.bails = 0; stats.gaps = 0; stats.letters = 0; stats.hidden = 0; stats.smashes = 0;
     stats.goalsCompleted = 0; stats.bestMultiplier = 0; stats.longestManual = 0;
     stats.perfectStreak = 0; stats.flips = 0;
 
@@ -1305,14 +1492,16 @@ export function createScoring(ctx) {
     }
 
     // --- world interactions --------------------------------------------------
-    if (api.phase !== 'results') {
+    const live = api.phase !== 'results';
+    if (live) {
       updateGaps(st);
-      updateLetters(fdt, st);
       updateSmashables(st);
       if (airDirtGap && mode === 'air') checkDirtBackflip();
-    } else {
-      updateLetters(fdt, st);
     }
+    // The pickups keep animating on the results screen so a pop-out that was still
+    // playing when the clock hit zero finishes cleanly; they just cannot be taken.
+    updateLetters(fdt, st, live);
+    updateCollectibles(fdt, st, live);
 
     // --- live readouts -------------------------------------------------------
     if (slotCount > 0) recount();
@@ -1416,7 +1605,7 @@ export function createScoring(ctx) {
   // Initial state so the HUD has something sane on frame 0.
   api.timeText = formatTime(T.sessionTime);
   sortBoard();
-  api.rank = board.length;
+  api.rank = BOARD_ROWS;
 
   return api;
 }

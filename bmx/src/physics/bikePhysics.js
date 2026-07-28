@@ -39,11 +39,11 @@ export const TUNING = {
   gravity: 17.5,            // m/s² — lower than real life so airs float like DMFBMX2 (0.9 m hop off flat)
   maxSpeed: 14.0,           // m/s target top speed on flat concrete
   speedHardCap: 24.0,       // m/s absolute clamp — a long drop-in cannot run away with the sim
-  pedalAccel: 9.5,         // m/s² pedal thrust — held nearly flat through the midrange by pedalFalloff
-  pedalFalloff: 4.0,        // exponent of the accel roll-off: high keeps thrust flat, then it dies near the top
-  pedalTopFactor: 1.04,     // the pedal curve dies at maxSpeed×this — the curve, not drag, sets the ceiling
-  coastDrag: 0.006,         // quadratic drag while rolling — deliberately low so transitions keep their energy
-  rollResist: 0.18,         // m/s² constant rolling drag, scaled by surface friction — dirt drags, concrete rolls
+  pedalAccel: 3.55,         // m/s² pedal thrust off the line — a standing sprint, not a dragster launch
+  pedalFalloff: 1.25,       // exponent of the accel roll-off: near-linear, so thrust bleeds away all the way up
+  pedalTopFactor: 1.22,     // the pedal curve dies at maxSpeed×this — the curve, not drag, sets the ceiling
+  coastDrag: 0.0034,        // quadratic drag while rolling — deliberately low so transitions keep their energy
+  rollResist: 0.11,         // m/s² constant rolling drag, scaled by surface friction — dirt drags, concrete rolls
   brakeDecel: 13.5,         // m/s² rear brake authority
   lockupBrake: 0.55,        // brake input above this locks the rear wheel into a skid
   skidMinSpeed: 2.6,        // m/s below which a locked wheel just stops instead of skidding
@@ -109,8 +109,12 @@ export const TUNING = {
   manualMinSpeed: 1.6,      // m/s needed to pull into a manual
   manualPitch: 0.42,        // rad (24°) nose-up angle of a centred manual
   manualPitchRange: 0.20,   // rad extra pitch swing as the balance meter travels
+  manualRise: 9.0,          // 1/s the nose comes up (and drops back) — the chassis pitch and the
+                            //     contact height ride this one blend, so the wheel never leaves the
+                            //     ground on the frame that the manual starts
   balanceGravity: 4.2,      // 1/s² inverted-pendulum divergence — untouched, a manual falls in ~1.5 s
-  balanceInput: 4.2,        // 1/s² authority of input.lean — can save the meter up to about |0.9|
+  balanceInput: 3.1,        // 1/s² authority of input.lean — can save the meter up to about |0.9|,
+                            //     and a stick pinned to one end takes ~0.8 s to loop you out
   balanceDamp: 1.6,         // 1/s damping on the balance rate — makes the correction land instead of oscillating
   balanceSpeedAid: 0.45,    // fraction of the divergence removed at top speed — fast manuals are easier
   balanceDrift: 0.8,        // 1/s² amplitude of the deterministic wobble that keeps the meter alive
@@ -293,6 +297,13 @@ export function createBikePhysics(ctx) {
 
   let prevHop = false;
   let prevManual = false;
+  // The manual is an intent, not an instant: pressing arms it, holding keeps it armed
+  // across bumps and hops, and only releasing (or looping out) disarms it.
+  let manualArmed = false;
+  let manualBlocked = false;                 // set when the balance ran out; cleared on release
+  let manualBlend = 0;                       // 0..1 how far the nose has come up
+  let manualSign = 0;                        // +1 manual, -1 nose manual — outlives manualType so
+                                             //   the nose can settle back down instead of snapping
   let prevReset = false;
   let prevSteer = 0;
   let hopHoldTime = 0;
@@ -399,7 +410,7 @@ export function createBikePhysics(ctx) {
 
     // Contact-fitted pitch: the flat heading has unit length in XZ, so the rise over
     // the wheelbase is exactly the tangent of the pitch angle.
-    if (state.manualType === null && probeF.usable && probeR.usable &&
+    if (!manualPivoting() && probeF.usable && probeR.usable &&
         Math.abs(probeF.perp) < T.contactBand && Math.abs(probeR.perp) < T.contactBand) {
       _fwd.y = clamp((probeF.point.y - probeR.point.y) / T.wheelBase, -1.7, 1.7);
       _fwd.normalize();
@@ -468,15 +479,19 @@ export function createBikePhysics(ctx) {
     return out;
   }
 
+  /**
+   * Nose-up angle of the chassis, scaled by how far into the manual we are. Both the
+   * visual pitch and the contact height read this one function, so the wheel that is
+   * still on the ground stays on the ground while the nose comes up and goes back down.
+   */
   function manualPitchAngle() {
-    if (state.manualType === 'manual') {
-      return T.manualPitch + state.balance * T.manualPitchRange;
-    }
-    if (state.manualType === 'nose') {
-      return -(T.manualPitch + state.balance * T.manualPitchRange) * 0.85;
-    }
-    return 0;
+    if (manualSign === 0 || manualBlend < 1e-4) return 0;
+    const a = (T.manualPitch + state.balance * T.manualPitchRange) * manualBlend;
+    return manualSign > 0 ? a : -a * 0.85;
   }
+
+  /** True while the chassis is pitched far enough for one wheel to own the contact. */
+  function manualPivoting() { return manualSign !== 0 && manualBlend > 0.02; }
 
   /**
    * Flatten the velocity into a surface plane. A rolling wheel following a curved
@@ -806,9 +821,16 @@ export function createBikePhysics(ctx) {
     const pressed = held && !prevManual;
     prevManual = held;
 
+    // Arming is an edge, staying armed is a hold. Keeping the intent alive across a
+    // bump, a hop or a whole air is what lets a manual survive the ground going away
+    // under it — you land straight back into it instead of having to re-tap.
+    if (pressed) manualArmed = true;
+    if (!held) { manualArmed = false; manualBlocked = false; }
+
     if (state.manualType === null) {
-      if (pressed && state.grounded && state.speed > T.manualMinSpeed) {
+      if (manualArmed && !manualBlocked && state.grounded && state.speed > T.manualMinSpeed) {
         state.manualType = inp.lean < -0.3 ? 'nose' : 'manual';
+        manualSign = state.manualType === 'nose' ? -1 : 1;
         // Seed off-centre (which way depends on the wobble at that instant) so the
         // pendulum actually has something to diverge from.
         state.balance = T.balanceSeed * (wobble() >= 0 ? 1 : -1);
@@ -845,6 +867,10 @@ export function createBikePhysics(ctx) {
       if (state.balance > cap) { state.balance = cap; if (balanceVel > 0) balanceVel = 0; }
       else if (state.balance < -cap) { state.balance = -cap; if (balanceVel < 0) balanceVel = 0; }
     } else if (Math.abs(state.balance) >= T.balanceBailAt) {
+      // Running out of balance costs you the manual for as long as the button is down:
+      // you have to let go and pull back in again, so a blown manual is still a mistake.
+      manualBlocked = true;
+      manualArmed = false;
       bail(state.manualType === 'nose' ? 'nosedive' : 'looped');
     }
   }
@@ -863,10 +889,14 @@ export function createBikePhysics(ctx) {
     const half = T.wheelBase * 0.5;
 
     let y = NaN;
-    if (state.manualType === 'manual' && rUse) {
-      y = probeR.point.y + Math.sin(Math.abs(manualPitchAngle())) * half;
-    } else if (state.manualType === 'nose' && fUse) {
-      y = probeF.point.y + Math.sin(Math.abs(manualPitchAngle())) * half;
+    // The lift tracks manualBlend, so it is zero on the frame the manual starts and
+    // walks back to zero as the nose comes down — no step in the contact height either
+    // way, which is what used to throw the bike into the air the instant it pivoted.
+    const lift = Math.sin(Math.abs(manualPitchAngle())) * half;
+    if (manualPivoting() && manualSign > 0 && rUse) {
+      y = probeR.point.y + lift;
+    } else if (manualPivoting() && manualSign < 0 && fUse) {
+      y = probeF.point.y + lift;
     } else if (fUse && rUse) {
       // Both wheels down: the frame rides the chord between the contacts, lifted back
       // up by the centre probe over a convex crest.
@@ -1432,6 +1462,10 @@ export function createBikePhysics(ctx) {
   // -------------------------------------------------------------- derived
 
   function updateDerived(fdt) {
+    // The nose rises and falls on a blend rather than a switch, so the manual pitch and
+    // the contact height it implies are always consistent with each other.
+    manualBlend = damp(manualBlend, state.manualType ? 1 : 0, T.manualRise, fdt);
+    if (state.manualType === null && manualBlend < 1e-3) { manualBlend = 0; manualSign = 0; }
     bodyAxes();
     state.forward.copy(_fwd);
     state.up.copy(_up);
@@ -1558,6 +1592,10 @@ export function createBikePhysics(ctx) {
       trickInput.set(0, 0, 0);
       bailSpin.set(0, 0, 0);
       balanceVel = 0;
+      manualArmed = false;
+      manualBlocked = false;
+      manualBlend = 0;
+      manualSign = 0;
       hopHoldTime = 0;
       stallTimer = 0;
       wallCooldown = 0;
