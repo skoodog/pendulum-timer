@@ -219,17 +219,23 @@ const CSS = `
   border:0; padding:0; cursor:pointer; text-align:left; -webkit-appearance:none; appearance:none;
 }
 .scr-root button:focus{outline:none;}
-.scr-root button:focus-visible{outline:2px solid var(--accent); outline-offset:2px;}
+.scr-root button:focus-visible{outline:2px solid var(--gold2); outline-offset:0;}
 
 /* --- blur veil (pause) --------------------------------------------------- */
+/* The filter only exists while the veil is up: a full-screen backdrop-filter is
+   the single most expensive thing this file can ask the compositor for. */
 .scr-veil{
   position:absolute; inset:0; opacity:0; pointer-events:none;
+  visibility:hidden;
   background:rgba(4,6,10,.42);
+  transition:opacity 280ms ease, visibility 0s linear 280ms;
+}
+.scr-veil.is-on{
+  opacity:1; visibility:visible;
   backdrop-filter:blur(13px) saturate(.82) brightness(.62);
   -webkit-backdrop-filter:blur(13px) saturate(.82) brightness(.62);
-  transition:opacity 280ms ease;
+  transition:opacity 280ms ease, visibility 0s;
 }
-.scr-veil.is-on{opacity:1;}
 
 /* --- screen shell -------------------------------------------------------- */
 .scr-screen{
@@ -246,15 +252,17 @@ const CSS = `
 .scr-screen.no-hit{pointer-events:none !important;}
 .scr-scrim{position:absolute; inset:0; pointer-events:none;}
 .scr-scrim.soft{
-  background:linear-gradient(180deg, rgba(3,5,9,.80) 0%, rgba(3,5,9,.30) 34%,
-    rgba(3,5,9,.34) 62%, rgba(3,5,9,.86) 100%);
+  background:
+    radial-gradient(72% 56% at 50% 56%, rgba(3,5,9,.58), rgba(3,5,9,0) 74%),
+    linear-gradient(180deg, rgba(3,5,9,.82) 0%, rgba(3,5,9,.24) 36%,
+      rgba(3,5,9,.30) 62%, rgba(3,5,9,.88) 100%);
 }
 .scr-scrim.hard{background:radial-gradient(130% 100% at 50% 42%, rgba(4,6,11,.52), rgba(2,3,6,.90));}
 
 /* --- title --------------------------------------------------------------- */
 .scr-title-wrap{
   position:relative; display:flex; flex-direction:column; align-items:center;
-  gap:calc(var(--su)*1.5); width:100%; max-width:calc(var(--su)*74);
+  gap:calc(var(--su)*1.5); width:100%; max-width:calc(var(--su)*80);
 }
 .scr-logo{text-align:center; position:relative;}
 .scr-logo-kicker{
@@ -293,7 +301,7 @@ const CSS = `
 
 .scr-cols{display:flex; gap:calc(var(--su)*1.5); width:100%; align-items:stretch; justify-content:center;}
 .scr-menu{
-  flex:1 1 auto; min-width:0; max-width:calc(var(--su)*32);
+  flex:1 1 auto; min-width:0; max-width:calc(var(--su)*38);
   display:flex; flex-direction:column; gap:calc(var(--su)*.34);
   padding:calc(var(--su)*.9);
   background:linear-gradient(180deg,rgba(8,11,17,.60),rgba(5,7,11,.72));
@@ -304,11 +312,12 @@ const CSS = `
 }
 
 /* --- menu items ---------------------------------------------------------- */
-.scr-item{
+.scr-root .scr-item{
   position:relative; display:grid; align-items:center;
-  grid-template-columns:calc(var(--su)*2.2) 1fr auto;
-  gap:calc(var(--su)*.6);
-  padding:calc(var(--su)*.62) calc(var(--su)*.8);
+  grid-template-columns:calc(var(--su)*2.2) minmax(0,1fr) calc(var(--su)*1.6);
+  grid-template-rows:auto auto;
+  gap:0 calc(var(--su)*.6);
+  padding:calc(var(--su)*.58) calc(var(--su)*.8);
   color:rgba(255,255,255,.72);
   transition:color 140ms linear, transform 200ms cubic-bezier(.2,.9,.25,1), background 160ms linear;
 }
@@ -323,23 +332,28 @@ const CSS = `
 }
 .scr-item.is-sel::before{transform:scaleY(1);}
 .scr-item-idx{
+  grid-column:1; grid-row:1 / span 2; align-self:center; justify-self:start;
   font-size:calc(var(--su)*.94); letter-spacing:.1em; color:var(--dim2);
   transition:color 140ms linear;
 }
 .scr-item.is-sel .scr-item-idx{color:var(--gold);}
 .scr-item-label{
-  font-size:calc(var(--su)*1.86); letter-spacing:.055em; white-space:nowrap;
+  grid-column:2; grid-row:1; justify-self:start;
+  font-size:calc(var(--su)*1.72); letter-spacing:.055em; white-space:nowrap;
   transform:skewX(-6deg); transform-origin:left center; text-shadow:var(--sh);
-  overflow:hidden; text-overflow:ellipsis;
+  max-width:100%; overflow:hidden; text-overflow:ellipsis;
 }
 .scr-item-desc{
-  grid-column:2; grid-row:2; font-size:calc(var(--su)*.92); font-weight:600; font-style:italic;
-  letter-spacing:.02em; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-  margin-top:calc(var(--su)*.16);
+  grid-column:2; grid-row:2; justify-self:start;
+  font-size:calc(var(--su)*.9); font-weight:600; font-style:italic;
+  letter-spacing:.02em; color:var(--dim); white-space:nowrap;
+  max-width:100%; overflow:hidden; text-overflow:ellipsis;
+  margin-top:calc(var(--su)*.18);
 }
 .scr-item.is-sel .scr-item-desc{color:rgba(255,255,255,.78);}
 .scr-item-arrow{
-  grid-row:1 / span 2; font-size:calc(var(--su)*1.5); color:var(--gold);
+  grid-column:3; grid-row:1 / span 2; align-self:center; justify-self:end;
+  font-size:calc(var(--su)*1.5); color:var(--gold);
   opacity:0; transform:translateX(calc(var(--su)*-.5));
   transition:opacity 150ms linear, transform 200ms cubic-bezier(.2,.9,.25,1);
 }
@@ -439,7 +453,7 @@ const CSS = `
   font-size:calc(var(--su)*.88); letter-spacing:.24em; color:var(--amber);
   padding:calc(var(--su)*.75) 0 calc(var(--su)*.3);
 }
-.scr-row{
+.scr-root .scr-row{
   position:relative; display:grid; align-items:center;
   grid-template-columns:1fr auto; gap:calc(var(--su)*.7);
   padding:calc(var(--su)*.42) calc(var(--su)*.6);
@@ -457,6 +471,8 @@ const CSS = `
 }
 .scr-row-label{font-size:calc(var(--su)*1.16); letter-spacing:.03em; white-space:nowrap;
   overflow:hidden; text-overflow:ellipsis;}
+.scr-legend{margin-left:auto; font-size:calc(var(--su)*.82); letter-spacing:.16em;
+  color:rgba(90,212,255,.7);}
 .scr-row-note{font-size:calc(var(--su)*.84); font-weight:600; font-style:italic; color:var(--dim);
   margin-top:calc(var(--su)*.14);}
 .scr-row-val{
@@ -465,7 +481,10 @@ const CSS = `
 }
 .scr-row-val .arw{color:var(--dim2); font-size:calc(var(--su)*.95); transition:color 140ms linear;}
 .scr-row.is-sel .arw{color:var(--accent);}
-.scr-row-val .v{min-width:calc(var(--su)*7.4); text-align:center; letter-spacing:.06em;}
+.scr-row-val .v{
+  width:calc(var(--su)*9); text-align:center; letter-spacing:.06em;
+  white-space:nowrap; overflow:hidden; text-overflow:clip;
+}
 .scr-meter{width:calc(var(--su)*7.4); height:calc(var(--su)*.42);
   background:rgba(255,255,255,.14); overflow:hidden;}
 .scr-meter i{display:block; height:100%; transform-origin:left center;
@@ -502,8 +521,8 @@ const CSS = `
 /* --- tour ---------------------------------------------------------------- */
 .scr-tour{align-items:flex-end; justify-content:flex-start;}
 .scr-tour-cap{
-  position:relative; max-width:calc(var(--su)*34);
-  margin:0 0 calc(var(--su)*2.4) calc(var(--su)*1.4);
+  position:relative; z-index:2; max-width:calc(var(--su)*34);
+  margin:0 0 calc(var(--su)*4.4) calc(var(--su)*1.4);
   padding:calc(var(--su)*.8) calc(var(--su)*1.0);
   background:linear-gradient(90deg,rgba(6,9,14,.86),rgba(6,9,14,.42));
   border-left:calc(var(--su)*.2) solid var(--gold);
@@ -516,15 +535,15 @@ const CSS = `
 .scr-tour-cap.flip{animation:scrCap 520ms cubic-bezier(.16,1,.3,1);}
 @keyframes scrCap{from{opacity:0; transform:translateX(calc(var(--su)*-1.2));} to{opacity:1; transform:none;}}
 .scr-tour-dots{
-  position:absolute; left:calc(var(--su)*1.4); bottom:calc(var(--su)*1.3);
+  position:absolute; z-index:2; left:calc(var(--su)*1.4); bottom:calc(var(--su)*1.2);
   display:flex; gap:calc(var(--su)*.34);
 }
 .scr-tour-dots i{width:calc(var(--su)*1.5); height:calc(var(--su)*.2);
   background:rgba(255,255,255,.22); display:block;}
 .scr-tour-dots i.on{background:var(--gold); box-shadow:0 0 8px rgba(255,196,52,.7);}
 .scr-tour-skip{
-  position:absolute; right:calc(var(--su)*1.6); bottom:calc(var(--su)*1.6);
-  font-size:calc(var(--su)*.94); letter-spacing:.14em; color:var(--dim);
+  position:absolute; z-index:2; right:calc(var(--su)*1.6); bottom:calc(var(--su)*1.05);
+  font-size:calc(var(--su)*.94); letter-spacing:.14em; color:rgba(255,255,255,.68);
 }
 .scr-tour-bars::before,.scr-tour-bars::after{
   content:""; position:absolute; left:0; right:0; height:calc(var(--su)*2.6);
@@ -605,7 +624,7 @@ const CSS = `
 .scr-res-btns{
   display:flex; gap:calc(var(--su)*.7); padding:calc(var(--su)*.9) calc(var(--su)*1.2) calc(var(--su)*1.1);
 }
-.scr-btn{
+.scr-root .scr-btn{
   flex:1 1 0; text-align:center; padding:calc(var(--su)*.72) calc(var(--su)*.9);
   font-size:calc(var(--su)*1.32); letter-spacing:.1em;
   border:1px solid rgba(255,255,255,.24); color:rgba(255,255,255,.82);
@@ -1065,7 +1084,6 @@ export function createScreens(ctx) {
       b.type = 'button';
       const left = el('div');
       left.appendChild(el('div', 'scr-row-label', label));
-      left.appendChild(el('div', 'scr-row-note', 'Gamepad: ' + (PAD_LABEL[action] || '—')));
       const right = el('div', 'scr-row-val');
       const keys = el('div', 'scr-keys');
       right.appendChild(keys);
@@ -1119,6 +1137,7 @@ export function createScreens(ctx) {
     panel.appendChild(body);
     const foot = el('div', 'scr-foot');
     foot.appendChild(hintRow([['ENTER', 'REBIND'], ['ESC', 'BACK / CANCEL']]));
+    foot.appendChild(el('span', 'scr-legend', 'BLUE = GAMEPAD (FIXED LAYOUT)'));
     panel.appendChild(foot);
     controls.el.appendChild(panel);
 
@@ -1674,7 +1693,9 @@ export function createScreens(ctx) {
     state = next;
     const rec = screens[state];
     if (rec) {
-      rec.sel = 0;
+      // Selection is remembered per screen (coming back from CONTROLS puts you
+      // back on CONTROLS), only clamped in case the list changed underneath.
+      if (rec.sel >= rec.items.length) rec.sel = 0;
       rec.onOpen?.();
       rec.el.classList.remove('is-on');
       void rec.el.offsetWidth;               // restart the entrance animations
@@ -1684,7 +1705,8 @@ export function createScreens(ctx) {
     const blocking = !!BLOCKING[state];
     // Keep the blur veil up for anything opened out of the pause menu, so the
     // frozen frame behind never snaps back into focus mid-navigation.
-    veil.classList.toggle('is-on', state === 'pause' || (rec && rec.back === 'pause'));
+    // NOTE: the `!!` matters — classList.toggle(name, undefined) *toggles*.
+    veil.classList.toggle('is-on', !!(state === 'pause' || (rec && rec.back === 'pause')));
     if (ctx.flags) ctx.flags.paused = blocking;
     ctx.hud?.setClean?.(blocking && state !== 'pause');
     if (!blocking) {
@@ -1790,8 +1812,18 @@ export function createScreens(ctx) {
       return;
     }
 
-    if (!BLOCKING[state]) return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+    // In gameplay only Escape belongs to us. input.pressed() cannot see keyboard
+    // edges (input.js snapshots `down` into `prev` at the top of poll, so a key
+    // pressed between frames is already in both sets), so the keyboard pause has
+    // to come from the DOM event. The gamepad Start button *is* seen by
+    // input.pressed() and is handled in update(). We deliberately do not stop
+    // propagation here so the HUD can still close its trick list on the same key.
+    if (!BLOCKING[state]) {
+      if (e.code === 'Escape' && !e.repeat) { e.preventDefault(); sfx('uiBack'); setState('pause'); }
+      return;
+    }
 
     const c = e.code;
     let used = true;
@@ -1906,19 +1938,27 @@ export function createScreens(ctx) {
   // ======================================================================
 
   let pauseLatch = false;
+  let lastNow = performance.now() * 0.001;
 
   function update(dt, c) {
     const cx = c || ctx;
     if (dormant) return;
     if (harnessTookOver(cx)) { goDormant(); return; }
 
-    const step = dt > 0.1 ? 0.1 : dt;
+    // Screen timers run on the wall clock, not the frame delta main.js clamps:
+    // at 12 fps a 3 s briefing must still last 3 s, not 3 s worth of frames.
+    const now = performance.now() * 0.001;
+    let step = now - lastNow;
+    lastNow = now;
+    if (!(step > 0)) step = dt > 0 ? dt : 0;
+    if (step > 0.5) step = 0.5;
 
-    // --- pause / back edge from input.js (covers Escape + gamepad Start) ------
+    // --- pause / back edge (gamepad Start; the keyboard path is onKeyDown) ----
     const pausePressed = !!cx.input?.pressed?.('pause');
     if (pausePressed && !pauseLatch) {
       pauseLatch = true;
       if (state === 'none') { sfx('uiBack'); setState('pause'); }
+      else if (state === 'results') { /* results ignores Start */ }
       else if (state === 'pause') resume();
       else if (state === 'tour') { sfx('uiBack'); setState('title'); }
       else if (state === 'controls' || state === 'options' || state === 'credits') goBack();
