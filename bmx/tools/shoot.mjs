@@ -52,6 +52,12 @@ export const SHOTS = [
     cam: [0, 6, 20, 0, 14, -60, 55] },
   { id: 'dusk', desc: 'Same hero framing under the evening lighting preset (lights, bloom, shadow length).',
     setup: 'air', rel: [3.4, 1.2, 4.2, 42], timeOfDay: 0.88 },
+
+  // --- framings that mirror the supplied reference frames -------------------
+  { id: 'ref1-match', desc: 'REFERENCE 1 FRAMING: close chase camera from behind and slightly above, rider mid-air over a concrete transition, park and city skyline filling the background, HUD live. Compare directly against reference/target-look.png.',
+    setup: 'air', rel: [0.2, 1.5, 5.2, 46], hud: true },
+  { id: 'ref2-match', desc: 'REFERENCE 2 FRAMING: low close camera near ledge height looking slightly up at the rider grinding, ground surface filling the lower third, city behind. Compare against the SECOND REFERENCE description in ARCHITECTURE.md.',
+    setup: 'grind', rel: [2.2, 0.35, 3.0, 44], hud: true },
 ];
 
 function freePort(start = 5178) {
@@ -148,8 +154,15 @@ async function main() {
           if (!B) return;
           if (s.timeOfDay != null) B.ctx.world.environment.setTimeOfDay?.(s.timeOfDay);
           else B.ctx.world.environment.setTimeOfDay?.(0.72);
+          if (s.hud) {
+            // Put a real run on the clock so the HUD has a score, combo and timer
+            // to show, then stage the pose and keep the HUD visible.
+            B.harnessPose?.('play');
+            B.simulate?.(24);
+          }
           if (s.setup) B.harnessPose?.(s.setup, s.rel);
           else if (s.cam) B.setCamera(...s.cam);
+          if (s.hud) { B.ctx.flags.freeCam = false; B.ctx.flags.hideHud = false; }
         }, shot);
         await page.waitForTimeout(shot.setup === 'play' ? 5000 : 1200);
         if (shot.setup === 'play') await page.evaluate(() => window.__BMX?.pause(true));

@@ -146,13 +146,23 @@ async function boot() {
     ctx,
     THREE,
     ready: true,
-    stats: () => ({
-      calls: engine.renderer.info.render.calls,
-      tris: engine.renderer.info.render.triangles,
-      programs: engine.renderer.info.programs?.length ?? 0,
-      textures: engine.renderer.info.memory.textures,
-      geometries: engine.renderer.info.memory.geometries,
-    }),
+    stats: () => {
+      // composer.render() ends on a fullscreen post quad, so info would report 1
+      // call. Render the scene straight to get the real per-frame scene cost.
+      const target = engine.renderer.getRenderTarget();
+      engine.renderer.setRenderTarget(null);
+      engine.renderer.render(engine.scene, engine.camera);
+      const r = engine.renderer.info.render;
+      const out = {
+        calls: r.calls,
+        tris: r.triangles,
+        programs: engine.renderer.info.programs?.length ?? 0,
+        textures: engine.renderer.info.memory.textures,
+        geometries: engine.renderer.info.memory.geometries,
+      };
+      engine.renderer.setRenderTarget(target);
+      return out;
+    },
     /** Park a free camera for beauty shots: pos/target in world space. */
     setCamera(px, py, pz, tx, ty, tz, fov = 45) {
       ctx.flags.freeCam = true;
