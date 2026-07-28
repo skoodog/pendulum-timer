@@ -20,6 +20,9 @@ import { createFX } from './fx/particles.js';
 import { createAudio } from './audio/audio.js';
 import { createHUD } from './ui/hud.js';
 import { createScreens } from './ui/screens.js';
+import { createSettings } from './ui/settings.js';
+import { createGlyphs } from './ui/glyphs.js';
+import { createCustomization } from './rider/customization.js';
 
 const FIXED_DT = 1 / 120;
 const MAX_SUBSTEPS = 6;
@@ -61,7 +64,11 @@ async function boot() {
   ctx.world.collision = createCollision(ctx.world.park.colliders, ctx.world.park.rails);
 
   // --- player --------------------------------------------------------------
-  ctx.player.rider = await createRider(ctx);
+  // Customization first: it publishes ctx.player.profile and ctx.player.cheats,
+  // which the rider build, physics and trick system all read.
+  ctx.customization = createCustomization(ctx);
+  ctx.player.rider = await createRider(ctx, ctx.customization.profile);
+  ctx.customization.applyTo(ctx.player.rider);
   ctx.scene.add(ctx.player.rider.group);
   ctx.player.physics = createBikePhysics(ctx);
   ctx.player.anim = createRiderAnim(ctx.player.rider, ctx);
@@ -72,9 +79,18 @@ async function boot() {
   // --- presentation --------------------------------------------------------
   ctx.fx = createFX(ctx);
   ctx.audio = createAudio(ctx);
+  ctx.glyphs = createGlyphs(ctx);
   ctx.hud = createHUD(ctx);
+  ctx.settings = createSettings(ctx);
   ctx.screens = createScreens(ctx);
   ctx.cameraRig = createCameraRig(ctx);
+
+  // screens.js ships a minimal options panel; the real one lives in settings.js.
+  // Point the menu action at it so there is a single settings surface.
+  if (ctx.screens && ctx.settings) {
+    ctx.screens.openSettings = (tab) => ctx.settings.open(tab);
+    ctx.on('menu:options', () => ctx.settings.open());
+  }
 
   const spawn = ctx.world.park.spawnPoints?.[0];
   if (spawn) ctx.player.physics.respawn(spawn);
@@ -118,6 +134,7 @@ async function boot() {
     ctx.fx.update(dt, ctx);
     ctx.audio.update(dt, ctx);
     ctx.hud.update(dt, ctx);
+    ctx.settings?.update?.(dt, ctx);
     ctx.screens.update?.(dt, ctx);
 
     engine.render(ctx.time.elapsed);
@@ -158,6 +175,8 @@ async function boot() {
       const anim = ctx.player.anim;
       ctx.input.harness = null;
       ctx.flags.paused = false;
+      // Staged shots disable the chase rig; keep the original so 'play' can restore it.
+      if (!window.__BMX._rigUpdate) window.__BMX._rigUpdate = ctx.cameraRig.update;
 
       const settle = (steps = 90) => {
         for (let i = 0; i < steps; i++) phys.fixedUpdate(FIXED_DT, ctx);
@@ -205,16 +224,33 @@ async function boot() {
         ctx.input.harness = () => ({ throttle: 1, lean: 1 });
         settle(200);
       } else if (mode === 'play') {
-        // Autopilot: pedal, hop off features, throw a trick, keep the HUD alive.
+        // Live gameplay capture: real chase camera, HUD visible, session running.
+        ctx.cameraRig.update = window.__BMX._rigUpdate;
+        ctx.flags.freeCam = false;
         spawnNamed('roll-in', 0);
+        ctx.cameraRig.snap?.(ctx);
+        try {
+          ctx.screens?.startSession?.();
+          if (ctx.player.scoring?.phase === 'ready') ctx.player.scoring.start?.();
+        } catch (err) { console.warn('harness: session start failed', err); }
+        // Autopilot: pedal, hop on a cycle, hold a grab briefly, then tuck it back
+        // in well before landing so the run actually scores instead of bailing.
         let t0 = null;
+        const CYCLE = 3.2;
         ctx.input.harness = (now) => {
           if (t0 == null) t0 = now;
           const t = (now - t0) / 1000;
+          const phase = t % CYCLE;
           const press = [];
-          if (t > 1.6 && t % 2.4 < 0.05) press.push('hop');
-          if (t > 2.0 && t % 2.4 > 0.1 && t % 2.4 < 0.16) press.push('trickA');
-          return { throttle: 1, steer: Math.sin(t * 0.6) * 0.25, press };
+          const release = [];
+          if (t < 1.2) return { throttle: 1, steer: 0 };            // build speed first
+          if (phase < 0.06) press.push('hop');
+          else release.push('hop');
+          if (phase > 0.18 && phase < 0.62) press.push('trickA');    // grab out
+          else release.push('trickA');                               // tucked back in
+          if (phase > 0.20 && phase < 0.55) press.push('spinRight');
+          else release.push('spinRight');
+          return { throttle: 1, steer: Math.sin(t * 0.45) * 0.3, press, release };
         };
         return;
       }
@@ -236,6 +272,31 @@ async function boot() {
       ctx.cameraRig.update = () => {};
       ctx.flags.paused = true;
     },
+    /**
+     * Step the simulation `seconds` forward without waiting on the render loop.
+     * The headless capture box renders at ~1 fps, so real-time play never happens
+     * there; this advances physics/tricks/scoring at the true fixed rate instead.
+     */
+    simulate(seconds = 5) {
+      const steps = Math.max(1, Math.round(seconds / FIXED_DT));
+      const t0 = performance.now();
+      for (let i = 0; i < steps; i++) {
+        ctx.input.poll(t0 + i * FIXED_DT * 1000);
+        ctx.player.physics.fixedUpdate(FIXED_DT, ctx);
+        ctx.player.grind.fixedUpdate(FIXED_DT, ctx);
+        ctx.player.tricks.fixedUpdate(FIXED_DT, ctx);
+        ctx.player.scoring.fixedUpdate(FIXED_DT, ctx);
+      }
+      ctx.player.anim.update(1 / 60, ctx);
+      ctx.cameraRig.update(1 / 60, ctx);
+      return {
+        speed: +ctx.player.physics.state.speed.toFixed(2),
+        mode: ctx.player.physics.state.mode,
+        score: ctx.player.scoring.score,
+        pos: ctx.player.physics.state.position.toArray().map((v) => +v.toFixed(2)),
+      };
+    },
+
     teleport(x, y, z, yaw = 0) {
       ctx.player.physics.respawn({ position: new THREE.Vector3(x, y, z), yaw });
       ctx.cameraRig.snap?.(ctx);
