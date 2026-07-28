@@ -27,9 +27,12 @@ const OWNED_FILES = [
   'src/fx/particles.js',
   'src/ui/hud.js',
   'src/ui/screens.js',
+  'src/ui/settings.js',
+  'src/ui/glyphs.js',
   'src/audio/audio.js',
   'src/core/engine.js',
   'src/core/camera.js',
+  'src/core/input.js',
 ]
 
 const REFERENCE = `
@@ -64,6 +67,12 @@ REFERENCE STANDARD - the wider bar.
 YOUR STANDARD IS (b) WITH THE READABILITY AND ATTITUDE OF (a). A frame passes only if it would not
 look out of place in a released commercial game. Nostalgia is not a defence; neither is "it is
 procedural" or "it is WebGL" - the target is a shipped-product look.
+
+(c) A SECOND reference frame was supplied that is not on disk. Its written description is in the
+"SECOND REFERENCE" section at the end of ARCHITECTURE.md - READ THAT SECTION. It raises the bar on
+wet-ground reflection (near-mirror reflections of buildings and sky in a rained-on plaza), character
+fidelity (a rider with a visible face, hair, layered clothing and real fabric response) and
+controller-first UI (Xbox glyphs in the HUD). Judge against it too.
 `
 
 const HARSHNESS = `

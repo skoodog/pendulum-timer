@@ -321,3 +321,61 @@ rider names anywhere.
   white italics beneath (`No Footed Can Can + Barspin`), animating in on each trick and slamming
   out when the combo banks or is lost.
 - **Bottom-right**: an optional controller/keys hint.
+
+---
+
+# SECOND REFERENCE (written description — image not on disk)
+
+A second target frame was supplied. It is a STREET spot, and it raises the bar on three things:
+wet-ground reflection, character fidelity, and controller-first UI. Details to match:
+
+- **Ground**: wet polished granite/stone plaza after rain, mirroring the buildings, sky, traffic
+  lights and car above it — near-mirror reflection in the puddled areas, blurring out with distance.
+  Scattered autumn leaves, kerb joints, tactile paving, drain grates, painted crossing stripes.
+- **Feature**: a long curved stone ledge with a steel edge strip being grind-ridden; the metal
+  catches a bright specular line along its whole length.
+- **Rider**: a fully realised character — visible face with real skin shading and hair, a raglan
+  jersey (navy body, red sleeves, printed chest graphic), loose blue jeans with fold and seam
+  detail, padded gloves, skate shoes, and a natural riding pose with weight over the bars.
+  Our rider must reach this class of readability: a face, hair, layered clothing, correct fabric
+  response. **All logos and graphics must be invented — no real brands.**
+- **Bike**: polished chrome frame with real reflections, chrome pegs, laced spoked wheels, gum-free
+  black tyres, correct 20" proportions.
+- **Environment**: overcast diffuse daylight, an office block with a mullioned glass facade, an
+  autumn tree in full golden leaf, traffic lights, street signage, parked cars, city traffic beyond.
+- **Camera**: close third-person, rider occupying roughly a third of frame height, camera near
+  ledge height looking slightly up.
+- **HUD**: identical layout to reference 1, with an **Xbox controller glyph bottom-right**, an `LB`
+  button chip beside `TRICK LIST`, and a `>>> HARD` difficulty tag.
+
+# CONTROLLER SUPPORT (first-class requirement)
+
+The game is designed controller-first, with keyboard as an equal alternative:
+
+- Full **Xbox pad support**: left stick steer/lean, right stick camera, A hop, X/Y/B trick modifiers,
+  RB grind, LB trick list, RT pedal, LT brake, LS manual, Start pause, Back restart. Standard
+  Gamepad API mapping, with correct handling of triggers as axes vs buttons across browsers.
+- **On-screen button glyphs** drawn procedurally (no image assets): Xbox A/B/X/Y with correct
+  colours, LB/RB/LT/RT, stick and d-pad glyphs, plus a keyboard-key glyph style. Every prompt in the
+  UI shows the glyph for the **currently active device**, switching automatically the moment the
+  player touches the other one.
+- **Deadzone, sensitivity, invert-Y, and vibration** (Gamepad haptics where supported: a light rumble
+  on landing, a sharper one on bail, a continuous low rumble while grinding).
+- **Full remapping for both devices** in the settings screen, with conflict detection, per-device
+  profiles, restore-defaults, and persistence in localStorage.
+
+# SETTINGS SCREEN
+
+A proper settings screen reachable from the title and pause menus, with tabbed sections:
+
+- **Controls**: device tabs (Gamepad / Keyboard), the full action list with current binding and
+  glyph, click/press-to-rebind with a listening state and conflict warnings, deadzone and
+  sensitivity sliders, invert-Y, vibration toggle and strength.
+- **Video**: quality tier (ultra/high/medium/low), resolution scale, FOV, motion blur / speed blur
+  amount, bloom, film grain, chromatic aberration, vignette, shadow quality, and an FPS counter.
+- **Audio**: master, music, SFX and crowd sliders with live preview tones.
+- **Gameplay**: run length (2:00 default), HUD scale, HUD element toggles, difficulty, camera
+  distance/height, auto-restart on bail.
+- **Data**: reset high scores, reset achievements, reset all progress (each with a confirm step).
+
+All settings persist in localStorage and apply live without a reload.
