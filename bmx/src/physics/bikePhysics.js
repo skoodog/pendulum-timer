@@ -94,6 +94,7 @@ export const TUNING = {
   landSnap: 0.14,           // m gap at which a descending bike is considered to have touched down
   landGrace: 0.12,          // s of coyote time after takeoff — a transition curls in behind you as you leave it
   landGraceClosing: 4.5,    // m/s of impact that lands you anyway during that grace window
+  wheelLandClosing: 2.5,    // m/s a single wheel must be closing at to commit a landing on its own
   landNormalToTangent: 0.42,// how much slam speed converts into roll-out speed (scaled by surface steepness)
   landSpeedKeep: 0.80,      // fraction of speed kept on the sketchiest legal landing (1.0 on a perfect one)
   maxImpactSpeed: 17.0,     // m/s of closing speed into a surface that snaps the rider — flat-drop bail
@@ -994,6 +995,9 @@ export function createBikePhysics(ctx) {
     const closing = -state.velocity.dot(p.normal);
     _n.copy(p.normal);
     if (state.airTime < T.landGrace && closing < T.landGraceClosing) return false;
+    // A wheel brushing the deck at the top of an air is a tail tap, not a landing —
+    // only the frame reaching the surface, or a real impact, commits the rider.
+    if (p !== probeC && closing < T.wheelLandClosing) return false;
     if (closing < 0.25) {
       // Skimming along the surface — leaving a lip looks exactly like this. Only push
       // out if we are genuinely inside the geometry (the chord of a tight transition
