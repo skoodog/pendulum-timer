@@ -145,6 +145,97 @@ async function boot() {
       engine.camera.lookAt(tx, ty, tz);
       ctx.cameraRig.update = () => {};
     },
+
+    /**
+     * Stage the rider for a beauty shot and frame the camera on them.
+     * mode: 'idle' | 'air' | 'grind' | 'manual' | 'play'
+     * cam:  [offX, offY, offZ, fov] relative to the rider (ignored for 'play').
+     */
+    harnessPose(mode, cam = [2.6, 1.5, 2.8, 38]) {
+      const phys = ctx.player.physics;
+      const s = phys.state;
+      const park = ctx.world.park;
+      const anim = ctx.player.anim;
+      ctx.input.harness = null;
+      ctx.flags.paused = false;
+
+      const settle = (steps = 90) => {
+        for (let i = 0; i < steps; i++) phys.fixedUpdate(FIXED_DT, ctx);
+      };
+      const spawnNamed = (name, fallback = 1) => {
+        const sp = park.spawnPoints?.find((p) => p.name === name) || park.spawnPoints?.[fallback] || park.spawnPoints?.[0];
+        if (sp) phys.respawn(sp);
+        return sp;
+      };
+
+      if (mode === 'idle') {
+        spawnNamed('main run', 1);
+        settle(60);
+        s.velocity.set(0, 0, 0);
+      } else if (mode === 'air') {
+        // Ride at the big quarterpipe and launch, then hold the rider at apex.
+        spawnNamed('main run', 1);
+        ctx.input.harness = () => ({ throttle: 1 });
+        settle(240);
+        ctx.input.harness = null;
+        const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(s.quaternion);
+        s.position.y += 3.2;
+        s.velocity.copy(fwd).multiplyScalar(9).setY(1.5);
+        s.mode = 'air';
+        s.grounded = false;
+        s.airTime = 0.55;
+        phys.applyTrickRotation?.('yaw', 3.4);
+        anim.setPose?.('tabletop', 1);
+        for (let i = 0; i < 24; i++) phys.fixedUpdate(FIXED_DT, ctx);
+      } else if (mode === 'grind') {
+        const rail = (park.rails || []).find((r) => r.type === 'rail') || (park.rails || [])[0];
+        if (rail?.curve) {
+          const p = rail.curve.getPointAt(0.45);
+          const t = rail.curve.getTangentAt(0.45);
+          phys.respawn({ position: p.clone().setY(p.y + 0.35), yaw: Math.atan2(t.x, t.z) });
+          s.velocity.copy(t).multiplyScalar(7);
+          s.speed = 7;
+          if (phys.enterGrind) phys.enterGrind({ rail, t: 0.45, point: p, tangent: t });
+          else s.mode = 'grind';
+          anim.setPose?.('grind_feeble', 1);
+          for (let i = 0; i < 20; i++) phys.fixedUpdate(FIXED_DT, ctx);
+        }
+      } else if (mode === 'manual') {
+        spawnNamed('main run', 1);
+        ctx.input.harness = () => ({ throttle: 1, lean: 1 });
+        settle(200);
+      } else if (mode === 'play') {
+        // Autopilot: pedal, hop off features, throw a trick, keep the HUD alive.
+        spawnNamed('roll-in', 0);
+        let t0 = null;
+        ctx.input.harness = (now) => {
+          if (t0 == null) t0 = now;
+          const t = (now - t0) / 1000;
+          const press = [];
+          if (t > 1.6 && t % 2.4 < 0.05) press.push('hop');
+          if (t > 2.0 && t % 2.4 > 0.1 && t % 2.4 < 0.16) press.push('trickA');
+          return { throttle: 1, steer: Math.sin(t * 0.6) * 0.25, press };
+        };
+        return;
+      }
+
+      anim.update?.(1 / 60, ctx);
+      ctx.player.rider.group.updateMatrixWorld(true);
+
+      // Frame the rider from the requested relative offset.
+      const [ox, oy, oz, fov = 38] = cam;
+      const yaw = Math.atan2(
+        new THREE.Vector3(0, 0, 1).applyQuaternion(s.quaternion).x,
+        new THREE.Vector3(0, 0, 1).applyQuaternion(s.quaternion).z);
+      const off = new THREE.Vector3(ox, oy, oz).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+      const target = s.position.clone().setY(s.position.y + 0.95);
+      engine.camera.position.copy(target).add(off);
+      engine.camera.fov = fov;
+      engine.camera.updateProjectionMatrix();
+      engine.camera.lookAt(target);
+      ctx.cameraRig.update = () => {};
+      ctx.flags.paused = true;
+    },
     teleport(x, y, z, yaw = 0) {
       ctx.player.physics.respawn({ position: new THREE.Vector3(x, y, z), yaw });
       ctx.cameraRig.snap?.(ctx);

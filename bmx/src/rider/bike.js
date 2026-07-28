@@ -197,43 +197,56 @@ function sweep(pts, opts = {}) {
 }
 
 /** Straight tapered tube between two points (fork legs, spokes, cables). */
-function rod(a, b, r0, r1 = r0, radial = 8, caps = true) {
+function rod(a, b, r0, r1 = r0, radial = 8, caps = true, steps = 2) {
   const mid = a.clone().lerp(b, 0.5);
-  return sweep([a, mid, b], { radius: 1, radial, steps: 4, caps, taper: (t) => lerp(r0, r1, t) });
+  return sweep([a, mid, b], { radius: 1, radial, steps, caps, taper: (t) => lerp(r0, r1, t) });
 }
 
 /** Capsule with independent end radii and a cross-section scale profile. */
 function capsule2(len, ra, rb, opts = {}) {
-  const { radial = 12, capSegs = 4, shape = null, mid = null } = opts;
+  const { radial = 12, capSegs = 4, shape = null, mid = null, bodyRings = 3 } = opts;
   const rings = [];
   for (let i = 0; i <= capSegs; i++) {                       // bottom cap
     const a = (i / capSegs) * (Math.PI / 2);
     rings.push([Math.sin(a) * ra, -Math.cos(a) * ra]);
   }
-  for (let i = 1; i <= 3; i++) {
-    const t = i / 4;
+  for (let i = 1; i <= bodyRings; i++) {
+    const t = i / (bodyRings + 1);
     rings.push([lerp(ra, rb, t) * (mid ? mid(t) : 1), len * t]);
   }
   for (let i = 0; i <= capSegs; i++) {                       // top cap
     const a = (i / capSegs) * (Math.PI / 2);
     rings.push([Math.cos(a) * rb, len + Math.sin(a) * rb]);
   }
+  // v runs along the PROFILE ARC LENGTH, not the axis: parameterising by height
+  // squeezes the hemispherical caps into a sliver of the atlas band, which makes
+  // them sample a blurred mip and show up as grey blobs on the joints.
+  const arc = [0];
+  for (let i = 1; i < rings.length; i++) {
+    arc[i] = arc[i - 1] + Math.hypot(rings[i][0] - rings[i - 1][0], rings[i][1] - rings[i - 1][1]);
+  }
+  const arcTotal = arc[arc.length - 1] || 1;
+
   const pos = [], nor = [], uvs = [], idx = [];
   const nv = new THREE.Vector3();
-  const total = len + ra + rb;
   for (let i = 0; i < rings.length; i++) {
     const [r, y] = rings[i];
     const t = clamp(y / len, 0, 1);
     const sc = shape ? shape(t) : [1, 1];
     const prev = rings[Math.max(0, i - 1)], next = rings[Math.min(rings.length - 1, i + 1)];
     const dr = next[0] - prev[0], dy = next[1] - prev[1];
+    // Pinch u toward the middle of the band as a cap ring closes in on its pole.
+    // Without this the u derivative explodes at the pole, the sampler drops to a
+    // tiny mip and the joint shows the average of the whole atlas as a grey blob.
+    const capR = y < 0 ? ra : y > len ? rb : 0;
+    const k = capR > 1e-6 ? clamp(r / capR, 0, 1) : 1;
     for (let j = 0; j <= radial; j++) {
       const a = (j / radial) * TAU;
       const sx = Math.sin(a), cz = Math.cos(a);
       pos.push(sx * r * sc[0], y, cz * r * sc[1]);
       nv.set(sx * dy / sc[0], -dr, cz * dy / sc[1]).normalize();
       nor.push(nv.x, nv.y, nv.z);
-      uvs.push(j / radial, clamp((y + ra) / total, 0, 1));
+      uvs.push(0.5 + (j / radial - 0.5) * k, arc[i] / arcTotal);
     }
   }
   const w = radial + 1;
@@ -269,7 +282,7 @@ function place(geo, a, b, front = V(0, 0, 1)) {
 
 /** Weld bead: a rippled ring — the detail that makes a metal frame read as welded. */
 function weld(pos, axis, r, thick = 0.0042) {
-  const geo = new THREE.TorusGeometry(r, thick, 6, 18);
+  const geo = new THREE.TorusGeometry(r, thick, 5, 14);
   const p = geo.attributes.position, n = geo.attributes.normal, uv = geo.attributes.uv;
   for (let i = 0; i < p.count; i++) {
     const rip = 0.0009 * Math.sin(uv.getX(i) * TAU * 9) + 0.00045 * Math.sin(uv.getX(i) * TAU * 23 + 1.1);
@@ -308,7 +321,7 @@ function sprocketShape(teeth, pitch, holes = 0, holeR = 0) {
   const R = pitch / (2 * Math.sin(Math.PI / teeth));
   const root = R - pitch * 0.30;
   const tip = R + pitch * 0.34;
-  const per = 10, s = new THREE.Shape();
+  const per = 6, s = new THREE.Shape();
   for (let i = 0; i < teeth * per; i++) {
     const f = (i % per) / per;
     const a = (i / (teeth * per)) * TAU;
@@ -451,12 +464,18 @@ function mapSet(aniso, w, h, paint, { normalStrength = 2.0 } = {}) {
   };
 }
 
-/** Run `fn` in the local coordinate frame of atlas band `i` of `n`. */
+/**
+ * Run `fn` in the local coordinate frame of atlas band `i` of `n`.
+ * Bands are painted bottom-up because CanvasTexture uploads with flipY: this way
+ * band `i` in UV space is band `i` here, and content painted upright stays upright
+ * with increasing v (up the limb, along the tube).
+ */
 function inBand(g, w, h, i, n, fn) {
   const bh = h / n;
+  const y = (n - 1 - i) * bh;
   g.save();
-  g.beginPath(); g.rect(0, i * bh, w, bh); g.clip();
-  g.translate(0, i * bh);
+  g.beginPath(); g.rect(0, y, w, bh); g.clip();
+  g.translate(0, y);
   fn(g, w, bh);
   g.restore();
 }
@@ -548,18 +567,18 @@ function buildMaterials(renderer) {
   };
   const paintMaps = mapSet(aniso, 1024, 1024, {
     color(g, w, h) {
-      inBand(g, w, h, PAINT.PLAIN, PAINT.N, (c, bw, bh) => paintBase(c, bw, bh, '#15616c', 'rgba(2,20,24,0.55)'));
+      inBand(g, w, h, PAINT.PLAIN, PAINT.N, (c, bw, bh) => paintBase(c, bw, bh, '#0f5561', 'rgba(2,20,24,0.55)'));
       inBand(g, w, h, PAINT.DARK, PAINT.N, (c, bw, bh) => {
         paintBase(c, bw, bh, '#0e454e', 'rgba(0,12,15,0.6)');
         scratches(c, bw, bh, 120, '#9fb6b9', 10, 60, 0.9);
       });
       inBand(g, w, h, PAINT.DECAL, PAINT.N, (c, bw, bh) => {
-        paintBase(c, bw, bh, '#15616c', 'rgba(2,20,24,0.55)');
+        paintBase(c, bw, bh, '#0f5561', 'rgba(2,20,24,0.55)');
         text(c, 'VOLTA', bw * 0.5, bh * 0.5, bh * 0.62, '#f4ecdb', { skew: -0.22, spacing: bh * 0.03 });
         text(c, 'HEAT TREATED CHROMOLY', bw * 0.5, bh * 0.82, bh * 0.11, 'rgba(244,236,219,0.75)', { font: '700', family: 'sans-serif', spacing: bh * 0.02 });
       });
       inBand(g, w, h, PAINT.SCRIPT, PAINT.N, (c, bw, bh) => {
-        paintBase(c, bw, bh, '#15616c', 'rgba(2,20,24,0.55)');
+        paintBase(c, bw, bh, '#0f5561', 'rgba(2,20,24,0.55)');
         c.fillStyle = '#e8552f'; c.globalAlpha = 0.9;
         c.fillRect(0, bh * 0.06, bw, bh * 0.055);
         c.fillRect(0, bh * 0.885, bw, bh * 0.055);
@@ -569,8 +588,8 @@ function buildMaterials(renderer) {
     },
     height(g, w, h) {
       fill(g, w, h, '#808080');
-      overlayGrain(g, w, h, 0.5, 4);      // orange peel
-      scratches(g, w, h, 70, '#4a4a4a', 6, 50, 0.8);
+      overlayGrain(g, w, h, 0.16, 2);     // orange peel, very shallow
+      scratches(g, w, h, 70, '#6a6a6a', 6, 50, 0.8);
       inBand(g, w, h, PAINT.DECAL, PAINT.N, (c, bw, bh) => {
         text(c, 'VOLTA', bw * 0.5, bh * 0.5, bh * 0.62, '#9a9a9a', { skew: -0.22, spacing: bh * 0.03 });
       });
@@ -579,25 +598,25 @@ function buildMaterials(renderer) {
       });
     },
     rough(g, w, h) {
-      fill(g, w, h, '#3c3c3c');
-      overlayGrain(g, w, h, 0.35, 3);
-      scratches(g, w, h, 110, '#8e8e8e', 8, 90, 0.9);
+      fill(g, w, h, '#949494');
+      overlayGrain(g, w, h, 0.22, 2);
+      scratches(g, w, h, 110, '#c4c4c4', 8, 90, 0.9);
       chips(g, w, h, 30, '#b0b0b0', 1, 3);
       inBand(g, w, h, PAINT.DARK, PAINT.N, (c, bw, bh) => {
         c.fillStyle = 'rgba(255,255,255,0.16)'; c.fillRect(0, 0, bw, bh);
       });
     },
-  }, { normalStrength: 1.1 });
+  }, { normalStrength: 0.45 });
 
   const paint = new THREE.MeshPhysicalMaterial({
     ...paintMaps,
     color: 0xffffff,
-    metalness: 0.42,
+    metalness: 0.08,
     roughness: 1.0,
-    clearcoat: 0.8,
-    clearcoatRoughness: 0.14,
-    normalScale: new THREE.Vector2(0.5, 0.5),
-    envMapIntensity: 1.0,
+    clearcoat: 0.28,
+    clearcoatRoughness: 0.38,
+    normalScale: new THREE.Vector2(0.30, 0.30),
+    envMapIntensity: 0.8,
   });
   paint.name = 'bikePaint';
 
@@ -666,8 +685,8 @@ function buildMaterials(renderer) {
     },
     height(g, w, h) {
       fill(g, w, h, '#808080');
-      overlayGrain(g, w, h, 0.35, 4);
-      scratches(g, w, h, 220, '#5a5a5a', 6, 80, 0.8);
+      overlayGrain(g, w, h, 0.14, 2);
+      scratches(g, w, h, 220, '#6c6c6c', 6, 80, 0.8);
       inBand(g, w, h, HW.PEG, HW.N, (c, bw, bh) => {      // knurl ridges
         for (let i = 0; i < bh; i += 3) {
           c.strokeStyle = i % 6 === 0 ? '#c8c8c8' : '#585858';
@@ -702,14 +721,14 @@ function buildMaterials(renderer) {
       inBand(g, w, h, HW.STEEL, HW.N, (c, bw, bh) => { fill(c, bw, bh, '#585858'); overlayGrain(c, bw, bh, 0.35, 3); });
       inBand(g, w, h, HW.RED, HW.N, (c, bw, bh) => fill(c, bw, bh, '#4e4e4e'));
     },
-  }, { normalStrength: 1.4 });
+  }, { normalStrength: 0.7 });
 
   const hardware = new THREE.MeshStandardMaterial({
     ...hwMaps,
     color: 0xffffff,
     metalness: 1.0,
     roughness: 1.0,
-    normalScale: new THREE.Vector2(0.65, 0.65),
+    normalScale: new THREE.Vector2(0.40, 0.40),
     envMapIntensity: 1.0,
   });
   hardware.name = 'bikeHardware';
@@ -808,15 +827,15 @@ function buildMaterials(renderer) {
       inBand(g, w, h, RUB.SEAT, RUB.N, (c, bw, bh) => { fill(c, bw, bh, '#8c8c8c'); overlayGrain(c, bw, bh, 0.4, 5); });
       inBand(g, w, h, RUB.CABLE, RUB.N, (c, bw, bh) => fill(c, bw, bh, '#9a9a9a'));
     },
-  }, { normalStrength: 2.6 });
+  }, { normalStrength: 1.5 });
 
   const rubber = new THREE.MeshStandardMaterial({
     ...rubberMaps,
     color: 0xffffff,
     metalness: 0.0,
     roughness: 1.0,
-    normalScale: new THREE.Vector2(1.0, 1.0),
-    envMapIntensity: 0.85,
+    normalScale: new THREE.Vector2(0.75, 0.75),
+    envMapIntensity: 0.8,
   });
   rubber.name = 'bikeRubber';
 
@@ -831,14 +850,26 @@ function buildRiderMaterials(aniso) {
     for (let y = 0; y < bh; y += 4) { c.beginPath(); c.moveTo(0, y); c.lineTo(bw, y); c.stroke(); }
     c.restore();
   };
+  // Cloth folds run ALONG the limb: u is around the body, v is along it, so the
+  // creases are near-vertical in atlas space with a lazy sideways drift.
   const folds = (c, bw, bh, n, css, alpha) => {
     c.save(); c.globalAlpha = alpha; c.strokeStyle = css; c.lineCap = 'round';
     for (let i = 0; i < n; i++) {
-      const y = rand(0, bh);
-      c.lineWidth = rand(2, 9);
+      const x = rand(0, bw);
+      const y0 = rand(-bh * 0.4, bh * 0.5), y1 = y0 + rand(bh * 0.45, bh * 1.3);
+      c.lineWidth = rand(2, 8);
       c.beginPath();
-      c.moveTo(-10, y);
-      c.bezierCurveTo(bw * 0.3, y + rand(-14, 14), bw * 0.7, y + rand(-14, 14), bw + 10, y + rand(-10, 10));
+      c.moveTo(x, y0);
+      c.bezierCurveTo(x + rand(-26, 26), lerp(y0, y1, 0.33), x + rand(-26, 26), lerp(y0, y1, 0.66), x + rand(-18, 18), y1);
+      c.stroke();
+    }
+    // a few short cross creases where fabric bunches
+    for (let i = 0; i < n >> 1; i++) {
+      const x = rand(0, bw), y = rand(0, bh);
+      c.lineWidth = rand(1.5, 4);
+      c.beginPath();
+      c.moveTo(x, y);
+      c.quadraticCurveTo(x + rand(-40, 40), y + rand(-10, 10), x + rand(-70, 70), y + rand(-16, 16));
       c.stroke();
     }
     c.restore();
@@ -848,35 +879,44 @@ function buildRiderMaterials(aniso) {
     color(g, w, h) {
       inBand(g, w, h, RD.SKIN, RD.N, (c, bw, bh) => {
         fill(c, bw, bh, '#b3805a');
-        overlayGrain(c, bw, bh, 0.16, 4);
-        chips(c, bw, bh, 60, '#8f5f42', 0.6, 2.2);
-        chips(c, bw, bh, 30, '#c9a081', 0.8, 3.0);
+        overlayGrain(c, bw, bh, 0.09, 4);
+        chips(c, bw, bh, 40, 'rgba(150,102,72,0.5)', 0.5, 1.6);
+        chips(c, bw, bh, 24, 'rgba(201,160,129,0.5)', 0.6, 2.0);
         const sh = c.createLinearGradient(0, 0, 0, bh);
-        sh.addColorStop(0, 'rgba(120,60,40,0.22)');
+        sh.addColorStop(0, 'rgba(120,60,40,0.14)');
         sh.addColorStop(0.5, 'rgba(0,0,0,0)');
-        sh.addColorStop(1, 'rgba(120,60,40,0.22)');
+        sh.addColorStop(1, 'rgba(120,60,40,0.14)');
         c.fillStyle = sh; c.fillRect(0, 0, bw, bh);
       });
       inBand(g, w, h, RD.JERSEY, RD.N, (c, bw, bh) => {
         fill(c, bw, bh, '#b93f2a');
         weave(c, bw, bh, 0.05);
         overlayGrain(c, bw, bh, 0.12, 3);
-        c.fillStyle = '#f0e6d2';
-        c.fillRect(0, bh * 0.06, bw, bh * 0.035);
-        c.fillRect(0, bh * 0.93, bw, bh * 0.045);
-        c.fillStyle = '#1d1f24';
-        c.fillRect(0, bh * 0.10, bw, bh * 0.02);
+        c.fillStyle = '#9e3120';
+        c.fillRect(0, bh * 0.04, bw, bh * 0.06);
+        c.fillRect(0, bh * 0.90, bw, bh * 0.10);
+        c.fillStyle = 'rgba(240,230,210,0.65)';
+        c.fillRect(0, bh * 0.100, bw, bh * 0.007);
+        c.fillRect(0, bh * 0.893, bw, bh * 0.007);
         folds(c, bw, bh, 14, 'rgba(60,12,6,0.30)', 0.5);
       });
+      // the whole torso is one piece: shorts at the bottom (v small = canvas
+      // bottom of the band), jersey above it, collar at the very top.
       inBand(g, w, h, RD.PRINT, RD.N, (c, bw, bh) => {
         fill(c, bw, bh, '#b93f2a');
         weave(c, bw, bh, 0.05);
+        c.fillStyle = '#34373e'; c.fillRect(0, bh * 0.66, bw, bh * 0.34);    // shorts
+        weave(c, bw, bh, 0.0);
+        c.fillStyle = '#f0e6d2'; c.fillRect(0, bh * 0.625, bw, bh * 0.020);  // jersey hem
+        c.fillStyle = '#1d1f24'; c.fillRect(0, bh * 0.645, bw, bh * 0.016);
+        c.fillStyle = '#f0e6d2'; c.fillRect(0, bh * 0.020, bw, bh * 0.026);  // collar
+        c.fillStyle = '#1d1f24'; c.fillRect(0, bh * 0.046, bw, bh * 0.014);
+        c.fillStyle = '#22242a'; c.fillRect(0, bh * 0.70, bw, bh * 0.030);   // waistband
         // back print sits at u = 0.5, which faces -Z (the chase camera)
-        text(c, 'VOLTA', bw * 0.5, bh * 0.42, bh * 0.34, '#f2e8d4', { skew: -0.16, spacing: bh * 0.02 });
-        text(c, 'SKATEPARK CO', bw * 0.5, bh * 0.63, bh * 0.10, '#f2e8d4', { font: '700', family: 'sans-serif', spacing: bh * 0.02, alpha: 0.9 });
-        text(c, '13', bw * 0.5, bh * 0.82, bh * 0.16, '#1d1f24', { spacing: bh * 0.01 });
-        c.fillStyle = '#1d1f24'; c.fillRect(bw * 0.5 - bw * 0.16, bh * 0.71, bw * 0.32, bh * 0.012);
-        folds(c, bw, bh, 10, 'rgba(60,12,6,0.28)', 0.45);
+        text(c, 'VOLTA', bw * 0.5, bh * 0.26, bh * 0.115, '#f2e8d4', { skew: -0.16, spacing: bh * 0.010 });
+        text(c, 'SKATEPARK CO', bw * 0.5, bh * 0.335, bh * 0.036, '#f2e8d4', { font: '700', family: 'sans-serif', spacing: bh * 0.006, alpha: 0.9 });
+        text(c, '13', bw * 0.5, bh * 0.44, bh * 0.075, '#1d1f24', { spacing: bh * 0.005 });
+        folds(c, bw, bh, 12, 'rgba(60,12,6,0.26)', 0.45);
       });
       inBand(g, w, h, RD.PANTS, RD.N, (c, bw, bh) => {
         fill(c, bw, bh, '#34373e');
@@ -943,7 +983,10 @@ function buildRiderMaterials(aniso) {
       inBand(g, w, h, RD.JERSEY, RD.N, (c, bw, bh) => { weave(c, bw, bh, 0.5); folds(c, bw, bh, 14, '#4a4a4a', 0.5); });
       inBand(g, w, h, RD.PRINT, RD.N, (c, bw, bh) => {
         weave(c, bw, bh, 0.5);
-        text(c, 'VOLTA', bw * 0.5, bh * 0.42, bh * 0.34, '#a8a8a8', { skew: -0.16, spacing: bh * 0.02 });
+        folds(c, bw, bh, 12, '#4e4e4e', 0.5);
+        c.fillStyle = '#b8b8b8'; c.fillRect(0, bh * 0.625, bw, bh * 0.020);
+        c.fillStyle = '#b8b8b8'; c.fillRect(0, bh * 0.020, bw, bh * 0.026);
+        text(c, 'VOLTA', bw * 0.5, bh * 0.26, bh * 0.115, '#a0a0a0', { skew: -0.16, spacing: bh * 0.010 });
       });
       inBand(g, w, h, RD.PANTS, RD.N, (c, bw, bh) => { weave(c, bw, bh, 0.55); folds(c, bw, bh, 20, '#4c4c4c', 0.65); folds(c, bw, bh, 12, '#b4b4b4', 0.5); });
       inBand(g, w, h, RD.KNEE, RD.N, (c, bw, bh) => { weave(c, bw, bh, 0.55); folds(c, bw, bh, 26, '#464646', 0.7); });
@@ -972,27 +1015,28 @@ function buildRiderMaterials(aniso) {
     },
     rough(g, w, h) {
       fill(g, w, h, '#c4c4c4');
-      inBand(g, w, h, RD.SKIN, RD.N, (c, bw, bh) => { fill(c, bw, bh, '#8e8e8e'); overlayGrain(c, bw, bh, 0.3, 5); });
-      inBand(g, w, h, RD.JERSEY, RD.N, (c, bw, bh) => { fill(c, bw, bh, '#d6d6d6'); overlayGrain(c, bw, bh, 0.25, 4); });
+      inBand(g, w, h, RD.SKIN, RD.N, (c, bw, bh) => { fill(c, bw, bh, '#a4a4a4'); overlayGrain(c, bw, bh, 0.3, 5); });
+      inBand(g, w, h, RD.JERSEY, RD.N, (c, bw, bh) => { fill(c, bw, bh, '#eaeaea'); overlayGrain(c, bw, bh, 0.25, 4); });
       inBand(g, w, h, RD.PRINT, RD.N, (c, bw, bh) => {
-        fill(c, bw, bh, '#d6d6d6');
-        text(c, 'VOLTA', bw * 0.5, bh * 0.42, bh * 0.34, '#8a8a8a', { skew: -0.16, spacing: bh * 0.02 });
+        fill(c, bw, bh, '#eaeaea');
+        c.fillStyle = '#d8d8d8'; c.fillRect(0, bh * 0.66, bw, bh * 0.34);
+        text(c, 'VOLTA', bw * 0.5, bh * 0.26, bh * 0.115, '#a8a8a8', { skew: -0.16, spacing: bh * 0.010 });
       });
-      inBand(g, w, h, RD.PANTS, RD.N, (c, bw, bh) => { fill(c, bw, bh, '#cfcfcf'); overlayGrain(c, bw, bh, 0.3, 4); });
-      inBand(g, w, h, RD.KNEE, RD.N, (c, bw, bh) => fill(c, bw, bh, '#c8c8c8'));
-      inBand(g, w, h, RD.SHOE, RD.N, (c, bw, bh) => { fill(c, bw, bh, '#bcbcbc'); overlayGrain(c, bw, bh, 0.3, 4); });
+      inBand(g, w, h, RD.PANTS, RD.N, (c, bw, bh) => { fill(c, bw, bh, '#e6e6e6'); overlayGrain(c, bw, bh, 0.3, 4); });
+      inBand(g, w, h, RD.KNEE, RD.N, (c, bw, bh) => fill(c, bw, bh, '#e2e2e2'));
+      inBand(g, w, h, RD.SHOE, RD.N, (c, bw, bh) => { fill(c, bw, bh, '#d2d2d2'); overlayGrain(c, bw, bh, 0.3, 4); });
       inBand(g, w, h, RD.SOLE, RD.N, (c, bw, bh) => fill(c, bw, bh, '#a2a2a2'));
-      inBand(g, w, h, RD.GEAR, RD.N, (c, bw, bh) => { fill(c, bw, bh, '#7e7e7e'); overlayGrain(c, bw, bh, 0.35, 5); });
+      inBand(g, w, h, RD.GEAR, RD.N, (c, bw, bh) => { fill(c, bw, bh, '#bcbcbc'); overlayGrain(c, bw, bh, 0.35, 5); });
     },
-  }, { normalStrength: 2.2 });
+  }, { normalStrength: 1.1 });
 
   const rider = new THREE.MeshStandardMaterial({
     ...maps,
     color: 0xffffff,
     metalness: 0.0,
     roughness: 1.0,
-    normalScale: new THREE.Vector2(0.9, 0.9),
-    envMapIntensity: 0.9,
+    normalScale: new THREE.Vector2(0.55, 0.55),
+    envMapIntensity: 0.7,
   });
   rider.name = 'riderSkinned';
 
@@ -1005,13 +1049,13 @@ function buildRiderMaterials(aniso) {
         grad.addColorStop(1, 'rgba(0,0,0,0.35)');
         c.fillStyle = grad; c.fillRect(0, 0, bw, bh);
         c.fillStyle = '#c3d84a';
-        c.fillRect(bw * 0.06, 0, bw * 0.035, bh);
-        c.fillRect(bw * 0.56, 0, bw * 0.035, bh);
+        c.fillRect(0, 0, bw * 0.028, bh); c.fillRect(bw * 0.972, 0, bw * 0.028, bh);
+        c.fillRect(bw * 0.486, 0, bw * 0.028, bh);
         c.fillStyle = '#e8552f';
-        c.fillRect(bw * 0.10, 0, bw * 0.016, bh);
-        c.fillRect(bw * 0.60, 0, bw * 0.016, bh);
-        text(c, 'GRIT', bw * 0.30, bh * 0.52, bh * 0.42, '#f2ecdc', { skew: -0.2, spacing: 4 });
-        text(c, 'GRIT', bw * 0.80, bh * 0.52, bh * 0.42, '#f2ecdc', { skew: -0.2, spacing: 4 });
+        c.fillRect(bw * 0.032, 0, bw * 0.014, bh); c.fillRect(bw * 0.954, 0, bw * 0.014, bh);
+        c.fillRect(bw * 0.518, 0, bw * 0.014, bh);
+        text(c, 'GRIT', bw * 0.25, bh * 0.62, bh * 0.30, '#f2ecdc', { skew: -0.2, spacing: 3 });
+        text(c, 'GRIT', bw * 0.75, bh * 0.62, bh * 0.30, '#f2ecdc', { skew: -0.2, spacing: 3 });
         scratches(c, bw, bh, 60, '#9aa0a8', 6, 50, 0.7);
         overlayGrain(c, bw, bh, 0.1, 3);
       });
@@ -1037,7 +1081,7 @@ function buildRiderMaterials(aniso) {
       inBand(g, w, h, HM.STRAP, HM.N, (c, bw, bh) => fill(c, bw, bh, '#c8c8c8'));
       inBand(g, w, h, HM.LINER, HM.N, (c, bw, bh) => fill(c, bw, bh, '#dcdcdc'));
     },
-  }, { normalStrength: 1.8 });
+  }, { normalStrength: 0.8 });
 
   const helmet = new THREE.MeshPhysicalMaterial({
     ...hMaps,
@@ -1051,16 +1095,1435 @@ function buildRiderMaterials(aniso) {
   helmet.name = 'riderHelmet';
 
   const lens = new THREE.MeshPhysicalMaterial({
-    color: 0x4a3524,
+    color: 0x8a5c2e,
     metalness: 1.0,
-    roughness: 0.06,
+    roughness: 0.05,
     clearcoat: 1.0,
-    clearcoatRoughness: 0.04,
-    envMapIntensity: 1.4,
+    clearcoatRoughness: 0.03,
+    envMapIntensity: 1.8,
   });
   lens.name = 'riderLens';
 
   return { rider, helmet, lens };
 }
 
-// __APPEND__
+// ---------------------------------------------------------------------------
+// bike: wheels
+// ---------------------------------------------------------------------------
+
+/** Small UV rect inside an atlas band — used for parts with no meaningful UVs. */
+function patch(geo, u0, u1, v0, v1) { return atlasUV(normalise(geo), u0, u1, v0, v1); }
+
+/** Circle point in wheel space: spin axis is +X. */
+function wheelPt(x, r, a) { return V(x, r * Math.cos(a), r * Math.sin(a)); }
+
+function latheX(profile, segments) {
+  const geo = new THREE.LatheGeometry(profile.map(([r, x]) => new THREE.Vector2(r, x)), segments);
+  geo.rotateZ(-Math.PI / 2);
+  return geo;
+}
+
+function buildWheel(isRear) {
+  const hw = [], rub = [];
+
+  // --- rim: double-wall box section with bead seats and a brake track ---------
+  const rimProfile = [
+    [G.rimInner, -0.0128], [G.rimInner + 0.006, -0.0132], [0.2085, -0.0132],
+    [G.rimOuter, -0.0112], [G.rimOuter, -0.0062], [0.2072, -0.0034],
+    [0.2072, 0.0034], [G.rimOuter, 0.0062], [G.rimOuter, 0.0112],
+    [0.2085, 0.0132], [G.rimInner + 0.006, 0.0132], [G.rimInner, 0.0128],
+  ];
+  hw.push(band(latheX(rimProfile, 36), HW.ANOD, HW.N));
+
+  // --- hub: shell, flanges, cones, axle --------------------------------------
+  hw.push(patch(latheX([
+    [0.0000, -0.052], [0.0090, -0.052], [0.0125, -0.046], [0.0150, -0.032],
+    [0.0170, -0.030], [0.0170, 0.030], [0.0150, 0.032], [0.0125, 0.046],
+    [0.0090, 0.052], [0.0000, 0.052],
+  ], 20), 0.05, 0.45, HW.ALLOY / HW.N + 0.01, (HW.ALLOY + 1) / HW.N - 0.01));
+  for (const s of [-1, 1]) {
+    const fl = latheX([
+      [G.hubR, s * 0.0235], [G.flangeR - 0.003, s * 0.0245], [G.flangeR, s * 0.0262],
+      [G.flangeR, s * (0.0262 + 0.0042)], [G.flangeR - 0.004, s * 0.0308], [G.hubR, s * 0.0300],
+    ], 20);
+    hw.push(patch(fl, 0.05, 0.45, (HW.ALLOY + 0.1) / HW.N, (HW.ALLOY + 0.9) / HW.N));
+  }
+  hw.push(patch(rod(V(-0.085, 0, 0), V(0.085, 0, 0), 0.0072), 0.1, 0.9, (HW.CHROME + 0.1) / HW.N, (HW.CHROME + 0.9) / HW.N));
+  for (const s of [-1, 1]) {
+    const nut = new THREE.CylinderGeometry(0.0125, 0.0125, 0.009, 6);
+    nut.rotateZ(Math.PI / 2); nut.translate(s * 0.0665, 0, 0);
+    hw.push(patch(nut, 0.1, 0.9, (HW.RED + 0.1) / HW.N, (HW.RED + 0.9) / HW.N));
+  }
+
+  // --- 36 spokes, three-cross, plus brass nipples -----------------------------
+  const rimHole = 0.1955, crossA = G.cross * 2 * (TAU / G.spokes);
+  const nipples = [];
+  for (let s = 0; s < 2; s++) {
+    const sx = s ? 1 : -1;
+    for (let i = 0; i < G.spokes / 2; i++) {
+      const hubA = (i / (G.spokes / 2)) * TAU + s * (TAU / G.spokes);
+      const dir = i % 2 === 0 ? 1 : -1;
+      const rimA = hubA + dir * crossA;
+      const a = wheelPt(sx * (G.flangeX + 0.0018), G.flangeR - 0.0035, hubA);
+      const b = wheelPt(sx * 0.0062, rimHole, rimA);
+      hw.push(patch(rod(a, b, 0.00105, 0.00095, 5, false), 0.1, 0.9, (HW.CHROME + 0.2) / HW.N, (HW.CHROME + 0.8) / HW.N));
+      const nb = wheelPt(sx * 0.0062, rimHole - 0.0075, rimA);
+      nipples.push(rod(b, nb, 0.0027, 0.0022, 5, true));
+    }
+  }
+  hw.push(patch(merge(nipples), 0.1, 0.9, (HW.BRASS + 0.1) / HW.N, (HW.BRASS + 0.9) / HW.N));
+
+  // --- valve stem -------------------------------------------------------------
+  const va = 0.6;
+  hw.push(patch(rod(wheelPt(0.0, 0.196, va), wheelPt(0.0, 0.223, va), 0.0035, 0.0032, 6),
+    0.1, 0.9, (HW.BRASS + 0.1) / HW.N, (HW.BRASS + 0.9) / HW.N));
+  const cap = new THREE.CylinderGeometry(0.0042, 0.0042, 0.010, 8);
+  place(cap, wheelPt(0, 0.221, va), wheelPt(0, 0.234, va));
+  hw.push(patch(cap, 0.1, 0.9, (HW.ANOD + 0.1) / HW.N, (HW.ANOD + 0.9) / HW.N));
+
+  // --- driver + cog (rear only) ----------------------------------------------
+  if (isRear) {
+    const driver = latheX([[0.014, 0.030], [0.026, 0.032], [0.028, 0.036], [0.028, 0.052], [0.014, 0.054]], 18);
+    hw.push(patch(driver, 0.1, 0.9, (HW.STEEL + 0.1) / HW.N, (HW.STEEL + 0.9) / HW.N));
+    const { shape } = sprocketShape(G.cogTeeth, G.pitch, 0, 0);
+    const cog = plate(shape, 0.0042, 0.0006, 3);
+    cog.rotateY(Math.PI / 2);
+    cog.translate(G.chainLine, 0, 0);
+    hw.push(patch(cog, 0.05, 0.95, (HW.OILY + 0.1) / HW.N, (HW.OILY + 0.9) / HW.N));
+  }
+
+  // --- tyre: lathed casing plus real knobs ------------------------------------
+  // the bead sits just proud of the rim's outer wall so the anodised rim reads
+  const tyreProfile = [
+    [0.2140, -0.0110], [0.2215, -0.0225], [0.2360, -0.0288], [0.2505, -0.0268],
+    [0.2578, -0.0160], [0.2600, 0.0000], [0.2578, 0.0160], [0.2505, 0.0268],
+    [0.2360, 0.0288], [0.2215, 0.0225], [0.2140, 0.0110],
+  ];
+  rub.push(band(latheX(tyreProfile, 40), RUB.TYRE, RUB.N));
+
+  const knobs = [];
+  const rows = 20;
+  for (let i = 0; i < rows; i++) {
+    const a = (i / rows) * TAU;
+    const set = i % 2 === 0
+      ? [[0, 0.2585, 0.0135, 0.0095], [-0.0195, 0.2505, 0.0105, 0.0115], [0.0195, 0.2505, 0.0105, 0.0115]]
+      : [[-0.0085, 0.2570, 0.0110, 0.0090], [0.0085, 0.2570, 0.0110, 0.0090], [-0.0245, 0.2440, 0.0100, 0.0110], [0.0245, 0.2440, 0.0100, 0.0110]];
+    for (const [x, r, len, wid] of set) {
+      const kb = new THREE.BoxGeometry(wid, 0.0055, len);
+      const p = wheelPt(x, r, a);
+      const out = V(0, Math.cos(a), Math.sin(a));
+      place(kb, p, p.clone().addScaledVector(out, 0.0055), V(1, 0, 0));
+      knobs.push(kb);
+    }
+  }
+  rub.push(patch(merge(knobs), 0.020, 0.030, 0.105, 0.145));
+
+  return { core: merge(hw), tyre: merge(rub) };
+}
+
+// ---------------------------------------------------------------------------
+// bike: frame
+// ---------------------------------------------------------------------------
+
+function buildFrame() {
+  const paint = [], hw = [], rub = [];
+  const { bb, stTop, htBottom, htTop, axisUp, axisFwd, rearAxle } = PT;
+  const dropZ = rearAxle.z + 0.006;
+
+  // down tube — ovalised at the bottom bracket, round at the head tube
+  const dtA = bb.clone().add(V(0, 0.016, 0.026));
+  const dtC = htBottom.clone().addScaledVector(axisUp, 0.028).addScaledVector(axisFwd, -0.004);
+  const dtM = dtA.clone().lerp(dtC, 0.5).add(V(0, -0.012, 0));
+  paint.push(band(sweep([dtA, dtM, dtC], {
+    radius: 0.0215, radial: 10, steps: 18,
+    taper: (t) => lerp(1.0, 0.88, smoothstep(t)),
+    oval: (t) => [lerp(1.24, 1.0, smoothstep(clamp(t * 2.2, 0, 1))), lerp(0.82, 1.0, smoothstep(clamp(t * 2.2, 0, 1)))],
+  }), PAINT.DECAL, PAINT.N));
+
+  // top tube
+  const ttA = stTop.clone().add(V(0, -0.020, 0.004));
+  const ttB = htTop.clone().addScaledVector(axisUp, -0.026).addScaledVector(axisFwd, -0.006);
+  paint.push(band(sweep([ttA, ttA.clone().lerp(ttB, 0.5).add(V(0, 0.004, 0)), ttB], {
+    radius: 0.0158, radial: 10, steps: 16,
+  }), PAINT.SCRIPT, PAINT.N));
+
+  // seat tube + head tube
+  paint.push(band(sweep([bb.clone().add(V(0, 0.014, -0.006)), bb.clone().lerp(stTop, 0.55), stTop], {
+    radius: 0.0168, radial: 10, steps: 12, taper: (t) => lerp(1.06, 0.96, t),
+  }), PAINT.PLAIN, PAINT.N));
+  paint.push(band(sweep([
+    htBottom.clone().addScaledVector(axisUp, -0.004),
+    htBottom.clone().lerp(htTop, 0.5),
+    htTop.clone().addScaledVector(axisUp, 0.004),
+  ], { radius: 0.0248, radial: 12, steps: 6, taper: (t) => 1 + 0.10 * Math.cos(t * Math.PI * 2 - Math.PI) * 0 + 0.06 * (Math.abs(t - 0.5) > 0.35 ? 1 : 0) }), PAINT.PLAIN, PAINT.N));
+
+  // chainstays and seatstays — bowed out for tyre clearance
+  for (const s of [-1, 1]) {
+    const csA = bb.clone().add(V(s * 0.030, -0.004, -0.014));
+    const csM = V(s * 0.079, 0.288, -0.330);
+    const csB = V(s * 0.056, 0.264, dropZ + 0.010);
+    paint.push(band(sweep([csA, csM, csB], {
+      radius: 0.0145, radial: 8, steps: 16, taper: (t) => lerp(1.05, 0.72, smoothstep(t)),
+      oval: (t) => [lerp(1.0, 0.75, smoothstep(t)), lerp(1.0, 1.25, smoothstep(t))],
+    }), PAINT.PLAIN, PAINT.N));
+
+    const ssA = stTop.clone().add(V(s * 0.019, -0.030, -0.004));
+    const ssM = V(s * 0.052, 0.412, -0.352);
+    const ssB = V(s * 0.056, 0.268, dropZ + 0.012);
+    paint.push(band(sweep([ssA, ssM, ssB], {
+      radius: 0.0118, radial: 8, steps: 16, taper: (t) => lerp(1.0, 0.68, smoothstep(t)),
+    }), PAINT.PLAIN, PAINT.N));
+
+    // dropout plates with a real slot
+    const dshape = new THREE.Shape();
+    dshape.moveTo(-0.030, -0.020); dshape.lineTo(0.040, -0.020);
+    dshape.lineTo(0.046, 0.006); dshape.lineTo(0.014, 0.028);
+    dshape.lineTo(-0.030, 0.028); dshape.closePath();
+    const slot = new THREE.Path();
+    slot.moveTo(0.040, -0.0085); slot.absarc(0.012, 0, 0.0085, -Math.PI / 2, Math.PI / 2, false);
+    slot.lineTo(0.040, 0.0085); slot.lineTo(0.040, -0.0085);
+    dshape.holes.push(slot);
+    const dp = plate(dshape, 0.0085, 0.0007, 4);
+    dp.rotateY(Math.PI / 2);
+    dp.translate(s * 0.056, G.tyreR, rearAxle.z);
+    paint.push(band(dp, PAINT.DARK, PAINT.N));
+
+    // chain tensioner
+    const ten = new THREE.BoxGeometry(0.012, 0.016, 0.030);
+    ten.translate(s * 0.066, G.tyreR + 0.001, rearAxle.z - 0.030);
+    hw.push(patch(ten, 0.1, 0.9, (HW.ANOD + 0.1) / HW.N, (HW.ANOD + 0.9) / HW.N));
+    const tb = new THREE.CylinderGeometry(0.0035, 0.0035, 0.030, 6);
+    tb.rotateX(Math.PI / 2);
+    tb.translate(s * 0.066, G.tyreR + 0.001, rearAxle.z - 0.048);
+    hw.push(patch(tb, 0.1, 0.9, (HW.CHROME + 0.1) / HW.N, (HW.CHROME + 0.9) / HW.N));
+  }
+
+  // bottom bracket shell
+  const bbShell = latheX([[0.0, -0.038], [0.020, -0.038], [0.0235, -0.034], [0.0235, 0.034], [0.020, 0.038], [0.0, 0.038]], 18);
+  bbShell.translate(bb.x, bb.y, bb.z);
+  paint.push(band(bbShell, PAINT.PLAIN, PAINT.N));
+
+  // gussets: head tube / down tube and down tube / bottom bracket
+  const gShape = new THREE.Shape();
+  gShape.moveTo(0, 0); gShape.lineTo(0.085, 0); gShape.quadraticCurveTo(0.052, 0.020, 0.020, 0.062);
+  gShape.lineTo(0, 0.062); gShape.closePath();
+  const gus = plate(gShape, 0.0055, 0.0008, 5);
+  gus.rotateY(Math.PI / 2);
+  const gDir = dtC.clone().sub(dtA).normalize();
+  _q.setFromUnitVectors(V(0, 1, 0), axisUp);
+  gus.applyQuaternion(_q);
+  gus.translate(0, htBottom.y + 0.010, htBottom.z - 0.026);
+  paint.push(band(gus, PAINT.DARK, PAINT.N));
+
+  const gShape2 = new THREE.Shape();
+  gShape2.moveTo(0, 0); gShape2.lineTo(0.060, 0); gShape2.quadraticCurveTo(0.030, 0.014, 0.006, 0.042);
+  gShape2.lineTo(0, 0.042); gShape2.closePath();
+  const gus2 = plate(gShape2, 0.005, 0.0008, 5);
+  gus2.rotateY(Math.PI / 2);
+  gus2.rotateX(-0.42);
+  gus2.translate(0, bb.y + 0.020, bb.z + 0.020);
+  paint.push(band(gus2, PAINT.DARK, PAINT.N));
+
+  // weld beads — the detail that sells a welded frame
+  const beads = [
+    [dtA.clone().add(V(0, 0.004, 0.006)), gDir, 0.0235],
+    [dtC.clone().addScaledVector(gDir, -0.010), gDir, 0.0200],
+    [ttA.clone().add(V(0, 0, 0.008)), ttB.clone().sub(ttA).normalize(), 0.0172],
+    [ttB.clone().addScaledVector(ttB.clone().sub(ttA).normalize(), -0.012), ttB.clone().sub(ttA).normalize(), 0.0172],
+    [bb.clone().addScaledVector(PT.stDir, 0.020), PT.stDir, 0.0184],
+    [stTop.clone().addScaledVector(PT.stDir, -0.030), PT.stDir, 0.0176],
+    [htBottom.clone().addScaledVector(axisUp, 0.006), axisUp, 0.0262],
+    [htTop.clone().addScaledVector(axisUp, -0.006), axisUp, 0.0262],
+  ];
+  for (const [p, ax, r] of beads) paint.push(band(weld(p, ax, r), PAINT.PLAIN, PAINT.N));
+  for (const s of [-1, 1]) {
+    const csDir = V(s * 0.5, -0.12, -0.86).normalize();
+    paint.push(band(weld(bb.clone().add(V(s * 0.032, -0.004, -0.016)), csDir, 0.0158), PAINT.PLAIN, PAINT.N));
+    const ssDir = V(s * 0.16, -0.62, -0.77).normalize();
+    paint.push(band(weld(stTop.clone().add(V(s * 0.019, -0.032, -0.006)), ssDir, 0.0130), PAINT.PLAIN, PAINT.N));
+  }
+
+  // seat post, clamp, pegs, brake
+  const spTop = stTop.clone().addScaledVector(PT.stDir, 0.075);
+  hw.push(patch(rod(stTop.clone().addScaledVector(PT.stDir, -0.05), spTop, 0.0135), 0.1, 0.9,
+    (HW.CHROME + 0.1) / HW.N, (HW.CHROME + 0.9) / HW.N));
+  const clampGeo = latheX([[0.0168, -0.010], [0.0205, -0.010], [0.0205, 0.010], [0.0168, 0.010]], 16);
+  _q.setFromUnitVectors(V(1, 0, 0), PT.stDir);
+  clampGeo.applyQuaternion(_q);
+  clampGeo.translate(stTop.x, stTop.y + 0.004, stTop.z);
+  hw.push(patch(clampGeo, 0.1, 0.9, (HW.RED + 0.1) / HW.N, (HW.RED + 0.9) / HW.N));
+  const clampBolt = new THREE.CylinderGeometry(0.0035, 0.0035, 0.030, 6);
+  clampBolt.rotateZ(Math.PI / 2);
+  clampBolt.translate(stTop.x, stTop.y + 0.004, stTop.z - 0.020);
+  hw.push(patch(clampBolt, 0.1, 0.9, (HW.CHROME + 0.1) / HW.N, (HW.CHROME + 0.9) / HW.N));
+
+  for (const s of [-1, 1]) {
+    const pegA = V(s * 0.062, G.tyreR, rearAxle.z);
+    const peg = latheX([
+      [0.0, 0], [G.pegR - 0.004, 0], [G.pegR, 0.006], [G.pegR, G.pegLen - 0.008],
+      [G.pegR - 0.003, G.pegLen], [0.0, G.pegLen],
+    ], 18);
+    peg.rotateZ(s > 0 ? 0 : Math.PI);
+    peg.translate(pegA.x, pegA.y, pegA.z);
+    hw.push(band(peg, HW.PEG, HW.N));
+  }
+
+  // rear u-brake: arms, pads, straddle cable
+  for (const s of [-1, 1]) {
+    const armShape = new THREE.Shape();
+    armShape.moveTo(0, 0); armShape.lineTo(0.012, 0.004); armShape.lineTo(0.030, 0.062);
+    armShape.lineTo(0.018, 0.068); armShape.lineTo(0.001, 0.014); armShape.closePath();
+    const arm = plate(armShape, 0.006, 0.0006, 3);
+    arm.rotateY(Math.PI / 2);
+    arm.rotateX(s > 0 ? 0.10 : -0.10);
+    arm.translate(s * 0.050, 0.404, -0.352);
+    hw.push(patch(arm, 0.1, 0.9, (HW.ANOD + 0.1) / HW.N, (HW.ANOD + 0.9) / HW.N));
+    const pad = new THREE.CylinderGeometry(0.0075, 0.0075, 0.014, 10);
+    pad.rotateZ(Math.PI / 2);
+    pad.translate(s * 0.038, 0.398, -0.348);
+    rub.push(patch(pad, 0.1, 0.9, (RUB.CABLE + 0.1) / RUB.N, (RUB.CABLE + 0.9) / RUB.N));
+  }
+  rub.push(patch(rod(V(-0.062, 0.466, -0.298), V(0, 0.446, -0.292), 0.0016), 0.1, 0.9, (RUB.CABLE + 0.1) / RUB.N, (RUB.CABLE + 0.9) / RUB.N));
+  rub.push(patch(rod(V(0.062, 0.466, -0.298), V(0, 0.446, -0.292), 0.0016), 0.1, 0.9, (RUB.CABLE + 0.1) / RUB.N, (RUB.CABLE + 0.9) / RUB.N));
+
+  // gyro lower cables: head tube down the top tube to the brake
+  const gyroBase = htTop.clone().addScaledVector(axisUp, 0.030);
+  for (const s of [-1, 1]) {
+    rub.push(band(sweep([
+      gyroBase.clone().add(V(s * 0.016, 0.006, -0.004)),
+      ttA.clone().lerp(ttB, 0.62).add(V(s * 0.012, 0.020, 0)),
+      ttA.clone().lerp(ttB, 0.18).add(V(s * 0.010, 0.020, 0)),
+      V(s * 0.030, 0.500, -0.300),
+      V(s * 0.055, 0.462, -0.300),
+    ], { radius: 0.0026, radial: 5, steps: 22 }), RUB.CABLE, RUB.N));
+  }
+
+  return { paint: merge(paint), hardware: merge(hw), rubber: merge(rub) };
+}
+
+// ---------------------------------------------------------------------------
+// bike: fork, bars, drivetrain, seat
+// ---------------------------------------------------------------------------
+
+function buildFork() {
+  const paint = [], hw = [];
+  const { htBottom, htTop, axisUp, frontAxle } = PT;
+  const crown = htBottom.clone().addScaledVector(axisUp, -0.030);
+
+  // steerer tube through the head tube
+  hw.push(patch(rod(crown.clone().addScaledVector(axisUp, 0.010),
+    htTop.clone().addScaledVector(axisUp, 0.086), 0.0143), 0.1, 0.9,
+    (HW.CHROME + 0.1) / HW.N, (HW.CHROME + 0.9) / HW.N));
+
+  // crown
+  const crownGeo = latheX([
+    [0.0, -0.052], [0.026, -0.052], [0.030, -0.044], [0.030, 0.044], [0.026, 0.052], [0.0, 0.052],
+  ], 16);
+  crownGeo.translate(crown.x, crown.y, crown.z);
+  paint.push(band(crownGeo, PAINT.PLAIN, PAINT.N));
+  paint.push(band(weld(crown, axisUp, 0.031), PAINT.PLAIN, PAINT.N));
+
+  for (const s of [-1, 1]) {
+    const a = crown.clone().add(V(s * 0.040, 0.006, 0));
+    const m = crown.clone().lerp(frontAxle, 0.55).add(V(s * 0.052, 0.006, 0.004));
+    const b = V(s * 0.056, frontAxle.y + 0.006, frontAxle.z - 0.002);
+    paint.push(band(sweep([a, m, b], {
+      radius: 0.0182, radial: 8, steps: 16,
+      taper: (t) => lerp(1.0, 0.62, smoothstep(t)),
+      oval: (t) => [lerp(0.92, 0.78, t), lerp(1.06, 1.22, t)],
+    }), PAINT.PLAIN, PAINT.N));
+
+    // dropout
+    const dshape = new THREE.Shape();
+    dshape.moveTo(-0.026, 0.030); dshape.lineTo(0.024, 0.030);
+    dshape.lineTo(0.026, -0.006); dshape.lineTo(0.000, -0.026);
+    dshape.lineTo(-0.026, -0.020); dshape.closePath();
+    const slot = new THREE.Path();
+    slot.moveTo(-0.0085, -0.026); slot.absarc(0, 0, 0.0085, -Math.PI / 2, Math.PI / 2, true);
+    slot.lineTo(0.0085, -0.026); slot.lineTo(-0.0085, -0.026);
+    dshape.holes.push(slot);
+    const dp = plate(dshape, 0.0085, 0.0007, 4);
+    dp.rotateY(Math.PI / 2);
+    dp.translate(s * 0.056, frontAxle.y, frontAxle.z);
+    paint.push(band(dp, PAINT.DARK, PAINT.N));
+
+    // front pegs
+    const peg = latheX([
+      [0.0, 0], [G.pegR - 0.004, 0], [G.pegR, 0.006], [G.pegR, G.pegLen - 0.008],
+      [G.pegR - 0.003, G.pegLen], [0.0, G.pegLen],
+    ], 18);
+    peg.rotateZ(s > 0 ? 0 : Math.PI);
+    peg.translate(s * 0.062, frontAxle.y, frontAxle.z);
+    hw.push(band(peg, HW.PEG, HW.N));
+
+    const nut = new THREE.CylinderGeometry(0.0125, 0.0125, 0.009, 6);
+    nut.rotateZ(Math.PI / 2);
+    nut.translate(s * (0.062 + G.pegLen + 0.005), frontAxle.y, frontAxle.z);
+    hw.push(patch(nut, 0.1, 0.9, (HW.RED + 0.1) / HW.N, (HW.RED + 0.9) / HW.N));
+  }
+
+  // headset cups, spacers, gyro lower plate
+  const cupLo = latheX([[0.0148, -0.012], [0.0290, -0.012], [0.0300, -0.004], [0.0250, 0.006], [0.0148, 0.006]], 18);
+  _q.setFromUnitVectors(V(1, 0, 0), axisUp);
+  cupLo.applyQuaternion(_q); cupLo.translate(htBottom.x, htBottom.y, htBottom.z);
+  hw.push(patch(cupLo, 0.1, 0.9, (HW.RED + 0.1) / HW.N, (HW.RED + 0.9) / HW.N));
+
+  const cupHi = latheX([[0.0148, -0.006], [0.0250, -0.006], [0.0300, 0.004], [0.0290, 0.014], [0.0148, 0.014]], 18);
+  cupHi.applyQuaternion(_q); cupHi.translate(htTop.x, htTop.y, htTop.z);
+  hw.push(patch(cupHi, 0.1, 0.9, (HW.RED + 0.1) / HW.N, (HW.RED + 0.9) / HW.N));
+
+  const gyroLo = latheX([[0.0150, 0], [0.0300, 0], [0.0300, 0.007], [0.0150, 0.007]], 20);
+  gyroLo.applyQuaternion(_q);
+  const gp = htTop.clone().addScaledVector(axisUp, 0.020);
+  gyroLo.translate(gp.x, gp.y, gp.z);
+  hw.push(patch(gyroLo, 0.1, 0.9, (HW.ANOD + 0.1) / HW.N, (HW.ANOD + 0.9) / HW.N));
+
+  return { paint: merge(paint), hardware: merge(hw) };
+}
+
+function buildBars() {
+  const hw = [], rub = [];
+  const { htTop, axisUp, axisFwd } = PT;
+  const stemBase = htTop.clone().addScaledVector(axisUp, 0.046);
+  const barCentre = stemBase.clone().addScaledVector(axisFwd, 0.050).addScaledVector(axisUp, 0.004);
+
+  // bar: one continuous sweep from grip to grip, with the crossbar added after
+  const half = [
+    [0.000, 0.000, 0.000], [0.052, 0.004, 0.000], [0.086, 0.062, -0.010],
+    [0.104, 0.150, -0.028], [0.132, 0.208, -0.044], [0.186, 0.222, -0.056],
+    [0.262, 0.226, -0.066], [0.330, 0.228, -0.074],
+  ];
+  const pts = [];
+  for (let i = half.length - 1; i >= 1; i--) pts.push(barCentre.clone().add(V(-half[i][0], half[i][1], half[i][2])));
+  pts.push(barCentre.clone());
+  for (let i = 1; i < half.length; i++) pts.push(barCentre.clone().add(V(half[i][0], half[i][1], half[i][2])));
+  hw.push(band(sweep(pts, { radius: 0.0143, radial: 8, steps: 40, tension: 0.42 }), HW.CHROME, HW.N));
+
+  // crossbar
+  const cbY = 0.150, cbA = [], cbB = [];
+  for (const s of [-1, 1]) {
+    cbA.push(barCentre.clone().add(V(s * 0.104, cbY, -0.028)));
+    cbB.push(barCentre.clone().add(V(s * 0.070, cbY + 0.028, -0.020)));
+  }
+  hw.push(band(sweep([cbA[0], cbB[0], cbB[1], cbA[1]], { radius: 0.0105, radial: 8, steps: 14, tension: 0.3 }), HW.CHROME, HW.N));
+
+  // stem: body, faceplate, six bolts
+  const fwd = axisFwd.clone(), up = axisUp.clone();
+  const side = new THREE.Vector3().crossVectors(fwd, up).normalize();
+  const basis = new THREE.Matrix4().makeBasis(fwd, up, side);
+  const body = plate(roundedRectShape(0.088, 0.046, 0.010), 0.044, 0.0012, 4);
+  body.applyMatrix4(basis);
+  body.translate(
+    (stemBase.x + barCentre.x) / 2, (stemBase.y + barCentre.y) / 2, (stemBase.z + barCentre.z) / 2);
+  hw.push(band(body, HW.ANOD, HW.N));
+
+  const clampRing = latheX([[0.0148, -0.024], [0.0230, -0.024], [0.0230, 0.024], [0.0148, 0.024]], 14);
+  _q.setFromUnitVectors(V(1, 0, 0), axisUp);
+  clampRing.applyQuaternion(_q);
+  clampRing.translate(stemBase.x, stemBase.y, stemBase.z);
+  hw.push(patch(clampRing, 0.1, 0.9, (HW.ANOD + 0.1) / HW.N, (HW.ANOD + 0.9) / HW.N));
+
+  const face = plate(roundedRectShape(0.048, 0.052, 0.008), 0.014, 0.001, 4);
+  face.applyMatrix4(basis);
+  face.translate(
+    barCentre.x + fwd.x * 0.018, barCentre.y + fwd.y * 0.018, barCentre.z + fwd.z * 0.018);
+  hw.push(band(face, HW.ANOD, HW.N));
+
+  for (const sx of [-1, 1]) {
+    for (const sy of [-1, 1]) {
+      const bolt = new THREE.CylinderGeometry(0.0042, 0.0042, 0.020, 6);
+      const o = barCentre.clone()
+        .addScaledVector(fwd, 0.022)
+        .addScaledVector(up, sy * 0.017)
+        .addScaledVector(side, sx * 0.017);
+      place(bolt, o, o.clone().addScaledVector(fwd, -0.02));
+      hw.push(patch(bolt, 0.1, 0.9, (HW.CHROME + 0.1) / HW.N, (HW.CHROME + 0.9) / HW.N));
+    }
+    const sbolt = new THREE.CylinderGeometry(0.0038, 0.0038, 0.028, 6);
+    const o = stemBase.clone().addScaledVector(fwd, -0.026).addScaledVector(up, sx * 0.013);
+    place(sbolt, o, o.clone().addScaledVector(side, 0.028));
+    hw.push(patch(sbolt, 0.1, 0.9, (HW.CHROME + 0.1) / HW.N, (HW.CHROME + 0.9) / HW.N));
+  }
+
+  // top cap
+  const cap = latheX([[0, 0], [0.017, 0], [0.017, 0.006], [0.010, 0.010], [0, 0.010]], 16);
+  cap.applyQuaternion(_q);
+  const capP = stemBase.clone().addScaledVector(axisUp, 0.026);
+  cap.translate(capP.x, capP.y, capP.z);
+  hw.push(patch(cap, 0.1, 0.9, (HW.RED + 0.1) / HW.N, (HW.RED + 0.9) / HW.N));
+
+  // gyro upper plate + upper cable
+  const gyroHi = latheX([[0.0150, 0], [0.0285, 0], [0.0285, 0.006], [0.0150, 0.006]], 20);
+  gyroHi.applyQuaternion(_q);
+  const ghp = htTop.clone().addScaledVector(axisUp, 0.029);
+  gyroHi.translate(ghp.x, ghp.y, ghp.z);
+  hw.push(patch(gyroHi, 0.1, 0.9, (HW.ANOD + 0.1) / HW.N, (HW.ANOD + 0.9) / HW.N));
+
+  // brake lever on the right bar
+  const gripInner = barCentre.clone().add(V(0.180, 0.222, -0.056));
+  const gripOuter = barCentre.clone().add(V(0.330, 0.228, -0.074));
+  const perch = latheX([[0.0143, 0], [0.0210, 0], [0.0210, 0.020], [0.0143, 0.020]], 14);
+  const gdir = gripOuter.clone().sub(gripInner).normalize();
+  _q.setFromUnitVectors(V(1, 0, 0), gdir);
+  perch.applyQuaternion(_q);
+  const perchP = gripInner.clone().addScaledVector(gdir, -0.020);
+  perch.translate(perchP.x, perchP.y, perchP.z);
+  hw.push(patch(perch, 0.1, 0.9, (HW.ANOD + 0.1) / HW.N, (HW.ANOD + 0.9) / HW.N));
+
+  const bladeShape = new THREE.Shape();
+  bladeShape.moveTo(0, 0); bladeShape.lineTo(0.086, -0.012);
+  bladeShape.quadraticCurveTo(0.100, -0.014, 0.098, -0.024);
+  bladeShape.lineTo(0.080, -0.026); bladeShape.lineTo(0.004, -0.012); bladeShape.closePath();
+  const blade = plate(bladeShape, 0.0075, 0.0008, 4);
+  const bFwd = V(0, 0, 1), bUp = V(0, 1, 0);
+  blade.applyMatrix4(new THREE.Matrix4().makeBasis(bFwd, bUp, new THREE.Vector3().crossVectors(bFwd, bUp)));
+  blade.translate(perchP.x + 0.012, perchP.y - 0.006, perchP.z + 0.016);
+  hw.push(patch(blade, 0.1, 0.9, (HW.ALLOY + 0.1) / HW.N, (HW.ALLOY + 0.9) / HW.N));
+
+  rub.push(band(sweep([
+    perchP.clone().add(V(0.004, 0.010, 0.016)),
+    perchP.clone().add(V(-0.03, 0.036, 0.030)),
+    barCentre.clone().add(V(0.02, 0.230, -0.010)),
+    barCentre.clone().add(V(0.0, 0.120, 0.010)),
+    ghp.clone().add(V(0.0, 0.014, 0.012)),
+  ], { radius: 0.0026, radial: 5, steps: 24 }), RUB.CABLE, RUB.N));
+
+  // grips with bar-end plugs
+  const gripPts = [];
+  gripPts.push([0.0125, 0.000], [0.0175, 0.004], [0.0178, 0.013], [0.0150, 0.017]);
+  for (let i = 0; i < 11; i++) {
+    const y = 0.019 + i * 0.0106;
+    gripPts.push([i % 2 ? 0.0172 : 0.0159, y]);
+  }
+  gripPts.push([0.0168, 0.140], [0.0180, 0.146], [0.0150, 0.150], [0.0, 0.150]);
+  for (const s of [-1, 1]) {
+    const gi = barCentre.clone().add(V(s * 0.180, 0.222, -0.056));
+    const go = barCentre.clone().add(V(s * 0.336, 0.228, -0.075));
+    const gr = new THREE.LatheGeometry(gripPts.map(([r, y]) => new THREE.Vector2(r, y)), 18);
+    place(gr, gi, go);
+    rub.push(band(gr, RUB.GRIP, RUB.N));
+
+    const plug = latheX([[0, 0], [0.0130, 0], [0.0150, 0.004], [0.0140, 0.010], [0, 0.010]], 16);
+    const pdir = go.clone().sub(gi).normalize();
+    _q.setFromUnitVectors(V(1, 0, 0), pdir);
+    plug.applyQuaternion(_q);
+    const pp = gi.clone().addScaledVector(pdir, 0.148);
+    plug.translate(pp.x, pp.y, pp.z);
+    hw.push(patch(plug, 0.1, 0.9, (HW.RED + 0.1) / HW.N, (HW.RED + 0.9) / HW.N));
+  }
+
+  const gripAnchorL = barCentre.clone().add(V(-0.255, 0.2245, -0.0655));
+  const gripAnchorR = barCentre.clone().add(V(0.255, 0.2245, -0.0655));
+  return { hardware: merge(hw), rubber: merge(rub), gripAnchorL, gripAnchorR, barCentre };
+}
+
+function buildSeat() {
+  const rub = [], hw = [];
+  const { stTop, stDir } = PT;
+  const base = stTop.clone().addScaledVector(stDir, 0.080);
+
+  const s = new THREE.SphereGeometry(1, 18, 12);
+  const p = s.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    let x = p.getX(i) * 0.070, y = p.getY(i) * 0.052, z = p.getZ(i) * 0.135;
+    if (y > 0.010) y = 0.010 + (y - 0.010) * 0.25;
+    const tz = clamp(z / 0.135, -1, 1);
+    if (tz > 0) x *= 1 - 0.62 * Math.pow(tz, 1.5);
+    else x *= 1 + 0.16 * Math.pow(-tz, 2);
+    if (tz > 0.5) y += (tz - 0.5) * 0.030;
+    p.setXYZ(i, x, y - 0.006, z);
+  }
+  s.computeVertexNormals();
+  s.translate(base.x, base.y + 0.020, base.z + 0.010);
+  rub.push(band(s, RUB.SEAT, RUB.N));
+
+  const mount = plate(roundedRectShape(0.052, 0.030, 0.006), 0.026, 0.0008, 4);
+  mount.rotateY(Math.PI / 2);
+  mount.rotateX(-0.22);
+  mount.translate(base.x, base.y - 0.004, base.z + 0.006);
+  hw.push(patch(mount, 0.1, 0.9, (HW.ANOD + 0.1) / HW.N, (HW.ANOD + 0.9) / HW.N));
+
+  return { rubber: merge(rub), hardware: merge(hw) };
+}
+
+function buildDrivetrain() {
+  const { bb } = PT;
+  const hw = [];
+
+  // crank arms — right arm forward, left arm back (level cranks, the ready stance)
+  const armShape = new THREE.Shape();
+  armShape.moveTo(0, 0.023);
+  armShape.lineTo(G.crankLen, 0.017);
+  armShape.absarc(G.crankLen, 0, 0.017, Math.PI / 2, -Math.PI / 2, true);
+  armShape.lineTo(0, -0.023);
+  armShape.absarc(0, 0, 0.023, -Math.PI / 2, -Math.PI * 1.5, true);
+  armShape.closePath();
+
+  const pedalPos = [];
+  for (const s of [1, -1]) {                       // s = +1 → right arm (+X, forward)
+    const arm = plate(armShape, 0.0155, 0.0012, 5);
+    const fwd = V(0, 0, s), up = V(0, 1, 0);
+    arm.applyMatrix4(new THREE.Matrix4().makeBasis(fwd, up, new THREE.Vector3().crossVectors(fwd, up)));
+    arm.translate(s * 0.055, bb.y, bb.z);
+    hw.push(band(arm, HW.ALLOY, HW.N));
+    // pedal spindle
+    const sp = V(s * 0.066, bb.y, bb.z + s * G.crankLen);
+    const so = V(s * 0.150, bb.y, bb.z + s * G.crankLen);
+    hw.push(patch(rod(sp, so, 0.0075, 0.0065, 8), 0.1, 0.9, (HW.CHROME + 0.1) / HW.N, (HW.CHROME + 0.9) / HW.N));
+    pedalPos.push(V(s * 0.112, bb.y, bb.z + s * G.crankLen));
+  }
+  // spindle + dust caps
+  hw.push(patch(rod(V(-0.062, bb.y, bb.z), V(0.062, bb.y, bb.z), 0.0115), 0.1, 0.9,
+    (HW.STEEL + 0.1) / HW.N, (HW.STEEL + 0.9) / HW.N));
+
+  // chainring on the drive side
+  const { shape: ringShape, R: ringR } = sprocketShape(G.sprocketTeeth, G.pitch, 5, 0.0115);
+  const ring = plate(ringShape, 0.0052, 0.0007, 4);
+  ring.rotateY(Math.PI / 2);
+  ring.rotateX(Math.PI / 2);
+  ring.translate(G.chainLine, bb.y, bb.z);
+  hw.push(band(ring, HW.ALLOY, HW.N));
+  for (let i = 0; i < 4; i++) {                    // sprocket bolts
+    const a = (i / 4) * TAU + 0.5;
+    const bolt = new THREE.CylinderGeometry(0.0045, 0.0045, 0.014, 6);
+    bolt.rotateZ(Math.PI / 2);
+    bolt.translate(0.048, bb.y + Math.sin(a) * ringR * 0.30, bb.z + Math.cos(a) * ringR * 0.30);
+    hw.push(patch(bolt, 0.1, 0.9, (HW.CHROME + 0.1) / HW.N, (HW.CHROME + 0.9) / HW.N));
+  }
+
+  // pedals: alloy platform, cage plates, eight grip pins per side
+  const pedals = pedalPos.map((pp) => {
+    const parts = [];
+    const bodyShape = roundedRectShape(0.098, 0.076, 0.008);
+    const bodyGeo = plate(bodyShape, 0.021, 0.0012, 4);
+    bodyGeo.rotateY(Math.PI / 2);
+    bodyGeo.rotateZ(Math.PI / 2);
+    bodyGeo.translate(pp.x, pp.y, pp.z);
+    parts.push(band(bodyGeo, HW.ALLOY, HW.N));
+    for (let k = 0; k < 4; k++) {
+      for (const sy of [-1, 1]) {
+        for (const sz of [-1, 1]) {
+          const pin = new THREE.CylinderGeometry(0.0021, 0.0018, 0.0075, 5);
+          const px = pp.x + (k - 1.5) * 0.024;
+          const pz = pp.z + sz * 0.030;
+          pin.translate(px, pp.y + sy * 0.0135, pz);
+          parts.push(patch(pin, 0.1, 0.9, (HW.CHROME + 0.1) / HW.N, (HW.CHROME + 0.9) / HW.N));
+        }
+      }
+    }
+    return { geo: merge(parts), pos: pp };
+  });
+
+  // --- chain: tangent lines + wrap arcs around ring and cog -------------------
+  const cogR = G.pitch / (2 * Math.sin(Math.PI / G.cogTeeth));
+  const c1 = { y: bb.y, z: bb.z, r: ringR };
+  const c2 = { y: PT.rearAxle.y, z: PT.rearAxle.z, r: cogR };
+  const dz = c2.z - c1.z, dy = c2.y - c1.y;
+  const D = Math.hypot(dz, dy);
+  const phi = Math.atan2(dy, dz);
+  const beta = Math.acos(clamp((c1.r - c2.r) / D, -1, 1));
+  const a1 = phi + beta, a2 = phi - beta;
+  const pointAt = (c, a) => V(G.chainLine, c.y + c.r * Math.sin(a), c.z + c.r * Math.cos(a));
+
+  const path = [];
+  const runLowFirst = Math.sin(a1) < Math.sin(a2);
+  const line = (from, to, n, sag) => {
+    for (let i = 0; i < n; i++) {
+      const t = i / n;
+      const p = from.clone().lerp(to, t);
+      if (sag) p.y -= sag * 4 * t * (1 - t);
+      path.push(p);
+    }
+  };
+  line(pointAt(c1, a1), pointAt(c2, a1), 12, runLowFirst ? 0.007 : 0);
+  for (let i = 0; i < 14; i++) path.push(pointAt(c2, lerp(a1, a2, i / 14)));
+  line(pointAt(c2, a2), pointAt(c1, a2), 12, runLowFirst ? 0 : 0.007);
+  for (let i = 0; i < 26; i++) path.push(pointAt(c1, lerp(a2, a1 - TAU, i / 26)));
+
+  const n = path.length;
+  const cum = new Float32Array(n + 1);
+  for (let i = 0; i < n; i++) {
+    cum[i + 1] = cum[i] + path[i].distanceTo(path[(i + 1) % n]);
+  }
+  const total = cum[n];
+  const links = Math.max(8, Math.round(total / G.pitch));
+
+  // one link: two plates and a roller, tiling along +X at exactly one pitch
+  const linkParts = [];
+  for (const s of [-1, 1]) {
+    const pl = new THREE.BoxGeometry(G.pitch * 1.12, 0.0072, 0.0013);
+    pl.translate(G.pitch * 0.5, 0, s * 0.0026);
+    linkParts.push(patch(pl, 0.1, 0.9, (HW.OILY + 0.1) / HW.N, (HW.OILY + 0.9) / HW.N));
+  }
+  const roller = new THREE.CylinderGeometry(0.0037, 0.0037, 0.0048, 5);
+  roller.rotateX(Math.PI / 2);
+  linkParts.push(patch(roller, 0.1, 0.9, (HW.STEEL + 0.1) / HW.N, (HW.STEEL + 0.9) / HW.N));
+  const linkGeo = merge(linkParts);
+
+  return {
+    hardware: merge(hw),
+    pedals,
+    chain: { path, cum, total, links, geo: linkGeo },
+    ringR,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// bike assembly
+// ---------------------------------------------------------------------------
+
+function buildBike(mats) {
+  const group = new THREE.Group();
+  group.name = 'bike';
+
+  const frame = buildFrame();
+  const fork = buildFork();
+  const bars = buildBars();
+  const seat = buildSeat();
+  const drive = buildDrivetrain();
+  const rearW = buildWheel(true);
+  const frontW = buildWheel(false);
+
+  const mesh = (geo, mat, name) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.name = name;
+    m.castShadow = true;
+    m.receiveShadow = true;
+    return m;
+  };
+
+  // --- static frame group ----------------------------------------------------
+  const frameGroup = new THREE.Group();
+  frameGroup.name = 'frameGroup';
+  const framePaint = mesh(frame.paint, mats.paint, 'frame');
+  const frameHw = mesh(frame.hardware, mats.hardware, 'frameHardware');
+  const frameRub = mesh(merge([frame.rubber, seat.rubber]), mats.rubber, 'frameRubber');
+  const seatHw = mesh(merge([seat.hardware]), mats.hardware, 'seatHardware');
+  frameGroup.add(framePaint, frameHw, frameRub, seatHw);
+  group.add(frameGroup);
+
+  // --- rear wheel ------------------------------------------------------------
+  const rearWheel = new THREE.Group();
+  rearWheel.name = 'wheelRear';
+  rearWheel.position.copy(PT.rearAxle);
+  const rearCore = mesh(rearW.core, mats.hardware, 'rearRim');
+  const rearTyre = mesh(rearW.tyre, mats.rubber, 'rearTyre');
+  rearWheel.add(rearCore, rearTyre);
+  group.add(rearWheel);
+
+  // --- steering assembly -----------------------------------------------------
+  const steer = new THREE.Object3D();
+  steer.name = 'steer';
+  steer.position.copy(PT.htBottom);
+  steer.rotation.x = -(Math.PI / 2 - G.headAngle);
+  steer.updateMatrix();
+  const steerInv = new THREE.Matrix4().copy(steer.matrix).invert();
+
+  const forkGroup = new THREE.Group();
+  forkGroup.name = 'fork';
+  fork.paint.applyMatrix4(steerInv);
+  fork.hardware.applyMatrix4(steerInv);
+  forkGroup.add(mesh(fork.paint, mats.paint, 'forkPaint'), mesh(fork.hardware, mats.hardware, 'forkHardware'));
+  steer.add(forkGroup);
+
+  const frontWheel = new THREE.Group();
+  frontWheel.name = 'wheelFront';
+  frontWheel.position.copy(PT.frontAxle).applyMatrix4(steerInv);
+  const frontCore = mesh(frontW.core, mats.hardware, 'frontRim');
+  const frontTyre = mesh(frontW.tyre, mats.rubber, 'frontTyre');
+  frontWheel.add(frontCore, frontTyre);
+  steer.add(frontWheel);
+
+  const barPivot = new THREE.Object3D();
+  barPivot.name = 'barPivot';
+  const barGroup = new THREE.Group();
+  barGroup.name = 'bars';
+  bars.hardware.applyMatrix4(steerInv);
+  bars.rubber.applyMatrix4(steerInv);
+  barGroup.add(mesh(bars.hardware, mats.hardware, 'barsHardware'), mesh(bars.rubber, mats.rubber, 'grips'));
+  barPivot.add(barGroup);
+  steer.add(barPivot);
+  group.add(steer);
+
+  // --- cranks ----------------------------------------------------------------
+  const crankPivot = new THREE.Object3D();
+  crankPivot.name = 'cranks';
+  crankPivot.position.copy(PT.bb);
+  drive.hardware.translate(-PT.bb.x, -PT.bb.y, -PT.bb.z);
+  crankPivot.add(mesh(drive.hardware, mats.hardware, 'crankArms'));
+
+  const pedalPivots = drive.pedals.map((p, i) => {
+    const pivot = new THREE.Object3D();
+    pivot.name = i === 0 ? 'pedalR' : 'pedalL';
+    pivot.position.copy(p.pos).sub(PT.bb);
+    p.geo.translate(-p.pos.x, -p.pos.y, -p.pos.z);
+    pivot.add(mesh(p.geo, mats.hardware, pivot.name + 'Mesh'));
+    crankPivot.add(pivot);
+    return pivot;
+  });
+  group.add(crankPivot);
+
+  // --- chain -----------------------------------------------------------------
+  const chainMesh = new THREE.InstancedMesh(drive.chain.geo, mats.hardware, drive.chain.links);
+  chainMesh.name = 'chain';
+  chainMesh.castShadow = true;
+  chainMesh.receiveShadow = true;
+  chainMesh.frustumCulled = false;
+  chainMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  group.add(chainMesh);
+
+  // chain placement — no allocation after this closure is built
+  const cp = drive.chain;
+  const _pA = new THREE.Vector3(), _tan = new THREE.Vector3();
+  const _nrm = new THREE.Vector3(), _lat = new THREE.Vector3(), _mat = new THREE.Matrix4();
+  const sampleAt = (dist, out, tan) => {
+    let d = dist % cp.total;
+    if (d < 0) d += cp.total;
+    let lo = 0, hi = cp.path.length;
+    while (lo < hi - 1) {                                     // binary search the arc table
+      const mid = (lo + hi) >> 1;
+      if (cp.cum[mid] <= d) lo = mid; else hi = mid;
+    }
+    const a = cp.path[lo], b = cp.path[(lo + 1) % cp.path.length];
+    const seg = cp.cum[lo + 1] - cp.cum[lo] || 1e-6;
+    const t = (d - cp.cum[lo]) / seg;
+    out.copy(a).lerp(b, t);
+    tan.copy(b).sub(a).normalize();
+  };
+  function placeChain(phase) {
+    const step = cp.total / cp.links;
+    for (let i = 0; i < cp.links; i++) {
+      sampleAt(phase + i * step, _pA, _tan);
+      _nrm.set(0, _tan.z, -_tan.y).normalize();               // in-plane normal
+      _lat.crossVectors(_tan, _nrm).normalize();
+      _mat.makeBasis(_tan, _nrm, _lat).setPosition(_pA);
+      if (i % 2) _mat.scale(_v1.set(1, 1, 0.55));
+      chainMesh.setMatrixAt(i, _mat);
+    }
+    chainMesh.instanceMatrix.needsUpdate = true;
+  }
+  placeChain(0);
+
+  const bike = {
+    group,
+    frame: frameGroup,
+    framePaint,
+    steer,
+    fork: forkGroup,
+    barPivot,
+    bars: barGroup,
+    grips: barGroup.children[1],
+    wheels: [rearWheel, frontWheel],
+    wheelRear: rearWheel,
+    wheelFront: frontWheel,
+    tyres: [rearTyre, frontTyre],
+    cranks: crankPivot,
+    pedals: pedalPivots,
+    pedalR: pedalPivots[0],
+    pedalL: pedalPivots[1],
+    chain: chainMesh,
+    seat: frameRub,
+    // anchors the animator can hang IK off (bike local space)
+    points: {
+      gripL: bars.gripAnchorL.clone(),
+      gripR: bars.gripAnchorR.clone(),
+      pedalR: drive.pedals[0].pos.clone(),
+      pedalL: drive.pedals[1].pos.clone(),
+      bb: PT.bb.clone(),
+      seat: PT.stTop.clone().addScaledVector(PT.stDir, 0.095),
+      headTop: PT.htTop.clone(),
+      rearAxle: PT.rearAxle.clone(),
+      frontAxle: PT.frontAxle.clone(),
+    },
+    /** Steering angle in radians about the head-tube axis. */
+    setSteer(rad) { steer.rotation.y = rad; },
+    /** Barspin angle: the bars turn inside the fork. */
+    setBarspin(rad) { barPivot.rotation.y = rad; },
+    /**
+     * Drive the transmission from one number: crank angle in radians.
+     * Rotates the cranks, keeps the pedal platforms level and walks the chain.
+     */
+    setDrive(crankAngle) {
+      crankPivot.rotation.x = crankAngle;
+      pedalPivots[0].rotation.x = -crankAngle;
+      pedalPivots[1].rotation.x = -crankAngle;
+      placeChain(-crankAngle * drive.ringR);
+    },
+    /**
+     * Wheel roll angle. Wheels spin about their local +X, and rolling FORWARD is
+     * an INCREASING angle (a point at the top of the tyre travels toward +Z).
+     * Distance travelled d metres => rad = d / TUNING.wheelRadius.
+     */
+    setWheelSpin(rad) {
+      rearWheel.rotation.x = rad;
+      frontWheel.rotation.x = rad;
+    },
+  };
+  return bike;
+}
+
+// ---------------------------------------------------------------------------
+// rider: skeleton + skinned body
+// ---------------------------------------------------------------------------
+
+const LIMB = { upperArm: 0.300, foreArm: 0.260, thigh: 0.440, shin: 0.430 };
+
+function riderPose(pts) {
+  const hips = V(0, 0.940, -0.245);
+  const lean = V(0, Math.cos(40 * DEG), Math.sin(40 * DEG));           // torso axis
+  const chest = hips.clone().addScaledVector(lean, 0.460);
+  const spine = hips.clone().lerp(chest, 0.46);
+  const neck = chest.clone().addScaledVector(lean, 0.105).add(V(0, 0.020, -0.020));
+  const head = neck.clone().add(V(0, 0.070, 0.012));
+
+  const shoulder = (s) => chest.clone().add(V(s * 0.180, 0.022, 0.004));
+  const wristFor = (s) => (s > 0 ? pts.gripR : pts.gripL).clone().add(V(0, 0.012, -0.020));
+  const hip = (s) => hips.clone().add(V(s * 0.096, -0.014, 0.012));
+  const ankle = (s) => (s > 0 ? pts.pedalR : pts.pedalL).clone().add(V(s * -0.008, 0.074, -0.030));
+
+  const pose = { hips, spine, chest, neck, head, lean };
+  for (const [side, s] of [['R', 1], ['L', -1]]) {
+    const sh = shoulder(s), wr = wristFor(s);
+    const el = ikJoint(sh, wr, LIMB.upperArm, LIMB.foreArm, V(s * 0.86, -0.34, -0.38));
+    const hp = hip(s), an = ankle(s);
+    const kn = ikJoint(hp, an, LIMB.thigh, LIMB.shin, V(s * 0.30, 0.16, 1.0));
+    pose['shoulder' + side] = sh;
+    pose['elbow' + side] = el;
+    pose['wrist' + side] = wr;
+    pose['hip' + side] = hp;
+    pose['knee' + side] = kn;
+    pose['ankle' + side] = an;
+    pose['toe' + side] = an.clone().add(V(s * 0.004, -0.052, 0.150));
+  }
+  return pose;
+}
+
+function buildSkeleton(pose) {
+  const bones = [], index = new Map(), world = new Map();
+  const add = (name, pos, parentName) => {
+    const b = new THREE.Bone();
+    b.name = name;
+    world.set(name, pos.clone());
+    if (parentName) {
+      b.position.copy(pos).sub(world.get(parentName));
+      index.get(parentName).b.add(b);
+    } else {
+      b.position.copy(pos);
+    }
+    index.set(name, { b, i: bones.length });
+    bones.push(b);
+    return b;
+  };
+  add('hips', pose.hips, null);
+  add('spine', pose.spine, 'hips');
+  add('chest', pose.chest, 'spine');
+  add('neck', pose.neck, 'chest');
+  add('head', pose.head, 'neck');
+  for (const side of ['R', 'L']) {
+    add('shoulder' + side, pose['shoulder' + side], 'chest');
+    add('elbow' + side, pose['elbow' + side], 'shoulder' + side);
+    add('wrist' + side, pose['wrist' + side], 'elbow' + side);
+    add('hip' + side, pose['hip' + side], 'hips');
+    add('knee' + side, pose['knee' + side], 'hip' + side);
+    add('ankle' + side, pose['ankle' + side], 'knee' + side);
+    add('toe' + side, pose['toe' + side], 'ankle' + side);
+  }
+  const bi = {};
+  for (const [name, v] of index) bi[name] = v.i;
+  return { bones, boneIndex: bi, byName: Object.fromEntries([...index].map(([k, v]) => [k, v.b])) };
+}
+
+/** Weight a part to one bone, ramping toward a second along the limb axis. */
+function skinPart(geo, boneIndex, aName, bName, a, b, from = 0.62, to = 1.0, max = 0.85) {
+  const p = geo.attributes.position;
+  const n = p.count;
+  const si = new Uint16Array(n * 4), sw = new Float32Array(n * 4);
+  const ia = boneIndex[aName];
+  const ib = bName != null ? boneIndex[bName] : ia;
+  const dir = b ? b.clone().sub(a) : null;
+  const len2 = dir ? Math.max(dir.lengthSq(), 1e-8) : 1;
+  const v = new THREE.Vector3();
+  for (let i = 0; i < n; i++) {
+    let w = 0;
+    if (dir) {
+      v.fromBufferAttribute(p, i).sub(a);
+      const t = v.dot(dir) / len2;
+      w = clamp((t - from) / (to - from), 0, 1) * max;
+    }
+    si[i * 4] = ia; si[i * 4 + 1] = ib;
+    sw[i * 4] = 1 - w; sw[i * 4 + 1] = w;
+  }
+  geo.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(si, 4));
+  geo.setAttribute('skinWeight', new THREE.Float32BufferAttribute(sw, 4));
+  return geo;
+}
+
+/**
+ * Weight a part across a chain of bones by projecting each vertex onto the chain
+ * axis — used for the one-piece torso so hips/spine/chest all deform it.
+ */
+function skinAlong(geo, boneIndex, names, points) {
+  const p = geo.attributes.position;
+  const n = p.count;
+  const si = new Uint16Array(n * 4), sw = new Float32Array(n * 4);
+  const a = points[0], b = points[points.length - 1];
+  const dir = b.clone().sub(a);
+  const len2 = Math.max(dir.lengthSq(), 1e-8);
+  const ts = points.map((q) => q.clone().sub(a).dot(dir) / len2);
+  const v = new THREE.Vector3();
+  for (let i = 0; i < n; i++) {
+    v.fromBufferAttribute(p, i).sub(a);
+    const t = clamp(v.dot(dir) / len2, 0, 1);
+    let k = 0;
+    while (k < ts.length - 2 && t > ts[k + 1]) k++;
+    const span = Math.max(ts[k + 1] - ts[k], 1e-5);
+    const w = smoothstep(clamp((t - ts[k]) / span, 0, 1));
+    si[i * 4] = boneIndex[names[k]];
+    si[i * 4 + 1] = boneIndex[names[k + 1]];
+    sw[i * 4] = 1 - w;
+    sw[i * 4 + 1] = w;
+  }
+  geo.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(si, 4));
+  geo.setAttribute('skinWeight', new THREE.Float32BufferAttribute(sw, 4));
+  return geo;
+}
+
+function buildRiderBody(pose, boneIndex) {
+  const parts = [];
+  const fwd = V(0, 0, 1);
+  const limb = (a, b, ra, rb, opts = {}) => {
+    const len = a.distanceTo(b);
+    const g = capsule2(len, ra, rb, opts);
+    return place(g, a, b, opts.front || fwd);
+  };
+  const push = (geo, bandIdx, skin) => {
+    band(geo, bandIdx, RD.N);
+    skin(geo);
+    parts.push(geo);
+  };
+
+  // --- torso: one continuous loft from the shorts to the collar so there are no
+  // internal capsule caps bulging through the jersey ---------------------------
+  const torsoA = pose.hips.clone().addScaledVector(pose.lean, -0.105);
+  const torsoB = pose.neck.clone();
+  const torso = limb(torsoA, torsoB, 0.150, 0.082, {
+    radial: 16, capSegs: 4, bodyRings: 7, front: pose.lean,
+    // waist in, chest out, taper to the collar
+    mid: (t) => (t < 0.30 ? lerp(1.02, 0.90, t / 0.30)
+      : t < 0.62 ? lerp(0.90, 1.30, smoothstep((t - 0.30) / 0.32))
+        : lerp(1.30, 1.02, smoothstep((t - 0.62) / 0.38))),
+    shape: (t) => [lerp(1.14, 1.28, smoothstep(clamp(t * 1.5, 0, 1))), lerp(0.88, 0.80, t)],
+  });
+  push(torso, RD.PRINT, (g) => skinAlong(g, boneIndex, ['hips', 'spine', 'chest', 'neck'],
+    [torsoA, pose.spine, pose.chest, torsoB]));
+
+  // neck + head
+  push(limb(pose.neck.clone().add(V(0, -0.03, 0)), pose.head.clone().add(V(0, 0.03, 0)), 0.055, 0.050,
+    { radial: 10, capSegs: 3 }),
+  RD.SKIN, (g) => skinPart(g, boneIndex, 'neck', 'head', pose.neck, pose.head, 0.2, 1.0, 0.85));
+
+  const headC = pose.head.clone().add(V(0, 0.072, 0.012));
+  const head = new THREE.SphereGeometry(0.098, 20, 14);
+  {
+    const p = head.attributes.position;
+    const t = new THREE.Vector3();
+    for (let i = 0; i < p.count; i++) {
+      t.fromBufferAttribute(p, i);
+      const r = 0.098;
+      let x = t.x * 0.93, y = t.y * 1.05, z = t.z * 1.08;
+      const yn = t.y / r, zn = t.z / r;
+      if (yn < 0) x *= 1 - 0.30 * yn * yn;                       // jaw taper
+      if (yn < -0.25 && zn > 0.1) { y -= 0.012 * (-yn); z += 0.020 * zn * (-yn - 0.25); }  // chin
+      if (yn > 0.55) z -= 0.014 * (yn - 0.55);                   // brow / crown
+      const nose = Math.max(0, 1 - Math.hypot(t.x / 0.022, (t.y + 0.006) / 0.030));
+      if (zn > 0.5) z += nose * 0.020;
+      p.setXYZ(i, x, y, z);
+    }
+    head.computeVertexNormals();
+    head.translate(headC.x, headC.y, headC.z);
+  }
+  push(head, RD.SKIN, (g) => skinPart(g, boneIndex, 'head', null));
+  for (const s of [-1, 1]) {
+    const ear = new THREE.SphereGeometry(0.026, 8, 6);
+    ear.scale(0.42, 1.0, 0.72);
+    ear.translate(headC.x + s * 0.090, headC.y - 0.004, headC.z - 0.014);
+    push(ear, RD.SKIN, (g) => skinPart(g, boneIndex, 'head', null));
+  }
+  // hair at the nape, below the helmet
+  const hair = new THREE.SphereGeometry(0.072, 10, 8);
+  hair.scale(1.05, 0.55, 0.9);
+  hair.translate(headC.x, headC.y - 0.052, headC.z - 0.052);
+  push(hair, RD.GEAR, (g) => skinPart(g, boneIndex, 'head', null));
+
+  // --- arms --------------------------------------------------------------------
+  for (const [side, s] of [['R', 1], ['L', -1]]) {
+    const sh = pose['shoulder' + side], el = pose['elbow' + side], wr = pose['wrist' + side];
+
+    // the sleeve starts fat at the shoulder so its cap forms the deltoid — no
+    // separate ball on top of the shoulder
+    push(limb(sh.clone().addScaledVector(el.clone().sub(sh).normalize(), -0.022), sh.clone().lerp(el, 0.52),
+      0.069, 0.051, { radial: 12, capSegs: 4, shape: (t) => [1, lerp(0.92, 1.0, t)] }),
+    RD.JERSEY, (g) => skinPart(g, boneIndex, 'shoulder' + side, 'elbow' + side, sh, el, 0.45, 1.0, 0.6));
+    push(limb(sh.clone().lerp(el, 0.44), el, 0.047, 0.042, { radial: 10, capSegs: 3 }),
+      RD.SKIN, (g) => skinPart(g, boneIndex, 'shoulder' + side, 'elbow' + side, sh, el, 0.5, 0.98, 0.85));
+    push(limb(el, wr, 0.045, 0.032, { radial: 10, capSegs: 3, mid: (t) => lerp(1.05, 0.98, t) }),
+      RD.SKIN, (g) => skinPart(g, boneIndex, 'elbow' + side, 'wrist' + side, el, wr, 0.55, 1.0, 0.9));
+
+    // glove: palm block wrapping the grip, plus a thumb
+    const gripDir = V(s, 0.02, -0.08).normalize();
+    const palmA = wr.clone().addScaledVector(gripDir, -0.020);
+    const palmB = wr.clone().addScaledVector(gripDir, 0.088);
+    push(limb(palmA, palmB, 0.042, 0.037, { radial: 10, capSegs: 3, shape: () => [1.0, 1.18] }),
+      RD.GEAR, (g) => skinPart(g, boneIndex, 'wrist' + side, null));
+    const thumb = limb(wr.clone().add(V(0, 0.014, 0.026)), wr.clone().add(V(s * 0.036, 0.006, 0.052)), 0.017, 0.014, { radial: 8, capSegs: 3 });
+    push(thumb, RD.GEAR, (g) => skinPart(g, boneIndex, 'wrist' + side, null));
+    const cuff = limb(wr.clone().addScaledVector(gripDir, -0.056), wr.clone().addScaledVector(gripDir, -0.014), 0.041, 0.045, { radial: 10, capSegs: 2 });
+    push(cuff, RD.GEAR, (g) => skinPart(g, boneIndex, 'wrist' + side, null));
+  }
+
+  // --- legs --------------------------------------------------------------------
+  for (const [side, s] of [['R', 1], ['L', -1]]) {
+    const hp = pose['hip' + side], kn = pose['knee' + side], an = pose['ankle' + side], toe = pose['toe' + side];
+
+    push(limb(hp.clone().add(V(0, 0.03, 0)), kn, 0.108, 0.070, { radial: 12, capSegs: 3, mid: (t) => lerp(1.04, 1.0, t) }),
+      RD.PANTS, (g) => skinPart(g, boneIndex, 'hip' + side, 'knee' + side, hp, kn, 0.62, 1.0, 0.85));
+    push(limb(kn, an, 0.073, 0.050, { radial: 12, capSegs: 3 }),
+      RD.KNEE, (g) => skinPart(g, boneIndex, 'knee' + side, 'ankle' + side, kn, an, 0.68, 1.02, 0.8));
+
+    // knee/shin pad
+    const padDir = kn.clone().sub(hp).normalize().add(an.clone().sub(kn).normalize()).normalize();
+    const out = V(0, 0, 1).cross(padDir).cross(padDir).negate().normalize();
+    const padA = kn.clone().addScaledVector(out, 0.048).addScaledVector(padDir, -0.030);
+    const padB = kn.clone().addScaledVector(out, 0.040).addScaledVector(padDir, 0.150);
+    const pad = limb(padA, padB, 0.058, 0.046, { radial: 10, capSegs: 3, shape: () => [1.0, 0.52] });
+    push(pad, RD.GEAR, (g) => skinPart(g, boneIndex, 'knee' + side, 'ankle' + side, kn, an, 0.45, 1.0, 0.7));
+
+    // shoe: upper, then a sole slab under it
+    const heel = an.clone().add(V(0, -0.036, -0.058));
+    const tip = toe.clone().add(V(0, 0.006, 0.026));
+    // front hint points down so u = 0.5 lands on the top of the foot (laces)
+    const shoeFront = V(0, -1, 0);
+    const shoe = limb(heel, tip, 0.052, 0.042, { radial: 12, capSegs: 3, front: shoeFront, shape: (t) => [lerp(1.0, 0.92, t), lerp(1.0, 0.78, t)] });
+    push(shoe, RD.SHOE, (g) => skinPart(g, boneIndex, 'ankle' + side, 'toe' + side, an, toe, 0.55, 1.0, 0.6));
+    const soleA = heel.clone().add(V(0, -0.030, 0));
+    const soleB = tip.clone().add(V(0, -0.026, 0));
+    const sole = limb(soleA, soleB, 0.040, 0.034, { radial: 10, capSegs: 2, front: shoeFront, shape: () => [1.06, 0.42] });
+    push(sole, RD.SOLE, (g) => skinPart(g, boneIndex, 'ankle' + side, 'toe' + side, an, toe, 0.55, 1.0, 0.6));
+    const ankleCuff = limb(an.clone().add(V(0, -0.030, -0.012)), an.clone().add(V(0, 0.030, -0.004)), 0.056, 0.052, { radial: 10, capSegs: 2 });
+    push(ankleCuff, RD.SHOE, (g) => skinPart(g, boneIndex, 'ankle' + side, null));
+  }
+
+  return merge(parts);
+}
+
+// ---------------------------------------------------------------------------
+// rider: helmet with real vents, peak, goggles
+// ---------------------------------------------------------------------------
+
+function surfPoint(centre, th, ph, r, s) {
+  return V(
+    centre.x + Math.sin(ph) * Math.sin(th) * s[0] * r,
+    centre.y + Math.cos(ph) * s[1] * r,
+    centre.z + Math.sin(ph) * Math.cos(th) * s[2] * r,
+  );
+}
+
+const _qa = new THREE.Vector3(), _qb = new THREE.Vector3(), _qn = new THREE.Vector3();
+
+/**
+ * Hand-built quad surface. `ref` is the direction the quad should face; the
+ * winding is flipped to match, so these parametric shells can never end up
+ * inside-out no matter which way the parameters run.
+ */
+function quadSoup() {
+  const pos = [], uv = [];
+  return {
+    pos, uv,
+    add(a, b, c, d, uvs, ref) {
+      if (ref) {
+        _qa.copy(b).sub(a); _qb.copy(c).sub(a);
+        _qn.copy(_qa).cross(_qb);
+        if (_qn.dot(ref) < 0) { const t = b; b = d; d = t; }
+      }
+      pos.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+      pos.push(a.x, a.y, a.z, c.x, c.y, c.z, d.x, d.y, d.z);
+      const [u0, v0, u1, v1] = uvs;
+      uv.push(u0, v0, u1, v0, u1, v1);
+      uv.push(u0, v0, u1, v1, u0, v1);
+    },
+    geometry() {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+      g.computeVertexNormals();
+      return normalise(g);
+    },
+  };
+}
+
+function buildHelmet(headC) {
+  const R = 0.130, T = 0.015;
+  const NU = 48, NV = 14;
+  const S = [1.00, 1.06, 1.10];
+  const phiMax = (th) => 1.78 - 0.22 * Math.cos(th);
+  // vent slots: [theta degrees from front, half width, v0, v1] — mirrored in ±theta
+  const slots = [[0, 3.4, 0.10, 0.40], [20, 3.2, 0.26, 0.62], [42, 3.0, 0.30, 0.66],
+    [66, 2.8, 0.36, 0.60], [150, 3.4, 0.24, 0.52], [180, 3.6, 0.18, 0.42]];
+  const angDiff = (a, b) => {
+    let d = Math.abs(a - b) % TAU;
+    return d > Math.PI ? TAU - d : d;
+  };
+  const isVent = (th, v) => {
+    for (const [deg, hw, v0, v1] of slots) {
+      if (v < v0 || v > v1) continue;
+      const w = hw * DEG;
+      if (angDiff(th, deg * DEG) < w || angDiff(th, -deg * DEG) < w) return true;
+    }
+    return false;
+  };
+  const solid = [];
+  for (let i = 0; i < NU; i++) {
+    solid[i] = [];
+    for (let j = 0; j < NV; j++) {
+      const th = ((i + 0.5) / NU) * TAU;
+      solid[i][j] = !isVent(th, (j + 0.5) / NV);
+    }
+  }
+  const P = (i, j, r) => {
+    const th = (i / NU) * TAU;
+    return surfPoint(headC, th, (j / NV) * phiMax(th), r, S);
+  };
+
+  const outer = quadSoup(), inner = quadSoup(), walls = quadSoup();
+  for (let i = 0; i < NU; i++) {
+    for (let j = 0; j < NV; j++) {
+      if (!solid[i][j]) continue;
+      const u0 = i / NU, u1 = (i + 1) / NU, v0 = j / NV, v1 = (j + 1) / NV;
+      const outDir = P(i, j, R).sub(headC);
+      outer.add(P(i, j, R), P(i + 1, j, R), P(i + 1, j + 1, R), P(i, j + 1, R), [u0, v0, u1, v1], outDir);
+      inner.add(P(i, j + 1, R - T), P(i + 1, j + 1, R - T), P(i + 1, j, R - T), P(i, j, R - T),
+        [u0, v0, u1, v1], outDir.clone().negate());
+      const nb = [
+        [(i + 1) % NU, j, [P(i + 1, j, R), P(i + 1, j + 1, R), P(i + 1, j + 1, R - T), P(i + 1, j, R - T)]],
+        [(i - 1 + NU) % NU, j, [P(i, j + 1, R), P(i, j, R), P(i, j, R - T), P(i, j + 1, R - T)]],
+        [i, j + 1, [P(i + 1, j + 1, R), P(i, j + 1, R), P(i, j + 1, R - T), P(i + 1, j + 1, R - T)]],
+        [i, j - 1, [P(i, j, R), P(i + 1, j, R), P(i + 1, j, R - T), P(i, j, R - T)]],
+      ];
+      for (const [ni, nj, quad] of nb) {
+        const open = nj < 0 || nj >= NV || !solid[ni][nj];
+        if (!open) continue;
+        // wall faces away from the cell it belongs to
+        const mid = quad[0].clone().add(quad[1]).add(quad[2]).add(quad[3]).multiplyScalar(0.25);
+        const cell = P(i + 0.5, j + 0.5, R - T * 0.5);
+        walls.add(quad[0], quad[1], quad[2], quad[3], [0.2, 0.2, 0.8, 0.8], mid.sub(cell));
+      }
+    }
+  }
+
+  const parts = [
+    band(outer.geometry(), HM.SHELL, HM.N),
+    band(inner.geometry(), HM.LINER, HM.N),
+    band(walls.geometry(), HM.VENT, HM.N),
+  ];
+
+  // peak / visor
+  const peak = quadSoup();
+  const NP = 18, NL = 3, span = 50 * DEG, len = 0.068;
+  for (let i = 0; i < NP; i++) {
+    for (let j = 0; j < NL; j++) {
+      const th0 = lerp(-span, span, i / NP), th1 = lerp(-span, span, (i + 1) / NP);
+      const s0 = j / NL, s1 = (j + 1) / NL;
+      const pk = (th, s, up) => {
+        const base = surfPoint(headC, th, phiMax(th) * 0.70, R, S);
+        const out = V(Math.sin(th) * 0.45, -0.10, Math.cos(th)).normalize();
+        return base.addScaledVector(out, len * s)
+          .add(V(0, -0.030 * s * s + (up ? 0.005 : -0.003), 0));
+      };
+      const pu0 = 0.42 + (i / NP) * 0.06, pu1 = 0.42 + ((i + 1) / NP) * 0.06;
+      peak.add(pk(th0, s0, true), pk(th1, s0, true), pk(th1, s1, true), pk(th0, s1, true),
+        [pu0, 0.2, pu1, 0.8], V(0, 1, 0));
+      peak.add(pk(th0, s1, false), pk(th1, s1, false), pk(th1, s0, false), pk(th0, s0, false),
+        [pu0, 0.2, pu1, 0.8], V(0, -1, 0));
+    }
+  }
+  parts.push(band(peak.geometry(), HM.SHELL, HM.N));
+
+  // goggle strap over the shell
+  const strap = quadSoup();
+  for (let i = 0; i < NU; i++) {
+    const th0 = (i / NU) * TAU, th1 = ((i + 1) / NU) * TAU;
+    const inFront = (t) => Math.cos(t) > 0.62;
+    if (inFront(th0) && inFront(th1)) continue;
+    const r = R * 1.018;
+    const a = surfPoint(headC, th0, phiMax(th0) * 0.80, r, S);
+    const b = surfPoint(headC, th1, phiMax(th1) * 0.80, r, S);
+    const c = surfPoint(headC, th1, phiMax(th1) * 0.94, r, S);
+    const d = surfPoint(headC, th0, phiMax(th0) * 0.94, r, S);
+    const outDir = a.clone().sub(headC);
+    strap.add(a, b, c, d, [i / NU, 0.1, (i + 1) / NU, 0.9], outDir);
+    strap.add(a, b, c, d, [i / NU, 0.1, (i + 1) / NU, 0.9], outDir.clone().negate());
+  }
+  parts.push(band(strap.geometry(), HM.STRAP, HM.N));
+
+  // chin straps + buckle
+  const chin = headC.clone().add(V(0, -0.112, 0.014));
+  for (const s of [-1, 1]) {
+    const a = surfPoint(headC, s * 78 * DEG, phiMax(s * 78 * DEG) * 0.98, R * 0.98, S);
+    const m = a.clone().lerp(chin, 0.5).add(V(s * 0.012, 0.006, 0.006));
+    const g = sweep([a, m, chin], { radius: 0.0115, radial: 5, steps: 8, oval: () => [1, 0.30] });
+    parts.push(band(g, HM.STRAP, HM.N));
+  }
+  const buckle = new THREE.BoxGeometry(0.022, 0.016, 0.008);
+  buckle.translate(chin.x, chin.y, chin.z);
+  parts.push(band(buckle, HM.LINER, HM.N));
+
+  return merge(parts);
+}
+
+function buildGoggleLens(headC) {
+  const soup = quadSoup();
+  const NU = 18, NV = 4;
+  const S = [0.95, 1.05, 1.08];
+  const th0 = -62 * DEG, th1 = 62 * DEG, p0 = 1.14, p1 = 1.56;
+  for (let i = 0; i < NU; i++) {
+    for (let j = 0; j < NV; j++) {
+      const ta = lerp(th0, th1, i / NU), tb = lerp(th0, th1, (i + 1) / NU);
+      const pa = lerp(p0, p1, j / NV), pb = lerp(p0, p1, (j + 1) / NV);
+      const r = 0.1045, ri = 0.0995;
+      const outDir = surfPoint(headC, (ta + tb) / 2, (pa + pb) / 2, r, S).sub(headC);
+      soup.add(
+        surfPoint(headC, ta, pa, r, S), surfPoint(headC, tb, pa, r, S),
+        surfPoint(headC, tb, pb, r, S), surfPoint(headC, ta, pb, r, S),
+        [i / NU, j / NV, (i + 1) / NU, (j + 1) / NV], outDir,
+      );
+      soup.add(
+        surfPoint(headC, ta, pb, ri, S), surfPoint(headC, tb, pb, ri, S),
+        surfPoint(headC, tb, pa, ri, S), surfPoint(headC, ta, pa, ri, S),
+        [i / NU, j / NV, (i + 1) / NU, (j + 1) / NV], outDir.clone().negate(),
+      );
+    }
+  }
+  // frame edge
+  for (let i = 0; i < NU; i++) {
+    const ta = lerp(th0, th1, i / NU), tb = lerp(th0, th1, (i + 1) / NU);
+    for (const [p, sgn] of [[p0, -1], [p1, 1]]) {
+      const a = surfPoint(headC, ta, p, 0.1045, S), b = surfPoint(headC, tb, p, 0.1045, S);
+      const c = surfPoint(headC, tb, p, 0.0995, S), d = surfPoint(headC, ta, p, 0.0995, S);
+      const along = surfPoint(headC, (ta + tb) / 2, p + sgn * 0.05, 0.1045, S)
+        .sub(surfPoint(headC, (ta + tb) / 2, p, 0.1045, S));
+      soup.add(a, b, c, d, [0, 0, 1, 1], along);
+    }
+  }
+  return soup.geometry();
+}
+
+// ---------------------------------------------------------------------------
+// public API
+// ---------------------------------------------------------------------------
+
+export async function createRider(ctx) {
+  const texStart = _textures.length;
+  const mats = buildMaterials(ctx?.renderer);
+  const rmats = buildRiderMaterials(mats.aniso);
+
+  const group = new THREE.Group();
+  group.name = 'rider';
+
+  const bike = buildBike(mats);
+  group.add(bike.group);
+
+  // --- skeleton ---------------------------------------------------------------
+  const pose = riderPose(bike.points);
+  const { bones, boneIndex, byName } = buildSkeleton(pose);
+  group.add(bones[0]);
+  bones[0].updateMatrixWorld(true);
+
+  const bodyGeo = buildRiderBody(pose, boneIndex);
+  const skinned = new THREE.SkinnedMesh(bodyGeo, rmats.rider);
+  skinned.name = 'riderBody';
+  skinned.castShadow = true;
+  skinned.receiveShadow = true;
+  skinned.frustumCulled = false;
+  group.add(skinned);
+  const skeleton = new THREE.Skeleton(bones);
+  skinned.bind(skeleton);
+
+  // --- helmet + goggles ride on the head bone ---------------------------------
+  const headC = pose.head.clone().add(V(0, 0.072, 0.012));
+  const headBone = byName.head;
+  headBone.updateMatrixWorld(true);
+  const headInv = new THREE.Matrix4().copy(headBone.matrixWorld).invert();
+
+  const helmetGeo = buildHelmet(headC);
+  helmetGeo.applyMatrix4(headInv);
+  const helmet = new THREE.Mesh(helmetGeo, rmats.helmet);
+  helmet.name = 'helmet';
+  helmet.castShadow = true;
+  helmet.receiveShadow = true;
+  headBone.add(helmet);
+
+  const lensGeo = buildGoggleLens(headC);
+  lensGeo.applyMatrix4(headInv);
+  const lens = new THREE.Mesh(lensGeo, rmats.lens);
+  lens.name = 'goggles';
+  lens.castShadow = true;
+  headBone.add(lens);
+
+  // --- rig handed to riderAnim -------------------------------------------------
+  const rig = {
+    root: bones[0],
+    hips: byName.hips,
+    spine: byName.spine,
+    chest: byName.chest,
+    neck: byName.neck,
+    head: byName.head,
+    shoulderL: byName.shoulderL, elbowL: byName.elbowL, wristL: byName.wristL,
+    shoulderR: byName.shoulderR, elbowR: byName.elbowR, wristR: byName.wristR,
+    hipL: byName.hipL, kneeL: byName.kneeL, ankleL: byName.ankleL, toeL: byName.toeL,
+    hipR: byName.hipR, kneeR: byName.kneeR, ankleR: byName.ankleR, toeR: byName.toeR,
+    armL: [byName.shoulderL, byName.elbowL, byName.wristL],
+    armR: [byName.shoulderR, byName.elbowR, byName.wristR],
+    legL: [byName.hipL, byName.kneeL, byName.ankleL, byName.toeL],
+    legR: [byName.hipR, byName.kneeR, byName.ankleR, byName.toeR],
+    spineChain: [byName.hips, byName.spine, byName.chest, byName.neck, byName.head],
+    bones, skeleton, byName,
+    mesh: skinned,
+    /** Bind-pose joint positions in bike space — handy for IK targets. */
+    bindPose: pose,
+  };
+
+  const materials = {
+    paint: mats.paint,
+    hardware: mats.hardware,
+    rubber: mats.rubber,
+    rider: rmats.rider,
+    helmet: rmats.helmet,
+    lens: rmats.lens,
+  };
+
+  const owned = _textures.splice(texStart);
+
+  return {
+    group,
+    bike,
+    rig,
+    materials,
+    helmet,
+    goggles: lens,
+    /** Optional convenience: the animator may drive these directly instead. */
+    setDrive: bike.setDrive,
+    setSteer: bike.setSteer,
+    setBarspin: bike.setBarspin,
+    update() {},
+    dispose() {
+      group.traverse((o) => {
+        if (o.isMesh || o.isSkinnedMesh || o.isInstancedMesh) o.geometry?.dispose();
+      });
+      for (const m of Object.values(materials)) m.dispose();
+      for (const t of owned) t.dispose();
+      skeleton.dispose?.();
+      group.removeFromParent();
+    },
+  };
+}
+

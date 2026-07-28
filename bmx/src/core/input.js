@@ -124,7 +124,23 @@ export function createInput(domElement = window) {
       state.lean = lean;
       state.throttle = throttle;
       state.brake = brake;
+
+      // Scripted-input hook used by the screenshot harness / demo autopilot.
+      if (api.harness) {
+        const h = api.harness(now, api);
+        if (h) {
+          if (h.steer != null) state.steer = h.steer;
+          if (h.lean != null) state.lean = h.lean;
+          if (h.throttle != null) state.throttle = h.throttle;
+          if (h.brake != null) state.brake = h.brake;
+          if (h.press) for (const a of h.press) { down.add(a); lastPressAt.set(a, now); }
+          if (h.release) for (const a of h.release) down.delete(a);
+        }
+      }
     },
+
+    /** fn(nowMs, input) -> { steer, lean, throttle, brake, press:[], release:[] } | null */
+    harness: null,
 
     _keyHeld(action) {
       // whether a physical key (not pad) currently holds this action — approximation

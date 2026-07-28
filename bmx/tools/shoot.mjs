@@ -29,27 +29,29 @@ const ONLY = (arg('only', '') || '').split(',').filter(Boolean);
 const QUALITY = arg('q', 'high');
 
 /** Beauty/diagnostic shots. `cam` = [px,py,pz, tx,ty,tz, fov]. */
+// `rel` = camera offset relative to the rider [x, y, z, fov] (used with `setup`).
+// `cam` = absolute [px,py,pz, tx,ty,tz, fov] for environment shots.
 export const SHOTS = [
   { id: 'hero', desc: 'Signature marketing frame: rider mid-air off the big quarterpipe, park and skyline behind.',
-    cam: [14, 7.5, 16, 0, 3.2, 0, 40], setup: 'air' },
+    setup: 'air', rel: [3.4, 1.2, 4.2, 42] },
   { id: 'park-wide', desc: 'Establishing wide of the whole park showing layout, lighting and set dressing.',
     cam: [-34, 22, 38, 0, 1, -4, 45] },
   { id: 'rider-closeup', desc: 'Close-up on the rider and bike: frame welds, spokes, tyre tread, cloth, helmet.',
-    cam: [2.4, 1.5, 2.6, 0, 1.0, 0, 34], setup: 'idle' },
+    setup: 'idle', rel: [1.9, 0.7, 2.2, 34] },
   { id: 'bike-detail', desc: 'Macro on the drivetrain and rear wheel: cranks, sprocket, chain, pegs, hub.',
-    cam: [1.1, 0.65, 1.0, 0.05, 0.45, 0, 26], setup: 'idle' },
+    setup: 'idle', rel: [0.9, -0.25, 1.1, 26] },
   { id: 'grind', desc: 'Rail grind: sparks, contact shadow, rail material, rider balance pose.',
-    cam: [5.5, 2.6, 5.5, 0, 1.2, 0, 42], setup: 'grind' },
+    setup: 'grind', rel: [3.2, 0.9, 3.4, 40] },
   { id: 'gameplay', desc: 'Actual in-game chase camera during a run — what the player really sees, HUD included.',
-    cam: null, setup: 'play' },
+    setup: 'play' },
   { id: 'bowl', desc: 'Bowl / pool section: coping, transitions, tiling, drain, graffiti.',
-    cam: [10, 8, 14, -6, 0, -6, 48] },
+    cam: [-20, 8, 14, -30, 0, 0, 48] },
   { id: 'ground-detail', desc: 'Low angle at ground level: concrete texel density, cracks, AO contact, decals.',
-    cam: [2, 0.35, 2, -2, 0.1, -3, 40] },
+    cam: [4, 0.35, 16, -4, 0.1, 6, 40] },
   { id: 'skyline', desc: 'Camera looking out at the sky, backdrop and distant city — atmosphere and fog.',
-    cam: [0, 6, 10, 0, 12, -60, 55] },
+    cam: [0, 6, 20, 0, 14, -60, 55] },
   { id: 'dusk', desc: 'Same hero framing under the evening lighting preset (lights, bloom, shadow length).',
-    cam: [14, 7.5, 16, 0, 3.2, 0, 40], setup: 'air', timeOfDay: 0.85 },
+    setup: 'air', rel: [3.4, 1.2, 4.2, 42], timeOfDay: 0.88 },
 ];
 
 function freePort(start = 5178) {
@@ -145,15 +147,14 @@ async function main() {
           const B = window.__BMX;
           if (!B) return;
           if (s.timeOfDay != null) B.ctx.world.environment.setTimeOfDay?.(s.timeOfDay);
-          if (s.setup === 'idle') B.harnessPose?.('idle');
-          if (s.setup === 'air') B.harnessPose?.('air');
-          if (s.setup === 'grind') B.harnessPose?.('grind');
-          if (s.setup === 'play') { B.harnessPose?.('play'); return; }
-          if (s.cam) B.setCamera(...s.cam);
+          else B.ctx.world.environment.setTimeOfDay?.(0.72);
+          if (s.setup) B.harnessPose?.(s.setup, s.rel);
+          else if (s.cam) B.setCamera(...s.cam);
         }, shot);
-        await page.waitForTimeout(shot.setup === 'play' ? 2600 : 900);
+        await page.waitForTimeout(shot.setup === 'play' ? 5000 : 1200);
+        if (shot.setup === 'play') await page.evaluate(() => window.__BMX?.pause(true));
         const file = path.join(OUT, `${shot.id}.png`);
-        await page.screenshot({ path: file, type: 'png' });
+        await page.screenshot({ path: file, type: 'png', timeout: 180000 });
         report.shots.push({ id: shot.id, desc: shot.desc, file: path.relative(ROOT, file) });
       } catch (e) {
         report.shots.push({ id: shot.id, error: String(e) });

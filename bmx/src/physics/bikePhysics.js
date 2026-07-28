@@ -36,14 +36,14 @@ export const TUNING = {
   crankRatio: 2.6,          // gearing: wheel revs per crank rev — sets the pedal cadence you see
 
   // --- drive ---------------------------------------------------------------
-  gravity: 17.5,            // m/s² — lower than real life so airs float like DMFBMX2 (0.9 m hop, ~2 m natural QP air)
+  gravity: 17.5,            // m/s² — lower than real life so airs float like DMFBMX2 (0.9 m hop off flat)
   maxSpeed: 14.0,           // m/s target top speed on flat concrete
   speedHardCap: 24.0,       // m/s absolute clamp — a long drop-in cannot run away with the sim
-  pedalAccel: 10.0,         // m/s² pedal thrust — held nearly flat through the midrange by pedalFalloff
+  pedalAccel: 9.5,         // m/s² pedal thrust — held nearly flat through the midrange by pedalFalloff
   pedalFalloff: 4.0,        // exponent of the accel roll-off: high keeps thrust flat, then it dies near the top
   pedalTopFactor: 1.04,     // the pedal curve dies at maxSpeed×this — the curve, not drag, sets the ceiling
   coastDrag: 0.006,         // quadratic drag while rolling — deliberately low so transitions keep their energy
-  rollResist: 0.35,         // m/s² constant rolling drag, scaled by surface friction — dirt drags, concrete rolls
+  rollResist: 0.18,         // m/s² constant rolling drag, scaled by surface friction — dirt drags, concrete rolls
   brakeDecel: 13.5,         // m/s² rear brake authority
   lockupBrake: 0.55,        // brake input above this locks the rear wheel into a skid
   skidMinSpeed: 2.6,        // m/s below which a locked wheel just stops instead of skidding
@@ -70,7 +70,7 @@ export const TUNING = {
   lipPop: 0.9,              // m/s free pop when the wheels leave a steep lip at speed — the last metre of QP air
   lipTiltMin: 0.35,         // sin(tilt) needed to count as "a lip" rather than a rolling crest
   pumpTapTime: 0.30,        // s — a crouch shorter than this on a transition pumps instead of hopping
-  pumpGain: 3.4,            // m/s of speed a perfect pump adds at full compression on a steep wall
+  pumpGain: 5.0,            // m/s of speed a perfect pump adds at full compression on a steep wall
   pumpBudget: 3.0,          // max stored pump charges — the anti-spam cap
   pumpRefill: 0.85,         // charges/s the budget refills — roughly one good pump per transition
   pumpMinTilt: 0.16,        // sin(surface tilt) below which there is nothing to pump against
@@ -98,7 +98,7 @@ export const TUNING = {
   landNormalToTangent: 0.42,// how much slam speed converts into roll-out speed (scaled by surface steepness)
   landSpeedKeep: 0.80,      // fraction of speed kept on the sketchiest legal landing (1.0 on a perfect one)
   maxImpactSpeed: 17.0,     // m/s of closing speed into a surface that snaps the rider — flat-drop bail
-  copingStep: 0.55,         // m of front-to-rear contact mismatch that reads as "landed across the coping"
+  copingStep: 0.55,         // m of front-vs-rear contact mismatch that reads as "landed across the coping"
   stallSpeed: 1.5,          // m/s below which a steep transition stalls you out
   stallTilt: 0.80,          // sin(tilt) above which the stall rule applies (~53°) — rolling back down a bank is fine
   stallTime: 0.30,          // s of stalling before it becomes a bail
@@ -126,7 +126,7 @@ export const TUNING = {
   wallProbeRadius: 0.34,    // m sweep radius — roughly the tyre/bar envelope
   wallProbeDist: 0.62,      // m the sweep reaches ahead of the contact point
   wallGravityScale: 0.42,   // fraction of gravity felt along the wall — the "stick" of a wallride
-  wallStick: 3.2,           // m/s² pressed into the wall so you track it round corners
+  wallStick: 14.0,          // 1/s the frame is pulled onto the wall face — how firmly a wallride tracks the wall
   wallMaxTime: 1.6,         // s a wallride can last before you drop off
   wallExitPop: 2.4,         // m/s pushed off the wall when the wallride ends
   wallCooldown: 0.45,       // s before another wall can grab you — stops sticky ping-pong
@@ -517,7 +517,10 @@ export function createBikePhysics(ctx) {
     const cost = 0.6 + charge * 0.6;
     const use = Math.min(cost, state.pumpBudget);
     state.pumpBudget -= use;
-    const gain = T.pumpGain * charge * clamp((tilt - T.pumpMinTilt) / (1 - T.pumpMinTilt), 0, 1) * (use / cost);
+    // sqrt on the tilt term so a shallow bank still rewards a pump; a vertical wall
+    // is only about twice as good, not ten times.
+    const gain = T.pumpGain * charge *
+      Math.sqrt(clamp((tilt - T.pumpMinTilt) / (1 - T.pumpMinTilt), 0, 1)) * (use / cost);
     if (gain < 0.05) return;
     bodyAxes();
     _tmpA.copy(_fwd).addScaledVector(state.surfaceNormal, -_fwd.dot(state.surfaceNormal));
@@ -802,14 +805,14 @@ export function createBikePhysics(ctx) {
     // vertical measure this comparison works in.
     const gap = state.position.y - targetY;
     if (gap > T.groundAttach / Math.max(state.surfaceNormal.y, 0.2)) return false;
-    if (gap < 0) state.position.y = targetY;                              // never penetrate
-    else state.position.y = damp(state.position.y, targetY, 34, fdt);     // settle without popping
 
     // Crest release: the wheels can push, never pull. If the contact plane has turned
     // away from where we are already travelling — the deck behind a coping, the lip of
     // a funbox — nothing can hold the bike down and it launches with the speed it had.
     if (state.velocity.dot(state.surfaceNormal) > T.crestRelease) return false;
 
+    if (gap < 0) state.position.y = targetY;                              // never penetrate
+    else state.position.y = damp(state.position.y, targetY, 34, fdt);     // settle without popping
     slideOnPlane(state.velocity, state.surfaceNormal);
     return true;
   }
@@ -971,7 +974,7 @@ export function createBikePhysics(ctx) {
       state.position.addScaledVector(state.velocity, sdt);
       state.airPeak = Math.max(state.airPeak, state.position.y - state.launchHeight);
       sampleGround();
-      if (tryLand(sdt)) return;
+      if (tryLand()) return;
       if (handleWalls(sdt, true)) return;
     }
   }
@@ -982,7 +985,7 @@ export function createBikePhysics(ctx) {
    * not landings, which is what lets you leave a transition lip without "landing" on
    * the last few degrees of it.
    */
-  function tryLand(fdt) {
+  function tryLand() {
     let p = null;
     let best = Infinity;
     for (let i = 0; i < probes.length; i++) {
@@ -1010,8 +1013,11 @@ export function createBikePhysics(ctx) {
 
     // Dropping onto the coping edge is a bail, not a landing.
     if (p.surface === 'coping') { bail('coping'); return true; }
+    // Straddling an edge: the two wheels are sitting on surfaces at wildly different
+    // distances from the frame (deck under one, transition under the other). Measured
+    // perpendicular, a smooth bank keeps both near zero however steep it is.
     if (probeF.usable && probeR.usable &&
-        (probeF.point.y - probeR.point.y) > T.copingStep && closing > 3.5) {
+        Math.abs(probeF.perp - probeR.perp) > T.copingStep && closing > 3.5) {
       bail('coping');
       return true;
     }
@@ -1112,7 +1118,9 @@ export function createBikePhysics(ctx) {
 
     if (approach > T.wallHeadOn && speed > T.wallBailSpeed) { bail('wall'); return true; }
 
-    if (wallCooldown <= 0 && speed > T.wallMinSpeed && approach < T.wallHeadOn) {
+    // You hop into a wallride — trying to start one with the wheels still on the floor
+    // just scrubs you along the wall instead.
+    if (inAir && wallCooldown <= 0 && speed > T.wallMinSpeed && approach < T.wallHeadOn) {
       enterWall(h);
       return true;
     }
@@ -1176,8 +1184,9 @@ export function createBikePhysics(ctx) {
             _n.copy(_tmpC);
             if (h.point) {
               state.wall.point.copy(h.point);
+              // Sit the contact origin on the face: the wheels are what touch the wall.
               const off = _tmpB.copy(state.position).sub(h.point).dot(_n);
-              state.position.addScaledVector(_n, (0.03 - off) * clamp(12 * fdt, 0, 1));
+              state.position.addScaledVector(_n, (T.contactLift - off) * clamp(T.wallStick * fdt, 0, 1));
             }
             contact = true;
           }
@@ -1198,9 +1207,9 @@ export function createBikePhysics(ctx) {
     _tmpA.set(0, -T.gravity * T.wallGravityScale, 0);
     _tmpA.addScaledVector(_n, -_tmpA.dot(_n));
     state.velocity.addScaledVector(_tmpA, fdt);
-    state.velocity.addScaledVector(_n, -T.wallStick * fdt);
-    const into = state.velocity.dot(_n);
-    if (into > 0) state.velocity.addScaledVector(_n, -into);      // never drift off the face
+    // Motion stays strictly in the plane of the wall; the position pull above is what
+    // holds the bike against it, so nothing can accumulate through the face.
+    state.velocity.addScaledVector(_n, -state.velocity.dot(_n));
     if (speed > 0.01) state.velocity.addScaledVector(state.velocity, -T.airDrag * speed * fdt);
 
     state.position.addScaledVector(state.velocity, fdt);
@@ -1221,10 +1230,24 @@ export function createBikePhysics(ctx) {
     state.yaw = Math.atan2(_fwd.x, _fwd.z);
 
     // Ground under the wall wins — running out of wall drops you back onto the park.
+    // The rider rolls off the face upright, so the chassis is levelled before the
+    // landing is judged; otherwise every wallride would end in a 90° roll bail.
     sampleGround();
-    if ((probeC.usable && probeC.perp < T.landSnap) || (probeR.usable && probeR.perp < T.landSnap)) {
+    const nearFloor = (probeC.usable && probeC.perp < T.landSnap * 1.6) ||
+      (probeR.usable && probeR.perp < T.landSnap * 1.6);
+    if (nearFloor && state.velocity.y < 0.5) {
+      _tmpB.set(Math.sin(state.yaw), 0, Math.cos(state.yaw));
+      _tmpC.copy(probeC.usable ? probeC.normal : probeR.normal);
+      _right.crossVectors(_tmpC, _tmpB);
+      if (_right.lengthSq() > 1e-6) {
+        _right.normalize();
+        _tmpB.crossVectors(_right, _tmpC).normalize();
+        _basis.makeBasis(_right, _tmpC, _tmpB);
+        state.quaternion.setFromRotationMatrix(_basis);
+      }
+      state.lean = 0;
       exitWall(false);
-      tryLand(fdt);
+      tryLand();
     }
   }
 
@@ -1314,7 +1337,7 @@ export function createBikePhysics(ctx) {
       // Fell out of the world: treat it as a bail-respawn rather than losing the player.
       const bounds = ctx.world?.park?.bounds;
       const floor = bounds?.min?.y ?? -40;
-      if (p.y > floor - 30) return;
+      if (p.y > floor - 12) return;
     }
     state.velocity.set(0, 0, 0);
     state.quaternion.identity();
