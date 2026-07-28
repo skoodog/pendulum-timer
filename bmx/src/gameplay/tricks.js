@@ -343,6 +343,34 @@ export function createTricks(ctx) {
 
   function stateOf() { return ctx.player?.physics?.state || phys?.state || null; }
 
+  /**
+   * How fast this rider's profile executes tricks. 1 unless a profile says otherwise;
+   * read defensively every time so the module works with no profile system at all and
+   * picks up a profile change between runs without being rebuilt.
+   */
+  function execRate() {
+    const s = ctx.player?.cheats?.trickSpeed;
+    return typeof s === 'number' && Number.isFinite(s) && s > 0 ? s : 1;
+  }
+
+  /** A minimum-time gate, shortened in proportion to the execution rate. */
+  function gate(seconds) {
+    const r = execRate();
+    return r === 1 ? seconds : seconds / r;
+  }
+
+  /**
+   * Tell the animator how fast poses should play. riderAnim may take this as a third
+   * argument to setPose or as its own setter — offer both, and do nothing at all if it
+   * accepts neither.
+   */
+  function pushPoseRate(anim, r) {
+    if (!anim) return;
+    if (typeof anim.setPoseRate === 'function') anim.setPoseRate(r);
+    else if (typeof anim.setTrickRate === 'function') anim.setTrickRate(r);
+    else if (typeof anim.setPoseSpeed === 'function') anim.setPoseSpeed(r);
+  }
+
   /** 8-way + neutral direction from the current stick / keys. */
   function readDir(input) {
     const s = input?.state;
@@ -375,7 +403,11 @@ export function createTricks(ctx) {
     const anim = ctx.player?.anim;
     if (poseId && anim?.setPose) anim.setPose(poseId, 0);
     poseId = id;
-    if (id && anim?.setPose) anim.setPose(id, 1);
+    // Poses play back at the rider's execution rate, so the animation keeps step with
+    // the rotation and the shortened timing gates.
+    const r = execRate();
+    pushPoseRate(anim, id ? r : 1);
+    if (id && anim?.setPose) anim.setPose(id, 1, r);
   }
 
   function rebuildText() {
@@ -526,10 +558,11 @@ export function createTricks(ctx) {
     const sl = input.held('spinLeft');
     const sr = input.held('spinRight');
     const dir = (sr ? 1 : 0) - (sl ? 1 : 0);
+    const r = execRate();
 
     if (dir !== 0 && !trickOwnsYaw) {
-      spinWind = Math.min(1, spinWind + fdt / T.spinRamp);
-      phys?.applyTrickRotation?.('yaw', dir * T.spinRate * spinWind);
+      spinWind = Math.min(1, spinWind + (fdt * r) / T.spinRamp);
+      phys?.applyTrickRotation?.('yaw', dir * T.spinRate * spinWind * r);
     } else {
       spinWind = Math.max(0, spinWind - T.spinDecay * fdt);
       // Landing assist: once the buttons are out and the bike is coming down, nudge
@@ -574,16 +607,19 @@ export function createTricks(ctx) {
   /** Closed-loop driver for the flip/cork tricks — lands them level, every time. */
   function driveTrickRotation(st) {
     if (!act || actDone) return true;
+    // Gain, floor and ceiling all move together with the execution rate, so a faster
+    // rider turns the same rotation in proportionally less air.
+    const r = execRate();
     let finished = true;
     if (act.flip) {
       const done = st.rotation.pitch - actPitch0;
       const remain = act.flip - done;
       if (Math.abs(remain) > T.flipDone) {
         finished = false;
-        let rate = remain * deg * T.flipGain;
+        let rate = remain * deg * T.flipGain * r;
         const mag = Math.abs(rate);
-        if (mag < T.flipMin && Math.abs(remain) > 25) rate = Math.sign(rate) * T.flipMin;
-        phys?.applyTrickRotation?.('flip', clamp(rate, -T.flipMax, T.flipMax));
+        if (mag < T.flipMin * r && Math.abs(remain) > 25) rate = Math.sign(rate) * T.flipMin * r;
+        phys?.applyTrickRotation?.('flip', clamp(rate, -T.flipMax * r, T.flipMax * r));
       }
     }
     if (act.spin) {
@@ -591,10 +627,10 @@ export function createTricks(ctx) {
       const remain = act.spin - done;
       if (Math.abs(remain) > T.flipDone) {
         finished = false;
-        let rate = remain * deg * T.flipGain * 0.8;
+        let rate = remain * deg * T.flipGain * 0.8 * r;
         const mag = Math.abs(rate);
-        if (mag < 2.2 && Math.abs(remain) > 25) rate = Math.sign(rate) * 2.2;
-        phys?.applyTrickRotation?.('yaw', clamp(rate, -T.flipMax, T.flipMax));
+        if (mag < 2.2 * r && Math.abs(remain) > 25) rate = Math.sign(rate) * 2.2 * r;
+        phys?.applyTrickRotation?.('yaw', clamp(rate, -T.flipMax * r, T.flipMax * r));
       }
     }
     if (act.roll) {
@@ -602,10 +638,10 @@ export function createTricks(ctx) {
       const remain = act.roll - done;
       if (Math.abs(remain) > T.flipDone) {
         finished = false;
-        let rate = remain * deg * T.flipGain;
+        let rate = remain * deg * T.flipGain * r;
         const mag = Math.abs(rate);
-        if (mag < T.flipMin && Math.abs(remain) > 25) rate = Math.sign(rate) * T.flipMin;
-        phys?.applyTrickRotation?.('roll', clamp(rate, -T.flipMax, T.flipMax));
+        if (mag < T.flipMin * r && Math.abs(remain) > 25) rate = Math.sign(rate) * T.flipMin * r;
+        phys?.applyTrickRotation?.('roll', clamp(rate, -T.flipMax * r, T.flipMax * r));
       }
     }
     return finished;
@@ -615,7 +651,8 @@ export function createTricks(ctx) {
   function impulseProgress(st) {
     if (!act) return 1;
     if (actDone) return 1;
-    let p = act.dur > 0 ? actTime / act.dur : 1;
+    const dur = gate(act.dur);
+    let p = dur > 0 ? actTime / dur : 1;
     if (act.flip) {
       const done = Math.abs(st.rotation.pitch - actPitch0);
       p = Math.min(p, done / Math.abs(act.flip));
@@ -670,15 +707,15 @@ export function createTricks(ctx) {
         if (!modLive(input, actMod)) {
           endAirTrick('release', st);
         } else {
-          if (!actEntry && actTime >= act.minAir) actEntry = commit(act, 0);
+          if (!actEntry && actTime >= gate(act.minAir)) actEntry = commit(act, 0);
           if (actEntry) actHold = addHold(actEntry, act, fdt, actHold);
           setCurrent(act, actEntry);
         }
       } else {
         const rotDone = driveTrickRotation(st);
-        if (!actEntry && actTime >= act.minAir) actEntry = commit(act, 0);
+        if (!actEntry && actTime >= gate(act.minAir)) actEntry = commit(act, 0);
         setCurrent(act, actEntry);
-        if (rotDone && actTime >= act.dur) {
+        if (rotDone && actTime >= gate(act.dur)) {
           actDone = true;
           endAirTrick('complete', st);
         }
@@ -868,14 +905,14 @@ export function createTricks(ctx) {
         if (!modLive(input, flatMod) || st.speed > T.flatMaxSpeed * 1.35) {
           stopFlat('release');
         } else {
-          if (!flatEntry && flatTime >= flatTrick.minAir) flatEntry = commit(flatTrick, 0);
+          if (!flatEntry && flatTime >= gate(flatTrick.minAir)) flatEntry = commit(flatTrick, 0);
           if (flatEntry) flatHold = addHold(flatEntry, flatTrick, fdt, flatHold);
           setCurrent(flatTrick, flatEntry);
         }
       } else {
-        if (!flatEntry && flatTime >= flatTrick.minAir) flatEntry = commit(flatTrick, 0);
+        if (!flatEntry && flatTime >= gate(flatTrick.minAir)) flatEntry = commit(flatTrick, 0);
         setCurrent(flatTrick, flatEntry);
-        if (flatTime >= flatTrick.dur) stopFlat('complete');
+        if (flatTime >= gate(flatTrick.dur)) stopFlat('complete');
       }
       return;
     }

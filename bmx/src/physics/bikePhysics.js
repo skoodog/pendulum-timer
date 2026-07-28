@@ -169,6 +169,16 @@ const _sweepTo = new THREE.Vector3();
 const _basis = new THREE.Matrix4();
 const _qTarget = new THREE.Quaternion();
 const _qStep = new THREE.Quaternion();
+// Scratch only ever touched by the profile-recovery path below.
+const _fixFwd = new THREE.Vector3();
+const _fixRight = new THREE.Vector3();
+
+// A landing that had to be talked back onto its feet is scored as a clean one — the
+// top of the clean band, never the perfect band, so it costs nothing and buys nothing.
+const RECOVERED_LAND_Q = 0.9;
+// Fraction of the manual bail threshold the balance meter is held under when the
+// rider's profile says it can never fall.
+const BALANCE_HOLD = 0.92;
 
 function makeProbe() {
   return {
@@ -257,6 +267,18 @@ export function createBikePhysics(ctx) {
   };
 
   const collision = () => ctx.world?.collision;
+
+  // Rider-profile modifiers. Read off ctx every time and defensively: the profile
+  // system is optional, and the active profile can change between runs.
+  const canFall = () => !(ctx.player?.cheats?.noBail === true);
+  /**
+   * Ceiling on trick-driven rotation. A profile that executes tricks faster carries
+   * the ceiling up with it; otherwise the cap would eat the whole rate change.
+   */
+  function trickRateCap() {
+    const s = ctx.player?.cheats?.trickSpeed;
+    return typeof s === 'number' && Number.isFinite(s) && s > 1 ? T.maxTrickRate * s : T.maxTrickRate;
+  }
 
   const probeF = makeProbe();
   const probeR = makeProbe();
@@ -407,6 +429,32 @@ export function createBikePhysics(ctx) {
   }
 
   /**
+   * Seat the chassis flat on `n`, pointing along the direction of travel (falling back
+   * to the current heading), with the roll cleared. Used only where a rider who cannot
+   * fall has to be talked back onto their wheels.
+   */
+  function snapUpright(n) {
+    _fixFwd.set(state.velocity.x, 0, state.velocity.z);
+    if (_fixFwd.lengthSq() < 1e-4) _fixFwd.set(Math.sin(state.yaw), 0, Math.cos(state.yaw));
+    _fixFwd.addScaledVector(n, -_fixFwd.dot(n));
+    if (_fixFwd.lengthSq() < 1e-6) {
+      _fixFwd.set(Math.sin(state.yaw), 0, Math.cos(state.yaw));
+      _fixFwd.addScaledVector(n, -_fixFwd.dot(n));
+      if (_fixFwd.lengthSq() < 1e-6) return;
+    }
+    _fixFwd.normalize();
+    _fixRight.crossVectors(n, _fixFwd);
+    if (_fixRight.lengthSq() < 1e-6) return;
+    _fixRight.normalize();
+    _fixFwd.crossVectors(_fixRight, n).normalize();
+    _basis.makeBasis(_fixRight, n, _fixFwd);
+    state.quaternion.setFromRotationMatrix(_basis);
+    state.quaternion.normalize();
+    state.yaw = Math.atan2(_fixFwd.x, _fixFwd.z);
+    state.lean = 0;
+  }
+
+  /**
    * Launch direction for hops and lip pop: world-up blended toward the surface normal,
    * with the blend itself scaled by how flat the surface is. On a bank you launch out
    * of the transition; at a near-vertical lip you launch straight up, which is where
@@ -531,7 +579,43 @@ export function createBikePhysics(ctx) {
     emit('pump', { gain, tilt, budget: state.pumpBudget });
   }
 
+  /**
+   * What happens instead of a crash for a rider whose profile says they stay on the
+   * bike: clear whatever failed, keep the momentum, and leave the bike rideable. The
+   * mode never becomes 'bail', so nothing downstream sees a crash either.
+   */
+  function recoverInPlace(reason) {
+    stallTimer = 0;
+    state.bailTimer = 0;
+    state.bailReason = null;
+    state.hopCharge = 0;
+    state.crouch = 0;
+    hopHoldTime = 0;
+    state.manualType = null;
+    state.balance = 0;
+    balanceVel = 0;
+
+    // The restart control still restarts — it just does it without a tumble.
+    if (reason === 'reset') {
+      api.respawn(state.lastSafe);
+      emit('respawn', { reason });
+      return;
+    }
+    // Thrown off a rail: leave it flying rather than falling. grind.js has already
+    // stood down by this point, so the chassis has to be handed back to the air step.
+    if (state.mode === 'grind') {
+      api.exitGrind(null);
+      state.velocity.y = Math.max(state.velocity.y, 1.2);
+      return;
+    }
+    // Still in the air (or on a wall): there is nothing to save, keep going.
+    if (state.mode === 'air' || state.mode === 'wallride') return;
+    state.mode = 'ride';
+    state.grounded = true;
+  }
+
   function bail(reason) {
+    if (!canFall()) { recoverInPlace(reason); return; }
     if (state.mode === 'bail') return;
     state.mode = 'bail';
     state.bailReason = reason;
@@ -754,7 +838,13 @@ export function createBikePhysics(ctx) {
     balanceVel += acc * fdt;
     balanceVel -= balanceVel * clamp(T.balanceDamp * fdt, 0, 1);
     state.balance = clamp(state.balance + balanceVel * fdt, -1.4, 1.4);
-    if (Math.abs(state.balance) >= T.balanceBailAt) {
+    if (!canFall()) {
+      // The meter still swings and still reads on the HUD; it simply cannot reach the
+      // end of its travel, so the pendulum never falls over.
+      const cap = T.balanceBailAt * BALANCE_HOLD;
+      if (state.balance > cap) { state.balance = cap; if (balanceVel > 0) balanceVel = 0; }
+      else if (state.balance < -cap) { state.balance = -cap; if (balanceVel < 0) balanceVel = 0; }
+    } else if (Math.abs(state.balance) >= T.balanceBailAt) {
       bail(state.manualType === 'nose' ? 'nosedive' : 'looped');
     }
   }
@@ -924,7 +1014,8 @@ export function createBikePhysics(ctx) {
     angVel.y = damp(angVel.y, trickInput.y + nudgeYaw, T.spinAssistLambda * 4, fdt);
     angVel.z = damp(angVel.z, trickInput.z, T.spinAssistLambda, fdt);
     const mag = angVel.length();
-    if (mag > T.maxTrickRate) angVel.multiplyScalar(T.maxTrickRate / mag);
+    const cap = trickRateCap();
+    if (mag > cap) angVel.multiplyScalar(cap / mag);
     trickInput.set(0, 0, 0);
 
     if (Math.abs(angVel.x) > 1e-5) {
@@ -1011,17 +1102,26 @@ export function createBikePhysics(ctx) {
 
     bodyAxes();
 
+    // A rider who cannot fall takes every one of the touchdown rules below as a
+    // correction instead of a crash: the bike is talked onto the surface and rides
+    // away. `fall` is false only for such a profile, so the default path is untouched.
+    const fall = canFall();
+    let corrected = false;
+
     // Dropping onto the coping edge is a bail, not a landing.
-    if (p.surface === 'coping') { bail('coping'); return true; }
+    if (p.surface === 'coping' && fall) { bail('coping'); return true; }
     // Straddling an edge: the two wheels are sitting on surfaces at wildly different
     // distances from the frame (deck under one, transition under the other). Measured
     // perpendicular, a smooth bank keeps both near zero however steep it is.
     if (probeF.usable && probeR.usable &&
-        Math.abs(probeF.perp - probeR.perp) > T.copingStep && closing > 3.5) {
+        Math.abs(probeF.perp - probeR.perp) > T.copingStep && closing > 3.5 && fall) {
       bail('coping');
       return true;
     }
-    if (closing > T.maxImpactSpeed) { bail('slam'); return true; }
+    if (closing > T.maxImpactSpeed) {
+      if (fall) { bail('slam'); return true; }
+      corrected = true;
+    }
 
     // Alignment: a perfectly landed bike has forward and right both perpendicular to
     // the surface normal, and travels where it points.
@@ -1042,15 +1142,21 @@ export function createBikePhysics(ctx) {
         Math.abs(pitchErr) > T.landPitchTol ||
         Math.abs(rollErr) > T.landRollTol ||
         yawErr > T.landYawTol) {
-      bail('angle');
-      return true;
+      if (fall) {
+        bail('angle');
+        return true;
+      }
+      corrected = true;
     }
 
-    const q = clamp(1 - Math.max(
+    let q = clamp(1 - Math.max(
       Math.abs(pitchErr) / T.landPitchTol,
       Math.abs(rollErr) / T.landRollTol,
       yawErr / T.landYawTol,
     ), 0, 1);
+    // A corrected touchdown is scored exactly like a clean one, so the rider is never
+    // punished for the landing they were put through.
+    if (corrected) q = Math.max(q, RECOVERED_LAND_Q);
 
     // Put the wheels on the ground and convert the landing.
     state.surfaceNormal.copy(_n);
@@ -1058,6 +1164,9 @@ export function createBikePhysics(ctx) {
     state.surfaceFriction = p.friction;
     state.surfaceType = p.surface;
     state.surfaceTilt = Math.sqrt(Math.max(0, 1 - _n.y * _n.y));
+    // Snap the chassis square onto the landing surface before the contact height is
+    // fitted, so a sideways or inverted arrival becomes a wheels-down one.
+    if (corrected) snapUpright(_n);
     const ty = contactTargetY();
     state.position.y = Number.isNaN(ty) ? p.point.y + T.contactLift : ty;
 
@@ -1067,8 +1176,22 @@ export function createBikePhysics(ctx) {
     const convert = closing * T.landNormalToTangent * state.surfaceTilt * q;
     let newSpeed = (tanSpeed + convert) * lerp(T.landSpeedKeep, 1, q);
     newSpeed = Math.min(newSpeed, T.speedHardCap);
+    if (corrected) {
+      // Keep the speed the rider arrived with — a correction must not cost anything a
+      // clean landing would not, and a slam dumped into the surface is rolled out.
+      newSpeed = Math.min(Math.max(newSpeed, Math.min(state.velocity.length(), T.maxSpeed)),
+        T.speedHardCap);
+    }
 
     if (tanSpeed > 0.05) _tmpA.multiplyScalar(newSpeed / tanSpeed);
+    else if (corrected) {
+      // Straight down onto the surface with nothing across it: roll away along the
+      // heading rather than stopping dead.
+      bodyAxes();
+      _tmpA.copy(_fwd).addScaledVector(_n, -_fwd.dot(_n));
+      if (_tmpA.lengthSq() > 1e-6) _tmpA.setLength(newSpeed);
+      else _tmpA.set(0, 0, 0);
+    }
     else _tmpA.set(0, 0, 0);
     state.velocity.copy(_tmpA);
 
@@ -1116,7 +1239,11 @@ export function createBikePhysics(ctx) {
     const approach = -_tmpA.dot(_n);
     if (approach <= 0.02) return false;
 
-    if (approach > T.wallHeadOn && speed > T.wallBailSpeed) { bail('wall'); return true; }
+    if (approach > T.wallHeadOn && speed > T.wallBailSpeed) {
+      // Without the crash, a head-on smash falls through to the contact resolve at the
+      // bottom of this function: the rider is stopped by the wall, not put on the floor.
+      if (canFall()) { bail('wall'); return true; }
+    }
 
     // You hop into a wallride — trying to start one with the wheels still on the floor
     // just scrubs you along the wall instead.
@@ -1341,6 +1468,14 @@ export function createBikePhysics(ctx) {
     }
     state.velocity.set(0, 0, 0);
     state.quaternion.identity();
+    if (!canFall()) {
+      // Out of the world with nothing to crash into: put the rider back on the last
+      // safe spot with no crash attached to it.
+      state.bailReason = null;
+      state.mode = 'ride';
+      respawnToSafe();
+      return;
+    }
     respawnToSafe();
   }
 
@@ -1460,7 +1595,8 @@ export function createBikePhysics(ctx) {
         if (_tmpA.lengthSq() > 1e-8) trickInput.addScaledVector(_tmpA.normalize(), rate);
       }
       const m = trickInput.length();
-      if (m > T.maxTrickRate) trickInput.multiplyScalar(T.maxTrickRate / m);
+      const cap = trickRateCap();
+      if (m > cap) trickInput.multiplyScalar(cap / m);
       trickRateThisStep = m;
     },
 
