@@ -379,3 +379,55 @@ A proper settings screen reachable from the title and pause menus, with tabbed s
 - **Data**: reset high scores, reset achievements, reset all progress (each with a confirm step).
 
 All settings persist in localStorage and apply live without a reload.
+
+---
+
+# RIDER CREATOR (required feature)
+
+Players build a custom rider before a run. The profile drives BOTH the character mesh and the bike,
+and is persisted so a player can keep several riders.
+
+## `src/rider/customization.js` — the profile model
+```js
+DEFAULT_PROFILE = {
+  name: 'Rookie',
+  gender: 'male' | 'female' | 'neutral',   // drives skeleton proportions and body shape
+  height: 1.60 .. 1.95,                    // metres — actually scales the rig and the bike fit
+  build: 0 .. 1,                           // slim -> heavy: limb girth, torso depth, shoulder width
+  skin: hex, hair: { style, colour }, facialHair: { style, colour },
+  headwear: 'helmet' | 'cap' | 'capBackwards' | 'beanie' | 'none',
+  top:    { style: 'tee'|'raglan'|'jersey'|'hoodie'|'tank', colour, accent, graphic },
+  bottom: { style: 'jeans'|'shorts'|'pants'|'joggers', colour },
+  shoes:  { style, colour, laces }, gloves: { on, colour },
+  pads:   { knee, elbow, shin },
+  bike:   { frame, rims, tyres, grips, seat, pegs, chrome, decals },
+}
+createCustomization() -> { profile, profiles[], load(id), save(), create(), remove(id),
+                           randomize(), applyTo(rider), cheatsFor(name) }
+```
+- Every colour choice maps onto the existing `materials.js` colourways/`tint()` helpers.
+- `height` and `build` must genuinely rebuild/scale the rig (and the rider's fit on the bike),
+  not just scale the whole group uniformly.
+- Graphics printed on tops are drawn procedurally with invented brand marks — never real logos.
+- Profiles persist in localStorage; a profile can be edited and re-saved at any time.
+
+## `src/rider/bike.js` signature change
+`createRider(ctx, profile = DEFAULT_PROFILE)` — builds the rider and bike from the profile, and
+exposes `rider.applyProfile(profile)` for live updates in the creator (rebuilding only what changed).
+
+## `src/ui/riderCreator.js` — the creation screen
+Live 3D turntable preview of the rider on the bike (its own camera and a soft studio-lit backdrop),
+category tabs (Body / Face / Outfit / Bike), swatch and option pickers with instant preview, a name
+field, randomise, save/load/delete profiles, and full mouse + keyboard + gamepad navigation with
+glyph prompts. Reachable from the title screen and the pause menu.
+
+## Easter egg — exact behaviour
+If the rider's name is **"James Paterson"** (case-insensitive, surrounding whitespace ignored):
+- **They cannot fall.** Every bail path is suppressed: bad landing angles auto-correct to a clean
+  land, manual/grind balance never fails, out-of-bounds recovers in place. The player is never
+  put into `mode: 'bail'`.
+- **Tricks execute at 1.5× speed**: trick rotation rates, trick animation playback and the
+  minimum-time gates for a trick to count are all scaled by 1.5, so more tricks fit in one air.
+Implement it in `customization.cheatsFor(name)` returning `{ noBail: true, trickSpeed: 1.5 }`, read
+by `bikePhysics.js` (bail suppression) and `tricks.js` / `riderAnim.js` (rate scaling). It is an
+easter egg: do not advertise it in the UI.
