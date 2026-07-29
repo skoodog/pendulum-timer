@@ -126,7 +126,9 @@ const SEV = { critical: 0, major: 1, minor: 2 }
 const history = []
 
 for (let round = START; round < START + ROUNDS; round++) {
-  const dir = 'shots/round' + round
+  // Deliberately not 'shots/roundN': numeric round names collided with older
+  // capture directories and critics wandered into the wrong one.
+  const dir = 'shots/rev-' + String.fromCharCode(64 + round)
 
   phase('Capture')
   log('Round ' + round + ': capturing frames into ' + dir)
@@ -171,7 +173,10 @@ Return a summary of what was captured and the state of the build.`,
     agent(
       HARSHNESS + REFERENCE + '\n' + l.brief +
       '\n\nThe frames to judge are PNG files in /home/user/pendulum-timer/bmx/' + dir +
-      '. Read EVERY .png in that directory with the Read tool, and read ' + dir + '/report.json for ' +
+      '. Read EVERY .png in THAT EXACT DIRECTORY with the Read tool. Do NOT read any other shots/* ' +
+      'directory - they hold stale captures from earlier builds and judging them would be worthless. ' +
+      'Before judging, read ' + dir + '/report.json and confirm its startedAt timestamp is recent and ' +
+      'that its shot list matches the files you found. It also carries ' +
       'shot descriptions, boot status, draw-call and triangle stats and console errors. ' +
       'Pay particular attention to ref1-match.png and ref2-match.png: those are framed deliberately ' +
       'to mirror the two reference frames, so they are your fairest side-by-side.\n' +
