@@ -2808,6 +2808,65 @@ function riderRegions() {
         // felled outseam: a second row of topstitch beside the first
         stitchLine(c, 9, 0, 9, h, seam, 1.8, [6, 8]);
         stitchLine(c, w - 9, 0, w - 9, h, seam, 1.8, [6, 8]);
+
+        // --- the parts that make trousers TROUSERS ---------------------------
+        // Without these the leg is a dyed tube: a waistband, a fly, and pockets
+        // are what the eye reads as a garment cut and sewn from panels.
+        const wbTop = yv(1.0), wbLow = yv(0.955);
+        c.fillStyle = rgba(shade(col, 0.10), 0.85);
+        c.fillRect(0, wbTop, w, wbLow - wbTop);
+        stitchLine(c, 0, wbLow - 2, w, wbLow - 2, seam, 2.2, [6, 7]);
+        stitchLine(c, 0, wbTop + 3, w, wbTop + 3, seam, 2.0, [6, 7]);
+        // belt loops, one at each seam and one either side of the fly
+        c.fillStyle = rgba(shade(col, -0.30), 0.75);
+        for (const u of [0.03, 0.17, 0.33, 0.47, 0.62, 0.78, 0.94]) {
+          c.fillRect(w * u - 3, wbTop - 2, 7, (wbLow - wbTop) + 6);
+        }
+        // fly: centre front is u = 0.25 on this tube
+        c.save();
+        c.strokeStyle = rgba(shade(col, -0.50), 0.55); c.lineWidth = 3;
+        c.beginPath(); c.moveTo(w * 0.25, wbLow); c.lineTo(w * 0.25, yv(0.845)); c.stroke();
+        c.restore();
+        stitchLine(c, w * 0.235, wbLow, w * 0.235, yv(0.850), seam, 2.0, [6, 7]);
+        c.save();                                             // fly J-stitch curve
+        c.strokeStyle = seam; c.lineWidth = 2.0; c.setLineDash([6, 7]);
+        c.beginPath();
+        c.moveTo(w * 0.272, wbLow);
+        c.bezierCurveTo(w * 0.272, yv(0.885), w * 0.262, yv(0.858), w * 0.243, yv(0.850));
+        c.stroke();
+        c.restore();
+        // front scoop pockets, one each side of the fly
+        for (const s2 of [-1, 1]) {
+          c.save();
+          c.strokeStyle = rgba(shade(col, -0.42), 0.5); c.lineWidth = 3.4;
+          c.beginPath();
+          c.moveTo(w * (0.25 + s2 * 0.052), wbLow);
+          c.quadraticCurveTo(w * (0.25 + s2 * 0.115), yv(0.930), w * (0.25 + s2 * 0.128), yv(0.862));
+          c.stroke();
+          c.restore();
+          stitchLine(c, w * (0.25 + s2 * 0.060), wbLow - 1,
+            w * (0.25 + s2 * 0.136), yv(0.864), seam, 2.0, [5, 6]);
+          // coin pocket, right side only
+          if (s2 > 0) {
+            stitchLine(c, w * 0.318, wbLow - 2, w * 0.352, yv(0.918), seam, 1.8, [4, 5]);
+          }
+        }
+        // back patch pockets, high on the seat (u = 0.75 is the back of the leg)
+        for (const s2 of [-1, 1]) {
+          const cx = w * (0.75 + s2 * 0.075);
+          const pw = w * 0.052, y0 = yv(0.938), y1 = yv(0.858);
+          c.save();
+          c.strokeStyle = rgba(shade(col, -0.40), 0.42); c.lineWidth = 3;
+          c.beginPath();
+          c.moveTo(cx - pw, y0); c.lineTo(cx + pw, y0);
+          c.lineTo(cx + pw * 0.86, y1 - h * 0.012);
+          c.lineTo(cx, y1); c.lineTo(cx - pw * 0.86, y1 - h * 0.012);
+          c.closePath(); c.stroke();
+          c.restore();
+          stitchLine(c, cx - pw, y0 + 3, cx + pw, y0 + 3, seam, 2.0, [5, 6]);
+          stitchLine(c, cx - pw * 0.86, y1 - h * 0.010, cx, y1 + 2, seam, 1.8, [5, 6]);
+          stitchLine(c, cx, y1 + 2, cx + pw * 0.86, y1 - h * 0.010, seam, 1.8, [5, 6]);
+        }
         overlay(c, w, h, 0.12, 4);
         chips(c, w, h, 30, rgba(shade(col, 0.6), 0.10), 2, 7);
       },
@@ -2840,6 +2899,17 @@ function riderRegions() {
           c.strokeStyle = i % 2 ? '#4c4c4c' : '#c4c4c4';
           c.lineWidth = 5;
           c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke();
+        }
+        // waistband, fly and pockets stand proud in relief as well as in ink
+        c.fillStyle = '#a8a8a8'; c.fillRect(0, 0, w, h * 0.045);
+        c.strokeStyle = '#d4d4d4'; c.lineWidth = 3;
+        c.beginPath(); c.moveTo(w * 0.25, h * 0.045); c.lineTo(w * 0.25, h * 0.155); c.stroke();
+        for (const s2 of [-1, 1]) {
+          const cx = w * (0.75 + s2 * 0.075), pw = w * 0.052;
+          c.fillStyle = '#9c9c9c';
+          c.fillRect(cx - pw, h * 0.062, pw * 2, h * 0.080);
+          c.strokeStyle = '#d8d8d8'; c.lineWidth = 3;
+          c.strokeRect(cx - pw, h * 0.062, pw * 2, h * 0.080);
         }
       },
     },
@@ -5364,14 +5434,18 @@ function buildFist(wrist, barDir, handR, glove, barR, gripPoint, side) {
   // shell is closed at the index edge, the pinky edge, the heel and the tips.
   for (let j = -1; j <= NA + 1; j++) {
     const qa = clamp(j / NA, 0, 1);
-    const a = lerp(A0, A1, qa);
+    // The closing rings sit OUTSIDE the hand, not on top of its border ring: a
+    // seal ring at the same station is a zero-thickness disc, and edge-on it
+    // opens a sliver straight through the fist to the shadow behind the grip.
+    const a = lerp(A0, A1, qa) + (j < 0 ? -9 : j > NA ? 9 : 0);
     const sealA = (j < 0 || j > NA) ? 0 : 1;
     for (let i = -1; i <= NS + 1; i++) {
       const s = clamp(i / NS, 0, 1);
       const sealS = (i < 0 || i > NS) ? 0 : 1;
       const seal = sealA * sealS;
+      const sa = lerp(sIn, sOut, s) + (i < 0 ? -handR * 0.075 : i > NS ? handR * 0.075 : 0);
       const r = curlR + handR * Math.max(0, thick(s, a) - groove(s, a)) * seal;
-      const p = at(lerp(sIn, sOut, s), a, r);
+      const p = at(sa, a, r);
       pos.push(p.x, p.y, p.z);
       // v walks the wrap so the SKIN band's warm extremity lands on the
       // fingertips; a glove wants its closure strap at the wrist instead.
