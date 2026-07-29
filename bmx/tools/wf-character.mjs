@@ -75,6 +75,14 @@ CONSTRAINTS
   polygon-count problem - spend triangles where the silhouette needs them (head, hands, shoulders,
   knees) and save them on hidden surfaces.
 - No external assets. Procedural textures only. Deterministic rng from src/core/mathx.js.
+PERSIST YOUR WORK OR IT WILL BE LOST. This container periodically rolls its filesystem back to an
+older snapshot. Anything not pushed to origin at that moment is gone - a previous run lost a full
+round of finished work this way. Therefore:
+  * As soon as you have a working change, run:  bash tools/save.sh "short message" <your file>
+  * Run it again after every further round of edits. Little and often.
+  * It commits, rebases onto origin and pushes, and is safe to run while other agents do the same.
+  * Never finish without a successful save.sh push.
+
 `
 
 const SCULPT_SCHEMA = {
@@ -219,7 +227,9 @@ whether it still reads as a potato, and file findings against exactly one of src
   log('Character round ' + round + ': avg ' + avg.toFixed(1) + '/10, ' + fails.length + ' FAIL, ' +
       potatoes.length + ' still call it a potato')
 
-  if (!fails.length && !potatoes.length) {
+  // Judges that failed to run are not a pass. Require the full panel.
+  const judged = reviews.length === CRITICS.length
+  if (judged && !fails.length && !potatoes.length) {
     log('Character round ' + round + ': PASSED - no critic fails it and nobody calls it a potato.')
     return { rounds: round, avg: +avg.toFixed(2), converged: true,
              scores: reviews.map((r) => ({ lens: r.lens, score: r.score, potato: r.potato })) }

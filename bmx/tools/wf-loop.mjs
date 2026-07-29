@@ -107,6 +107,14 @@ RULES
   and READ the PNGs. Iterate until the finding is genuinely gone, not merely addressed.
 - If the game has gameplay tests, do not break them: node tools/playtest.mjs --only boot,perf-budget
 - Dismissing a finding requires it to be factually wrong. "It is fine already" is not a reason.
+PERSIST YOUR WORK OR IT WILL BE LOST. This container periodically rolls its filesystem back to an
+older snapshot. Anything not pushed to origin at that moment is gone - a previous run lost a full
+round of finished work this way. Therefore:
+  * As soon as you have a working change, run:  bash tools/save.sh "short message" <your file>
+  * Run it again after every further round of edits. Little and often.
+  * It commits, rebases onto origin and pushes, and is safe to run while other agents do the same.
+  * Never finish without a successful save.sh push.
+
 `
 
 const FIX_SCHEMA = {
@@ -210,7 +218,9 @@ Return a summary of what was captured and the state of the build.`,
   })
 
   // Convergence: every lens passes and none of them still prefers the reference.
-  if (!failing.length && !theirs.length) {
+  // Critics that failed to run are not convergence. Require the full panel.
+  const judged = reviews.length === LENSES.length
+  if (judged && !failing.length && !theirs.length) {
     log('Round ' + round + ': CONVERGED - every lens passes and no critic prefers the reference.')
     break
   }
