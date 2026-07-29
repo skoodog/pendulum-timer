@@ -795,13 +795,18 @@ const _speck = (() => {
 const _weaveTile = (() => {
   const g = c2d(64, 64);
   g.fillStyle = '#808080'; g.fillRect(0, 0, 64, 64);
-  for (let x = 0; x < 64; x += 4) {
-    g.fillStyle = 'rgba(255,255,255,0.30)'; g.fillRect(x, 0, 2, 64);
-    g.fillStyle = 'rgba(0,0,0,0.26)'; g.fillRect(x + 2, 0, 2, 64);
-  }
+  // A plain weave is a CHECKERBOARD of warp and weft floats, not a set of ruled
+  // stripes: stripes of unequal contrast in x and y leave a directional bias that
+  // survives every mip and shows up on the garment as ribbing.
   for (let y = 0; y < 64; y += 4) {
-    g.fillStyle = 'rgba(255,255,255,0.22)'; g.fillRect(0, y, 64, 2);
-    g.fillStyle = 'rgba(0,0,0,0.20)'; g.fillRect(0, y + 2, 64, 2);
+    for (let x = 0; x < 64; x += 4) {
+      const warp = ((x >> 2) + (y >> 2)) & 1;
+      g.fillStyle = warp ? 'rgba(255,255,255,0.26)' : 'rgba(0,0,0,0.24)';
+      g.fillRect(x, y, 4, 4);
+      g.fillStyle = warp ? 'rgba(0,0,0,0.16)' : 'rgba(255,255,255,0.14)';
+      g.fillRect(x, y + 3, 4, 1);
+      g.fillRect(x + 3, y, 1, 4);
+    }
   }
   return g.canvas;
 })();
@@ -1006,25 +1011,48 @@ function text(g, str, x, y, size, css, opts = {}) {
 }
 
 /** Cloth folds running ALONG the limb (u across, v along). */
-function folds(c, bw, bh, n, css, alpha) {
+/**
+ * Cloth folds.
+ *
+ * The old version put one full-height near-vertical stroke at a uniformly random
+ * x. Twenty-odd of those across an atlas region is not drapery, it is a comb:
+ * every garment on the rider came out as evenly-pitched vertical ribbing — the
+ * tee and the jeans both read as corduroy, which was the loudest "this is a
+ * texture, not a garment" tell on the character.
+ *
+ * Real folds are (a) CLUMPED, because cloth only gathers where the pose
+ * compresses it, and (b) DIRECTIONAL — a shirt bunching round a bent torso folds
+ * ACROSS the body, denim breaking at the knee folds across the leg. So: a handful
+ * of anchors, strokes radiating from them along `slant` (0 = along the region's
+ * v axis, π/2 = around it) with a spread of angles, and lengths well short of the
+ * region so a fold starts and dies somewhere.
+ *
+ * Regions wrap in u, so every stroke is drawn at −bw, 0 and +bw; the region clip
+ * throws away the copies that fall outside.
+ */
+function folds(c, bw, bh, n, css, alpha, opts = {}) {
+  const { slant = 0, spread = 0.55, len = 0.55, clumps = 0, wide = 1 } = opts;
   c.save(); c.globalAlpha = alpha; c.strokeStyle = css; c.lineCap = 'round';
+  const na = Math.max(1, clumps || Math.round(n / 3.5));
+  const anchors = [];
+  for (let i = 0; i < na; i++) anchors.push([rand(0, bw), rand(-bh * 0.05, bh * 1.05)]);
   for (let i = 0; i < n; i++) {
-    const x = rand(0, bw);
-    const y0 = rand(-bh * 0.4, bh * 0.5), y1 = y0 + rand(bh * 0.45, bh * 1.3);
-    c.lineWidth = rand(2, 8);
-    c.beginPath();
-    c.moveTo(x, y0);
-    c.bezierCurveTo(x + rand(-26, 26), lerp(y0, y1, 0.33), x + rand(-26, 26), lerp(y0, y1, 0.66),
-      x + rand(-18, 18), y1);
-    c.stroke();
-  }
-  for (let i = 0; i < n >> 1; i++) {                 // short cross creases where it bunches
-    const x = rand(0, bw), y = rand(0, bh);
-    c.lineWidth = rand(1.5, 4);
-    c.beginPath();
-    c.moveTo(x, y);
-    c.quadraticCurveTo(x + rand(-40, 40), y + rand(-10, 10), x + rand(-70, 70), y + rand(-16, 16));
-    c.stroke();
+    const A = anchors[i % na];
+    const a = slant + rand(-spread, spread);
+    const dx = Math.sin(a), dy = Math.cos(a);
+    const L = bh * len * rand(0.45, 1.55);
+    const x0 = A[0] + rand(-bw * 0.075, bw * 0.075) - dx * L * rand(0.25, 0.75);
+    const y0 = A[1] + rand(-bh * 0.20, bh * 0.20) - dy * L * 0.5;
+    const bow = rand(-L * 0.20, L * 0.20);
+    const cx1 = x0 + dx * L * 0.33 - dy * bow, cy1 = y0 + dy * L * 0.33 + dx * bow;
+    const cx2 = x0 + dx * L * 0.67 - dy * bow * 0.55, cy2 = y0 + dy * L * 0.67 + dx * bow * 0.55;
+    c.lineWidth = rand(1.6, 6.5) * wide;
+    for (const off of [-bw, 0, bw]) {
+      c.beginPath();
+      c.moveTo(x0 + off, y0);
+      c.bezierCurveTo(cx1 + off, cy1, cx2 + off, cy2, x0 + dx * L + off, y0 + dy * L);
+      c.stroke();
+    }
   }
   c.restore();
 }
@@ -2504,7 +2532,8 @@ function riderRegions() {
           c.stroke();
         }
         c.restore();
-        folds(c, w, yv(0) - yv(hem), 6, rgba(shade(X.bottom.colour, -0.7), 0.5), 0.5);
+        folds(c, w, yv(0) - yv(hem), 6, rgba(shade(X.bottom.colour, -0.7), 0.5), 0.5,
+          { slant: 1.20, spread: 0.40, len: 0.35, clumps: 3 });
         // garment body
         c.fillStyle = HEX(T.body);
         c.fillRect(0, 0, w, yv(hem));
@@ -2603,8 +2632,16 @@ function riderRegions() {
           }, 0.25);
         }
         overlay(c, w, yv(hem), 0.16, 16, _weaveTile);
-        folds(c, w, yv(hem), 16, rgba(shade(T.body, -0.65), 0.38), 0.55);
-        folds(c, w, yv(hem), 8, rgba(shade(T.body, 0.5), 0.16), 0.5);
+        // A tee on a rider bent over the bars gathers ACROSS the body — a band of
+        // compression above the waist and diagonal pulls out of each armpit — with
+        // only the loose skirt of the garment hanging in vertical drape.
+        const gh = yv(hem);
+        folds(c, w, gh, 11, rgba(shade(T.body, -0.65), 0.34), 0.55,
+          { slant: 1.18, spread: 0.42, len: 0.34, clumps: 4 });
+        folds(c, w, gh, 7, rgba(shade(T.body, -0.60), 0.28), 0.5,
+          { slant: 0.62, spread: 0.30, len: 0.46, clumps: 3 });
+        folds(c, w, gh, 5, rgba(shade(T.body, 0.5), 0.14), 0.5,
+          { slant: 1.10, spread: 0.45, len: 0.30, clumps: 3 });
         // Baked crease occlusion where a top ACTUALLY creases on a rider bent over
         // the bars: a horizontal bunch above the waist, a pull from each armpit,
         // and the drape off the shoulder yoke.
@@ -2633,7 +2670,8 @@ function riderRegions() {
         fill(c, w, h, X.top.style === 'jersey' ? '#d8d8d8' : '#f2f2f2');
         overlay(c, w, h, 0.32, 16, _weaveTile);
         overlay(c, w, h, 0.25, 4);
-        folds(c, w, h, 14, 'rgba(168,168,168,0.5)', 0.5);
+        folds(c, w, h, 10, 'rgba(168,168,168,0.5)', 0.5,
+          { slant: 1.18, spread: 0.45, len: 0.30, clumps: 4 });
         if (X.top.graphic.mark !== 'none') {
           const printed = (fn, ux) => {
             c.save(); c.translate(w * ux, 0); c.scale(-1, 1); c.translate(-w * ux, 0);
@@ -2651,9 +2689,13 @@ function riderRegions() {
         const yv = (v) => (1 - v) * h;
         const hem = X.top.style === 'jersey' ? 0.135 : X.top.style === 'hoodie' ? 0.115 : 0.175;
         fill(c, w, h, '#808080');
-        overlay(c, w, h, 0.75, 16, _weaveTile);
-        folds(c, w, h, 18, '#4e4e4e', 0.6);
-        folds(c, w, h, 10, '#b6b6b6', 0.5);
+        // 0.75 of a 64 px weave tile in the HEIGHT map is a corrugated-iron
+        // normal, not cloth: the Sobel turns it into a hard rib the eye reads all
+        // the way out to gameplay distance. The weave belongs at grain level.
+        overlay(c, w, h, 0.26, 16, _weaveTile);
+        folds(c, w, h, 12, '#565656', 0.55, { slant: 1.18, spread: 0.42, len: 0.32, clumps: 4 });
+        folds(c, w, h, 7, '#5e5e5e', 0.45, { slant: 0.62, spread: 0.30, len: 0.44, clumps: 3 });
+        folds(c, w, h, 7, '#b0b0b0', 0.45, { slant: 1.10, spread: 0.45, len: 0.28, clumps: 3 });
         c.fillStyle = '#c0c0c0'; c.fillRect(0, 0, w, h * 0.030);     // collar rib
         // the hem's turned edge and the waist bunch, in real relief
         c.fillStyle = '#c8c8c8'; c.fillRect(0, yv(hem) - h * 0.016, w, h * 0.016);
@@ -2703,8 +2745,11 @@ function riderRegions() {
           c.fillRect(0, h * 0.15, w, h * 0.030);
           c.fillRect(0, h * 0.20, w, h * 0.014);
         }
-        folds(c, w, h, 14, rgba(shade(T.sleeve, -0.62), 0.36), 0.55);
-        folds(c, w, h, 7, rgba(shade(T.sleeve, 0.5), 0.14), 0.5);
+        // a sleeve gathers round the arm at the armpit and again above the cuff
+        folds(c, w, h, 9, rgba(shade(T.sleeve, -0.62), 0.32), 0.55,
+          { slant: 1.30, spread: 0.34, len: 0.22, clumps: 3 });
+        folds(c, w, h, 5, rgba(shade(T.sleeve, 0.5), 0.13), 0.5,
+          { slant: 1.25, spread: 0.40, len: 0.20, clumps: 3 });
         // the sleeve bunches at the elbow end of its run
         const bunch = c.createLinearGradient(0, h * 0.06, 0, h * 0.30);
         bunch.addColorStop(0, rgba(shade(T.sleeve, -0.7), 0.30));
@@ -2716,15 +2761,15 @@ function riderRegions() {
         fill(c, w, h, '#f0f0f0');
         overlay(c, w, h, 0.32, 16, _weaveTile);
         overlay(c, w, h, 0.25, 3);
-        folds(c, w, h, 10, 'rgba(172,172,172,0.5)', 0.5);
+        folds(c, w, h, 8, 'rgba(172,172,172,0.5)', 0.5, { slant: 1.30, spread: 0.36, len: 0.22, clumps: 3 });
         c.fillStyle = 'rgba(206,206,206,0.6)'; c.fillRect(0, 0, w, h * 0.060);
       },
       hsig: () => 'k',
       height: (c, w, h) => {
         fill(c, w, h, '#808080');
         overlay(c, w, h, 0.75, 16, _weaveTile);
-        folds(c, w, h, 12, '#4e4e4e', 0.6);
-        folds(c, w, h, 7, '#b8b8b8', 0.5);
+        folds(c, w, h, 9, '#525252', 0.55, { slant: 1.30, spread: 0.34, len: 0.22, clumps: 3 });
+        folds(c, w, h, 6, '#b2b2b2', 0.45, { slant: 1.25, spread: 0.40, len: 0.20, clumps: 3 });
         for (let i = 0; i < 150; i++) {
           c.fillStyle = i % 2 ? '#c6c6c6' : '#5a5a5a';
           c.fillRect((i / 150) * w, 0, w / 300, h * 0.075);
@@ -2776,28 +2821,35 @@ function riderRegions() {
           fade.addColorStop(0.75, rgba(shade(col, 0.60), 0.24));
           fade.addColorStop(1, 'rgba(255,255,255,0)');
           c.fillStyle = fade; c.fillRect(0, 0, w, h);
-          // ABRADED KNEE: a real lighter patch on the front of the leg at the
-          // knee station, with whisker creases fanning out of it
+          // ABRADED KNEE: a lighter patch on the front of the leg at the knee,
+          // with whisker creases fanning out of it. Held DOWN — at 0.34/0.24 it
+          // rendered as a white smear the size of a hand, which read as a hole in
+          // the mesh rather than as wear.
           const kneeY = yv(0.48);
-          blob(c, w * 0.25, kneeY, w * 0.13, h * 0.075, rgba(shade(col, 0.62), 0.34), 0.95);
-          blob(c, w * 0.25, kneeY, w * 0.08, h * 0.045, rgba(shade(col, 0.75), 0.24), 0.95);
+          blob(c, w * 0.25, kneeY, w * 0.115, h * 0.055, rgba(shade(col, 0.42), 0.16), 0.95);
           c.save();
-          c.strokeStyle = rgba(shade(col, 0.70), 0.30); c.lineCap = 'round';
-          for (let i = 0; i < 16; i++) {
-            const t = i / 15;
-            const y = kneeY + lerp(-h * 0.075, h * 0.075, t);
-            c.lineWidth = rand(1.4, 3.4);
+          c.strokeStyle = rgba(shade(col, 0.55), 0.18); c.lineCap = 'round';
+          for (let i = 0; i < 14; i++) {
+            const t = i / 13;
+            const y = kneeY + lerp(-h * 0.060, h * 0.060, t);
+            c.lineWidth = rand(1.2, 2.6);
             c.beginPath();
-            c.moveTo(w * (0.25 - 0.115), y + rand(-4, 4));
-            c.quadraticCurveTo(w * 0.25, y + rand(-10, 10), w * (0.25 + 0.115), y + rand(-4, 4));
+            c.moveTo(w * (0.25 - 0.100), y + rand(-4, 4));
+            c.quadraticCurveTo(w * 0.25, y + rand(-9, 9), w * (0.25 + 0.100), y + rand(-4, 4));
             c.stroke();
           }
           c.restore();
-          // seat wear, high on the back of the leg
-          blob(c, w * 0.75, yv(0.90), w * 0.15, h * 0.055, rgba(shade(col, 0.50), 0.22), 0.95);
+          // seat wear, high on the back of the leg (v → 0 is the HIP end)
+          blob(c, w * 0.75, yv(0.10), w * 0.15, h * 0.055, rgba(shade(col, 0.34), 0.16), 0.95);
         }
-        folds(c, w, h, 22, rgba(shade(col, -0.62), 0.40), 0.6);
-        folds(c, w, h, 12, rgba(shade(col, 0.55), 0.16), 0.5);
+        // denim breaks ACROSS the leg — at the knee, behind it, and where it
+        // stacks on the shoe — with only a little lengthwise drape on the thigh
+        folds(c, w, h, 13, rgba(shade(col, -0.62), 0.34), 0.6,
+          { slant: 1.25, spread: 0.34, len: 0.16, clumps: 5 });
+        folds(c, w, h, 7, rgba(shade(col, -0.55), 0.26), 0.5,
+          { slant: 0.30, spread: 0.28, len: 0.34, clumps: 3 });
+        folds(c, w, h, 7, rgba(shade(col, 0.55), 0.13), 0.5,
+          { slant: 1.25, spread: 0.34, len: 0.14, clumps: 4 });
         // the trouser stacks on the shoe: hard bunched creases at the cuff
         for (let i = 0; i < 5; i++) {
           const y = h * (0.012 + i * 0.026);
@@ -2822,6 +2874,14 @@ function riderRegions() {
         // --- the parts that make trousers TROUSERS ---------------------------
         // Without these the leg is a dyed tube: a waistband, a fly, and pockets
         // are what the eye reads as a garment cut and sewn from panels.
+        //
+        // THE HIP END IS v = 0, i.e. the BOTTOM of this canvas — the leg tube maps
+        // v 0.03 at the hip to 0.99 at the cuff. This whole block used to be laid
+        // out from y = 0, which is the ANKLE, so the waistband, the belt loops,
+        // the fly and both back pockets were printed around the rider's shoe,
+        // on top of the cuff stack, and the hip was bare denim. Mirroring y puts
+        // every one of them where it was always meant to be.
+        c.save(); c.translate(0, h); c.scale(1, -1);
         const wbTop = yv(1.0), wbLow = yv(0.955);
         c.fillStyle = rgba(shade(col, 0.10), 0.85);
         c.fillRect(0, wbTop, w, wbLow - wbTop);
@@ -2877,6 +2937,7 @@ function riderRegions() {
           stitchLine(c, cx - pw * 0.86, y1 - h * 0.010, cx, y1 + 2, seam, 1.8, [5, 6]);
           stitchLine(c, cx, y1 + 2, cx + pw * 0.86, y1 - h * 0.010, seam, 1.8, [5, 6]);
         }
+        c.restore();
         overlay(c, w, h, 0.12, 4);
         chips(c, w, h, 30, rgba(shade(col, 0.6), 0.10), 2, 7);
       },
@@ -2887,19 +2948,21 @@ function riderRegions() {
         overlay(c, w, h, denim ? 0.35 : 0.25, denim ? 18 : 14, denim ? _twillTile : _weaveTile);
         overlay(c, w, h, 0.3, 4);
         // denim polishes where it rubs: fold crests, the knee and the seat
-        folds(c, w, h, 20, 'rgba(160,160,160,0.5)', 0.5);
+        folds(c, w, h, 12, 'rgba(160,160,160,0.5)', 0.5,
+          { slant: 1.25, spread: 0.34, len: 0.16, clumps: 5 });
         if (denim) {
           blob(c, w * 0.25, yv(0.48), w * 0.13, h * 0.075, 'rgba(120,120,120,0.55)', 0.95);
-          blob(c, w * 0.75, yv(0.90), w * 0.15, h * 0.055, 'rgba(132,132,132,0.45)', 0.95);
+          blob(c, w * 0.75, yv(0.10), w * 0.15, h * 0.055, 'rgba(132,132,132,0.45)', 0.95);
         }
       },
       hsig: (X) => `${X.bottom.style}`,
       height: (c, w, h, X) => {
         const denim = X.bottom.style === 'jeans';
         fill(c, w, h, '#808080');
-        overlay(c, w, h, denim ? 0.85 : 0.55, denim ? 18 : 14, denim ? _twillTile : _weaveTile);
-        folds(c, w, h, 24, '#4a4a4a', 0.65);
-        folds(c, w, h, 14, '#bcbcbc', 0.55);
+        overlay(c, w, h, denim ? 0.30 : 0.22, denim ? 18 : 14, denim ? _twillTile : _weaveTile);
+        folds(c, w, h, 14, '#4e4e4e', 0.60, { slant: 1.25, spread: 0.34, len: 0.16, clumps: 5 });
+        folds(c, w, h, 7, '#585858', 0.45, { slant: 0.30, spread: 0.28, len: 0.34, clumps: 3 });
+        folds(c, w, h, 9, '#b6b6b6', 0.50, { slant: 1.25, spread: 0.34, len: 0.14, clumps: 4 });
         for (const x of [2, w - 2, w * 0.5 - 4, w * 0.5 + 4]) {
           c.fillStyle = '#9c9c9c'; c.fillRect(x - 3, 0, 6, h);        // felled seam ridge
           stitchLine(c, x, 0, x, h, '#dcdcdc', 3, [6, 7]);
@@ -2910,7 +2973,9 @@ function riderRegions() {
           c.lineWidth = 5;
           c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke();
         }
-        // waistband, fly and pockets stand proud in relief as well as in ink
+        // waistband, fly and pockets stand proud in relief as well as in ink —
+        // mirrored onto the HIP end (v → 0) to match the colour pass
+        c.save(); c.translate(0, h); c.scale(1, -1);
         c.fillStyle = '#a8a8a8'; c.fillRect(0, 0, w, h * 0.045);
         c.strokeStyle = '#d4d4d4'; c.lineWidth = 3;
         c.beginPath(); c.moveTo(w * 0.25, h * 0.045); c.lineTo(w * 0.25, h * 0.155); c.stroke();
@@ -2921,6 +2986,7 @@ function riderRegions() {
           c.strokeStyle = '#d8d8d8'; c.lineWidth = 3;
           c.strokeRect(cx - pw, h * 0.062, pw * 2, h * 0.080);
         }
+        c.restore();
       },
     },
     // ---------------------------------------------------------------- shoes
@@ -3123,7 +3189,7 @@ function riderRegions() {
         for (let i = 0; i < 260; i++) {
           c.beginPath(); c.arc(rand(0, w), rand(h * 0.10, h * 0.80), rand(1.2, 2.4), 0, TAU); c.fill();
         }
-        folds(c, w, h, 10, rgba(shade(col, -0.6), 0.35), 0.55);
+        folds(c, w, h, 8, rgba(shade(col, -0.6), 0.35), 0.55, { slant: 1.20, spread: 0.45, len: 0.26, clumps: 3 });
       },
       rough: (c, w, h) => {
         fill(c, w, h, '#c8c8c8');                              // padded leather
@@ -3208,7 +3274,7 @@ function riderRegions() {
           drawMark(c, w * 0.5, h * 0.42, h * 0.30,
             { mark: 'wordmark', text: 'VOLTA' }, ink, col);
         }
-        folds(c, w, h, 6, rgba(shade(col, -0.55), 0.3), 0.5);
+        folds(c, w, h, 6, rgba(shade(col, -0.55), 0.3), 0.5, { slant: 1.15, spread: 0.50, len: 0.26, clumps: 3 });
       },
       rough: (c, w, h) => { fill(c, w, h, '#f0f0f0'); overlay(c, w, h, 0.25, 4); },
       hsig: (X) => `${X.lid.style}`,
@@ -4383,7 +4449,13 @@ function riderPose(pts, X) {
   const chest = hips.clone().addScaledVector(lean, L.torso);
   const spine = hips.clone().lerp(chest, 0.46);
   const neck = chest.clone().addScaledVector(lean, L.neck).add(V(0, 0.020 * hs, -0.020 * hs));
-  const head = neck.clone().add(V(0, 0.070 * hs, 0.012));
+  // THE RIDER HAD NO NECK. At +0.070 the chin landed 12 mm above the top of the
+  // collar, so the jaw, the throat and the shoulder yoke were one continuous
+  // mass and the head read as a lump growing out of the shirt — half of "he looks
+  // like a potato" in one number. A real male has ~70 mm of throat showing above
+  // a tee collar; this puts the atlanto-occipital joint where that is true, and
+  // sets it FORWARD of the spine, which is where a neck actually is.
+  const head = neck.clone().add(V(0, 0.108 * hs, 0.026 * hs));
   // the torso's own frame: +X is the chest front, +Z the rider's left
   const front = new THREE.Vector3().crossVectors(lean, V(-1, 0, 0)).normalize();
 
@@ -5732,7 +5804,11 @@ function buildRiderBody(pose, boneIndex, X, A) {
     // full hip-radius (150 mm) below and behind the hips, so the tee ended in a
     // giant blunt dome instead of a hem — the biggest single silhouette error on
     // the character. capB likewise stops the shoulder yoke ballooning over the neck.
-    capA: 0.30, capB: 0.55,
+    // capB 0.55 pushed the shoulder yoke 50 mm above the neck joint — a dome of
+    // shirt climbing the throat. A yoke is nearly FLAT across the top of the
+    // shoulders; 0.24 puts the fabric where the trapezius is and lets the neck
+    // out of the collar.
+    capA: 0.30, capB: 0.24,
     // hem flare → WAIST → ribcage → the shoulder yoke.
     // The base radius already tapers 140 → 90 mm, so the old profile (0.92 at the
     // waist, 1.16 at the chest) cancelled the taper exactly and left a constant
