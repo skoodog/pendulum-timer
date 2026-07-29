@@ -20,7 +20,11 @@
 //   glyphs.el('KeyJ')                -> keycap for a raw KeyboardEvent.code
 //   glyphs.el('a', { size: 2 })      -> the A button at 2em tall
 //   glyphs.svg('lt')                 -> raw SVG markup string
-//   glyphs.controller()              -> the pad silhouette for the HUD corner
+//   glyphs.controller()              -> the device silhouette for the HUD corner
+//                                       (pad on a pad, keyboard on a keyboard)
+//   glyphs.padCorner()               -> that silhouette already parked in the
+//                                       bottom-right at the shared --pad inset
+//   glyphs.chip('tricklist')         -> the flat LB / T chip for a label row
 //   glyphs.prompt('grind', 'GRIND')  -> glyph + caption row
 //   glyphs.hint([['hop','HOP'], ['grind','GRIND']])
 //
@@ -37,6 +41,13 @@
 // listeners: any keypress/click means keyboard, any pad button press or stick
 // deflection means gamepad. Elements built from an *action* name remember their
 // spec and re-render themselves the moment the device flips.
+//
+// The HUD corner is an action too — the pseudo-action `device`, which resolves
+// to the pad silhouette on a pad and the keyboard silhouette on a keyboard. Both
+// are drawn on the same 128x88 box, so the corner is a fixed-width column that
+// does not move when the player switches hands. `createGlyphs(ctx, { device })`
+// seeds the starting device for a screen that should open controller-first; the
+// first real input still wins.
 //
 // ---------------------------------------------------------------------------
 // PAD LAYOUT (ARCHITECTURE.md "CONTROLLER SUPPORT")
@@ -89,10 +100,18 @@ export const GLYPH_CSS = `
   filter:drop-shadow(0 1px 1.1px rgba(0,0,0,.85)) drop-shadow(0 0 3px rgba(0,0,0,.5));
 }
 .gly.no-scrim{filter:none;}
-.gly--controller{
+.gly--controller,.gly--keys{
   height:var(--gly-pad-size,2.7em);
   width:calc(var(--gly-pad-size,2.7em) * var(--gly-ar,1));
   vertical-align:middle;
+}
+/* Width-driven sizing. The HUD corner is pinned to a fixed column width so the
+   silhouette does not resize when the player swaps device mid-run: the pad and
+   the keyboard share one viewBox aspect and one measured width. */
+.gly.gly--fitw{
+  width:var(--gly-w,6em);
+  height:auto;
+  aspect-ratio:var(--gly-ar,1);
 }
 .gly--arrows{
   height:var(--gly-arrows-size,2.15em);
@@ -107,6 +126,13 @@ export const GLYPH_CSS = `
 .gly .g-shell-2{fill:var(--gly-shell-2);}
 .gly .g-rim{fill:none; stroke:var(--gly-rim); stroke-width:1.1; stroke-linejoin:round;}
 .gly .g-rim.hair{stroke-width:.85; stroke-opacity:.72;}
+/* A true one-device-pixel border, whatever size the glyph is drawn at, in the
+   host UI's own --dim ink when there is one. This is what makes the shoulder
+   chips sit in the same drawn weight as the panel keylines around them. */
+.gly .g-rim.px{
+  stroke:var(--dim,var(--gly-rim)); stroke-width:1; stroke-opacity:1;
+  vector-effect:non-scaling-stroke;
+}
 .gly .g-round{stroke:var(--gly-shell); stroke-width:2.6; stroke-linejoin:round;}
 .gly--dpad .g-scrim-o{stroke-width:5;}
 .gly .g-hi{fill:#fff; opacity:.155;}
@@ -149,10 +175,65 @@ export const GLYPH_CSS = `
 
 /* --- controller silhouette ---------------------------------------------- */
 .gly--controller .g-body{fill:var(--gly-pad-body);}
-.gly--controller .g-body-hi{fill:#fff; opacity:.06;}
+.gly--controller .g-body-hi{fill:#fff; opacity:.1;}
 .gly--controller .g-pad-part{fill:var(--gly-shell-2);}
-.gly--controller .g-pad-top{fill:#39434e;}
+.gly--controller .g-pad-well{fill:#070b0f;}
+.gly--controller .g-pad-top{fill:#4c5866;}
 .gly--controller .g-guide{fill:#eef3f8;}
+/* Face-button colour has to come from a class: a fill= presentation attribute
+   loses to the .g-pad-part rule above, which is what turned the pad in the HUD
+   corner into four identical black dots. */
+.gly--controller .g-fb{fill:#39434e;}
+.gly--controller .g-fb-a{fill:var(--gly-a);}
+.gly--controller .g-fb-b{fill:var(--gly-b);}
+.gly--controller .g-fb-x{fill:var(--gly-x);}
+.gly--controller .g-fb-y{fill:var(--gly-y);}
+
+/* --- keyboard silhouette ------------------------------------------------- */
+.gly--keys .g-chassis{fill:var(--gly-shell-2);}
+.gly--keys .g-body{fill:var(--gly-pad-body);}
+.gly--keys .g-body-hi{fill:#fff; opacity:.07;}
+.gly--keys .g-key{fill:#39434e;}
+.gly--keys .g-key.warm{fill:var(--gly-accent); fill-opacity:.42;}
+.gly--keys .g-key.hot{fill:var(--gly-accent);}
+
+/* --- flat text chip (LB / T beside a label) ------------------------------ */
+/* Same silhouette on both devices — a rounded rect with a one-pixel keyline in
+   the host's --dim and condensed caps inside — so a label row keeps its metrics
+   when the player drops the pad and picks up the keyboard. */
+.gly-chip{
+  display:inline-flex; align-items:center; justify-content:center;
+  flex:0 0 auto;
+  box-sizing:border-box;
+  height:var(--gly-chip-h,1.5em);
+  min-width:var(--gly-chip-h,1.5em);
+  padding:0 .4em;
+  border:1px solid var(--dim,var(--gly-rim));
+  border-radius:.32em;
+  background:var(--gly-scrim);
+  font-family:var(--gly-font); font-weight:700; font-stretch:87.5%;
+  font-size:.82em; line-height:1; letter-spacing:.1em;
+  text-transform:uppercase; white-space:nowrap;
+  color:var(--gly-ink);
+  text-shadow:0 1px 2px rgba(0,0,0,.9);
+  vertical-align:-.26em;
+  pointer-events:none;
+}
+.gly-chip.is-wide{letter-spacing:.06em;}
+.gly-chip.no-scrim{background:none;}
+
+/* --- bottom-right device corner ----------------------------------------- */
+/* Parked on the same title-safe inset token the other corners use, at a fixed
+   column width so the corner holds its mass for the whole run. */
+.gly-corner{
+  position:absolute;
+  right:var(--pad,calc(var(--u,14px) * 1.55));
+  bottom:var(--pad,calc(var(--u,14px) * 1.55));
+  display:flex; align-items:flex-end; justify-content:flex-end;
+  width:var(--gly-corner-w,calc(var(--u,14px) * 6));
+  pointer-events:none;
+}
+.gly-corner .gly{width:100%; height:auto; aspect-ratio:var(--gly-ar,1);}
 
 /* --- prompt rows --------------------------------------------------------- */
 .gly-group{display:inline-flex; align-items:center; gap:.24em; vertical-align:-.26em;}
@@ -246,9 +327,17 @@ function faceGlyph(letter) {
   };
 }
 
-/** LB / RB — a wide bumper seen from above: flat base, domed top. */
-const BUMPER_D = 'M4 25.4V15C4 7 11.6 3.2 23 3.2S42 7 42 15v10.4'
-  + 'a3.2 3.2 0 0 1-3.2 3.2H7.2A3.2 3.2 0 0 1 4 25.4z';
+/**
+ * LB / RB — the shoulder chip: a rounded rectangle with a one-pixel keyline and
+ * the name in condensed caps, exactly the shape the reference HUD sets beside
+ * TRICK LIST. A soft dome of sheen across the top keeps the bumper read (a
+ * shoulder seen from above) without breaking the chip silhouette, which is what
+ * lets it sit inline with a text label at the same optical weight as a keycap.
+ */
+const BUMPER_D = 'M8 4.2h30a6.4 6.4 0 0 1 6.4 6.4v8.8a6.4 6.4 0 0 1-6.4 6.4'
+  + 'H8a6.4 6.4 0 0 1-6.4-6.4v-8.8A6.4 6.4 0 0 1 8 4.2z';
+const BUMPER_SHEEN_D = 'M8 4.2h30a6.4 6.4 0 0 1 6.4 6.4v1.8'
+  + 'C39.6 9 32 7.2 23 7.2S6.4 9 1.6 12.4v-1.8A6.4 6.4 0 0 1 8 4.2z';
 
 function bumperGlyph(side) {
   const name = side.toUpperCase() + 'B';
@@ -259,10 +348,11 @@ function bumperGlyph(side) {
     body:
       `<path class="g-scrim-o" d="${BUMPER_D}"/>`
       + `<path class="g-shell" d="${BUMPER_D}"/>`
-      + '<path class="g-hi" d="M6.4 14.2C7 8.4 13.6 5.4 23 5.4s16 3 16.6 8.8'
-      + 'C36.4 10.6 30.4 8.8 23 8.8S9.6 10.6 6.4 14.2z"/>'
-      + `<path class="g-rim hair" d="${BUMPER_D}"/>`
-      + txt(name, 23, 18.4, 12.6, 17.2),
+      + `<path class="g-hi" d="${BUMPER_SHEEN_D}"/>`
+      + '<path class="g-sh" d="M1.6 19.4h42.8a6.4 6.4 0 0 1-6.4 6.4H8'
+      + 'a6.4 6.4 0 0 1-6.4-6.4z"/>'
+      + `<path class="g-rim px" d="${BUMPER_D}"/>`
+      + txt(name, 23, 15.1, 14, 18.6),
   };
 }
 
@@ -282,7 +372,7 @@ function triggerGlyph(side) {
       + '<path class="g-hi" d="M9 13.8C9.4 8 14.2 4.6 20 4.6S30.6 8 31 13.8'
       + 'C28.4 10.4 24.6 8.6 20 8.6S11.6 10.4 9 13.8z"/>'
       + '<path class="g-sh" d="M6 24h28v4.4a2.6 2.6 0 0 1-2.6 2.6H8.6A2.6 2.6 0 0 1 6 28.4z"/>'
-      + `<path class="g-rim hair" d="${TRIGGER_D}"/>`
+      + `<path class="g-rim px" d="${TRIGGER_D}"/>`
       + txt(name, 20, 20.6, 12.4, 15.4),
   };
 }
@@ -489,11 +579,19 @@ const PAD_BODY_D = 'M64 6C76 6 88 8 98 11.5C112 16 123 25 124.5 38'
  */
 function controllerGlyph(opts) {
   const colour = !opts || opts.colour !== false;
-  const faceCol = (v) => (colour ? ` fill="var(--gly-${v})"` : '');
+
+  /** Sunk well + cap + sheen: the depth cue that keeps the pad off "black blob". */
   const stick = (cx, cy) =>
-    `<circle class="g-pad-part" cx="${cx}" cy="${cy}" r="10"/>`
-    + `<circle class="g-pad-top" cx="${cx}" cy="${cy}" r="6.2"/>`
-    + `<circle class="g-rim hair" cx="${cx}" cy="${cy}" r="10"/>`;
+    `<circle class="g-pad-well" cx="${cx}" cy="${cy}" r="10.4"/>`
+    + `<circle class="g-pad-top" cx="${cx}" cy="${cy}" r="6.6"/>`
+    + `<ellipse class="g-hi" cx="${cx}" cy="${n2(cy - 2.2)}" rx="4.6" ry="2.5"/>`
+    + `<circle class="g-rim hair" cx="${cx}" cy="${cy}" r="10.4"/>`;
+
+  const face = (cx, cy, v) =>
+    `<circle class="g-pad-well" cx="${cx}" cy="${cy}" r="5.5"/>`
+    + `<circle class="g-fb${colour ? ' g-fb-' + v : ''}" cx="${cx}" cy="${cy}" r="4.3"/>`;
+
+  const DPAD_CROSS = 'M48.6 50.4h6.8v5h5v6.8h-5v5h-6.8v-5h-5v-6.8h5z';
 
   return {
     w: 128, h: 88,
@@ -501,28 +599,88 @@ function controllerGlyph(opts) {
     label: 'Controller',
     body:
       // shoulder bumpers peeking above the shell
-      '<rect class="g-pad-part" x="26" y="3" width="24" height="11" rx="4.6"/>'
-      + '<rect class="g-pad-part" x="78" y="3" width="24" height="11" rx="4.6"/>'
+      '<rect class="g-pad-top" x="26" y="3" width="24" height="11" rx="4.6"/>'
+      + '<rect class="g-pad-top" x="78" y="3" width="24" height="11" rx="4.6"/>'
       + `<path class="g-scrim-o" d="${PAD_BODY_D}"/>`
       + `<path class="g-body" d="${PAD_BODY_D}"/>`
       + '<path class="g-body-hi" d="M64 9C84 9 104 14 114 24C104 17 86 13 64 13'
       + 'S24 17 14 24C24 14 44 9 64 9Z"/>'
-      + `<path class="g-rim hair" d="${PAD_BODY_D}"/>`
+      // one crisp device pixel of edge, so the silhouette survives both a
+      // blown-out sky and a dark ramp face behind it
+      + `<path class="g-rim px" d="${PAD_BODY_D}"/>`
       // left stick + d-pad
       + stick(36.5, 33)
-      + '<path class="g-pad-part" d="M48.6 50.4h6.8v5h5v6.8h-5v5h-6.8v-5h-5v-6.8h5z"'
-      + ' stroke="var(--gly-shell-2)" stroke-width="2.4" stroke-linejoin="round"/>'
+      + '<g transform="translate(-4 0)">'
+      + `<path class="g-pad-well" d="${DPAD_CROSS}"`
+      + ' stroke="#070b0f" stroke-width="3.2" stroke-linejoin="round"/>'
+      + `<path class="g-pad-top" d="${DPAD_CROSS}"/></g>`
       // right stick
       + stick(77, 52)
       // centre buttons
       + '<circle class="g-guide" cx="64" cy="19.5" r="5.6"/>'
-      + '<circle class="g-pad-part" cx="53" cy="30.5" r="3"/>'
-      + '<circle class="g-pad-part" cx="75" cy="30.5" r="3"/>'
+      + '<circle class="g-pad-well" cx="53" cy="30.5" r="3.2"/>'
+      + '<circle class="g-pad-well" cx="75" cy="30.5" r="3.2"/>'
       // face cluster
-      + `<circle class="g-pad-part" cx="95.5" cy="22.6" r="4.5"${faceCol('y')}/>`
-      + `<circle class="g-pad-part" cx="87" cy="31.1" r="4.5"${faceCol('x')}/>`
-      + `<circle class="g-pad-part" cx="104" cy="31.1" r="4.5"${faceCol('b')}/>`
-      + `<circle class="g-pad-part" cx="95.5" cy="39.6" r="4.5"${faceCol('a')}/>`,
+      + face(95.5, 22.6, 'y')
+      + face(87, 31.1, 'x')
+      + face(104, 31.1, 'b')
+      + face(95.5, 39.6, 'a'),
+  };
+}
+
+/**
+ * Keyboard silhouette — the corner glyph's keyboard half.
+ *
+ * Drawn on the *same 128x88 viewBox as the pad* on purpose: the HUD corner is a
+ * fixed-width column, so when the player drops the pad and touches a key the
+ * silhouette swaps without the corner changing size or shifting the layout.
+ * Rows are staggered like a real board, WASD and the space bar are lit in the
+ * accent so the glyph reads as "these are your controls", not as clip art.
+ */
+function keyboardGlyph() {
+  const CHASSIS = 'M10 24.5h108a8 8 0 0 1 8 8v34a8 8 0 0 1-8 8H10a8 8 0 0 1-8-8'
+    + 'v-34a8 8 0 0 1 8-8z';
+  const FACE = 'M12 20.5h104a7 7 0 0 1 7 7v32a7 7 0 0 1-7 7H12a7 7 0 0 1-7-7'
+    + 'v-32a7 7 0 0 1 7-7z';
+  const SHEEN = 'M12 20.5h104a7 7 0 0 1 7 7v2a7 7 0 0 0-7-7H12a7 7 0 0 0-7 7'
+    + 'v-2a7 7 0 0 1 7-7z';
+
+  const key = (x, y, w, cls) =>
+    `<rect class="g-key${cls ? ' ' + cls : ''}" x="${n2(x)}" y="${n2(y)}"`
+    + ` width="${n2(w)}" height="8.2" rx="2.2"/>`;
+
+  // [x0, count, y, hot indices, trailing key width]
+  const ROWS = [
+    [12, 11, 25.5, null, 0],
+    [14, 10, 35.2, [1], 8.6],         // W — one stagger step left of S
+    [16, 10, 44.9, [0, 1, 2], 6.6],   // A S D
+  ];
+  let keys = '';
+  for (let r = 0; r < ROWS.length; r++) {
+    const row = ROWS[r];
+    let x = row[0];
+    for (let i = 0; i < row[1]; i++) {
+      keys += key(x, row[2], 8.2, row[3] && row[3].indexOf(i) >= 0 ? 'hot' : '');
+      x += 9.5;
+    }
+    if (row[4]) keys += key(x, row[2], row[4], '');
+  }
+  // bottom row: modifiers either side of a lit space bar
+  keys += key(12, 54.6, 13.4) + key(27.4, 54.6, 10)
+    + key(39.4, 54.6, 46, 'warm')
+    + key(87.4, 54.6, 10) + key(99.4, 54.6, 10) + key(111.4, 54.6, 6.6);
+
+  return {
+    w: 128, h: 88,
+    cls: ['gly--keys'],
+    label: 'Keyboard',
+    body:
+      `<path class="g-scrim-o" d="${CHASSIS}"/>`
+      + `<path class="g-chassis" d="${CHASSIS}"/>`
+      + `<path class="g-body" d="${FACE}"/>`
+      + `<path class="g-body-hi" d="${SHEEN}"/>`
+      + keys
+      + `<path class="g-rim px" d="${FACE}"/>`,
   };
 }
 
@@ -541,9 +699,38 @@ const ALIAS = {
   home: 'guide', xbox: 'guide',
   dpad: 'dpad', 'd-pad': 'dpad',
   pad: 'controller', gamepad: 'controller', joypad: 'controller',
+  keyboard: 'keys', kb: 'keys', board: 'keys',
   arrowkeys: 'arrows', 'arrow-keys': 'arrows',
   empty: 'none', unbound: 'none', '-': 'none',
+  // labels input.js hands back from glyphFor(), so a remap still resolves to a
+  // drawn glyph instead of silently falling through to the static table
+  'd-pad-↑': 'dpad-up', 'd-pad-↓': 'dpad-down',
+  'd-pad-←': 'dpad-left', 'd-pad-→': 'dpad-right',
+  'ls-↑': 'ls-up', 'ls-↓': 'ls-down', 'ls-←': 'ls-left', 'ls-→': 'ls-right',
+  'rs-↑': 'rs-up', 'rs-↓': 'rs-down', 'rs-←': 'rs-left', 'rs-→': 'rs-right',
 };
+
+/**
+ * Our action names vs the ones input.js publishes. Without this the trick-list
+ * prompt never sees a rebind, because input.js calls the action `trickList`.
+ */
+const INPUT_ACTION_ALIAS = {
+  tricklist: 'trickList', trickList: 'tricklist',
+  throttle: 'pedal', backOut: 'cancel', accept: 'confirm', move: 'forward',
+};
+
+/** The first spelling of `action` that `table` actually carries. */
+function actionKeyIn(table, action) {
+  if (!table || !action) return null;
+  if (table[action] != null) return action;
+  const alt = INPUT_ACTION_ALIAS[action];
+  if (alt && table[alt] != null) return alt;
+  const lower = String(action).toLowerCase();
+  for (const k in table) {
+    if (k.toLowerCase() === lower) return k;
+  }
+  return null;
+}
 
 const DIRS = ['up', 'down', 'left', 'right'];
 
@@ -584,7 +771,10 @@ export const KEY_ACTIONS = {
   rebind: 'Enter', randomize: 'KeyR', deleteItem: 'Delete', start: 'Enter',
 };
 
-const ACTION_SET = new Set(Object.keys(PAD_ACTIONS).concat(Object.keys(KEY_ACTIONS)));
+// `device` is a pseudo-action: it resolves to whichever *silhouette* matches the
+// hands on the controls, which is what makes the HUD corner swap by itself.
+const ACTION_SET = new Set(
+  Object.keys(PAD_ACTIONS).concat(Object.keys(KEY_ACTIONS)).concat(['device']));
 
 /** Human labels for KeyboardEvent.code values. */
 export const KEY_LABELS = {
@@ -630,6 +820,9 @@ for (const d of DIRS) {
 }
 
 const PAD_NAME_SET = new Set(PAD_NAMES);
+
+/** Everything drawable that is not a pad button or a keycap. */
+const EXTRA_NAMES = ['keys', 'device', 'arrows', 'none'];
 
 function normalise(name) {
   const s = String(name == null ? '' : name).trim().toLowerCase()
@@ -693,7 +886,16 @@ function buildGlyph(spec, opts) {
     const rest = pfx[2];
     const isKey = /^(key|kb|keyboard)$/i.test(pfx[1]);
     if (rest.indexOf('|') >= 0) {
-      return { group: rest.split('|').map((p) => buildGlyph((isKey ? 'key:' : 'pad:') + p, o)) };
+      // "key:Space|Enter" and "key:Space|key:Enter" must mean the same thing:
+      // re-prefixing a part that already carries one produced "key:key:Enter",
+      // which fell through to a keycap literally labelled KEY:ENTER.
+      return {
+        group: rest.split('|').map((part) => {
+          const p = part.trim();
+          const own = /^(pad|gp|gamepad|key|kb|keyboard):/i.test(p);
+          return buildGlyph(own ? p : (isKey ? 'key:' : 'pad:') + p, o);
+        }),
+      };
     }
     if (isKey) {
       if (normalise(rest) === 'arrows') return arrowsGlyph();
@@ -709,6 +911,11 @@ function buildGlyph(spec, opts) {
   const nm = normalise(raw);
   if (nm === 'none' || nm === '') return noneGlyph();
   if (nm === 'arrows') return arrowsGlyph();
+  if (nm === 'keys') return keyboardGlyph();
+  // "device" is whichever silhouette matches the hands on the controls now.
+  if (nm === 'device') {
+    return activeDevice === 'gamepad' ? controllerGlyph(o) : keyboardGlyph();
+  }
   if (PAD_NAME_SET.has(nm)) return buildPad(nm, o) || noneGlyph();
   if (looksLikeKeyCode(raw)) return keyGlyph(raw, o.label);
   return keyGlyph(raw, o.label != null ? o.label : raw.toUpperCase());
@@ -833,11 +1040,22 @@ export function createGlyphs(ctx, options) {
     if (tracked.length > 512) prune();
   }
 
+  /**
+   * A tracked node is live until it has been in the document *and* left again.
+   * Testing `isConnected` alone dropped every prompt that was still being
+   * assembled — a device switch between `el()` and the parent's `appendChild()`
+   * unsubscribed the whole HUD, and it then never swapped device again.
+   */
+  function alive(node) {
+    if (!node || !node.__glyph) return false;
+    if (node.isConnected) { node.__glyphSeen = true; return true; }
+    return !node.__glyphSeen;
+  }
+
   function prune() {
     let w = 0;
     for (let i = 0; i < tracked.length; i++) {
-      const node = tracked[i].deref();
-      if (node && node.isConnected !== false) tracked[w++] = tracked[i];
+      if (alive(tracked[i].deref())) tracked[w++] = tracked[i];
     }
     tracked.length = w;
   }
@@ -861,6 +1079,12 @@ export function createGlyphs(ctx, options) {
     setActiveDevice(readDevice());
   }
 
+  // The documented `device` option was never actually applied, so a caller that
+  // wanted to open controller-first (the reference frames are) had no way to say
+  // so. It only seeds the starting state: the first real input still wins.
+  if (opt.device === 'gamepad' || opt.device === 'pad') setActiveDevice('gamepad');
+  else if (opt.device === 'keyboard' || opt.device === 'key') setActiveDevice('keyboard');
+
   const localListeners = new Set();
   const onDeviceChanged = () => { refreshAll(); for (const fn of localListeners) fn(activeDevice); };
   deviceListeners.add(onDeviceChanged);
@@ -879,7 +1103,8 @@ export function createGlyphs(ctx, options) {
       const b = input.binds;
       const table = b.keyboard && typeof b.keyboard === 'object' && !Array.isArray(b.keyboard)
         ? b.keyboard : b;
-      const v = table[action];
+      const key = actionKeyIn(table, action);
+      const v = key ? table[key] : null;
       if (Array.isArray(v) && v.length) return v;
       if (typeof v === 'string') return [v];
     }
@@ -889,16 +1114,21 @@ export function createGlyphs(ctx, options) {
 
   /** The pad glyph name for `action`, preferring anything input.js publishes. */
   function padName(action) {
+    const padTable = input && input.binds && input.binds.gamepad;
+    // input.js spells some actions differently from our table (trickList vs
+    // tricklist); ask it under the name it actually knows, or a rebind never
+    // reaches the prompt.
+    const asked = actionKeyIn(padTable, action) || INPUT_ACTION_ALIAS[action] || action;
     if (input && typeof input.glyphFor === 'function') {
       let g = null;
-      try { g = input.glyphFor(action, 'gamepad'); } catch (err) { g = null; }
+      try { g = input.glyphFor(asked, 'gamepad'); } catch (err) { g = null; }
       if (g && (g.device === 'gamepad' || g.kind === 'pad' || g.kind === 'button')) {
         const nm = normalise(g.glyph || g.name || g.label || '');
         if (PAD_NAME_SET.has(nm)) return nm;
       }
     }
-    if (input && input.binds && input.binds.gamepad) {
-      const v = input.binds.gamepad[action];
+    if (padTable) {
+      const v = padTable[asked];
       const first = Array.isArray(v) ? v[0] : v;
       if (first != null) {
         const nm = normalise(padInputName(first));
@@ -927,6 +1157,8 @@ export function createGlyphs(ctx, options) {
    */
   function nameFor(action, wantDevice, opts) {
     const dev = device(wantDevice);
+    // The device silhouette: pad in hand -> pad, key touched -> keyboard.
+    if (action === 'device') return dev === 'gamepad' ? 'controller' : 'keys';
     if (dev === 'gamepad') return padName(action) || 'none';
     const keys = boundKeys(action);
     if (!keys || !keys.length) return 'none';
@@ -943,6 +1175,8 @@ export function createGlyphs(ctx, options) {
     if (nm === 'none') return '—';
     if (nm === 'back-btn') return 'BACK';
     if (nm === 'start') return 'START';
+    if (nm === 'controller') return 'PAD';
+    if (nm === 'keys') return 'KEYS';
     const m = /^(l|r)s-(up|down|left|right)$/.exec(nm);
     if (m) return (m[1] + 'S').toUpperCase() + ' ' + m[2].toUpperCase();
     if (nm === 'ls-press') return 'L3';
@@ -966,10 +1200,46 @@ export function createGlyphs(ctx, options) {
     return String(v);
   }
 
+  /** The caps that go inside a flat chip for a resolved glyph name. */
+  function chipLabel(resolved) {
+    const nm = String(resolved);
+    if (nm.startsWith('key:')) return keyLabel(nm.slice(4));
+    if (nm.startsWith('pad:')) return chipLabel(normalise(nm.slice(4)));
+    if (nm.indexOf('|') >= 0) return chipLabel(nm.split('|')[0]);
+    if (nm === 'none' || nm === '') return '—';
+    if (nm === 'back-btn') return 'BACK';
+    if (nm === 'ls-press') return 'L3';
+    if (nm === 'rs-press') return 'R3';
+    const m = /^(l|r)s-(up|down|left|right)$/.exec(nm);
+    if (m) return (m[1] + 'S').toUpperCase() + ' ' + m[2].toUpperCase();
+    if (nm.startsWith('dpad')) return nm.length > 4 ? 'D-PAD ' + nm.slice(5).toUpperCase() : 'D-PAD';
+    if (PAD_NAME_SET.has(nm)) return nm.toUpperCase();
+    return keyLabel(nm);
+  }
+
   function paint(node, spec, opts) {
     const o = opts || {};
     const action = isAction(spec) && o.as !== 'input';
     const resolved = action ? nameFor(spec, o.device, o) : spec;
+
+    // --- flat chip: a rounded rect, a hairline keyline and condensed caps.
+    // Used inline with a label (LB beside TRICK LIST) where a modelled button
+    // would out-shout the type it is annotating.
+    if (o.chip) {
+      const text = o.text != null ? String(o.text) : chipLabel(resolved);
+      node.className = ['gly-chip']
+        .concat(text.length > 2 ? ['is-wide'] : [], o.scrim === false ? ['no-scrim'] : [],
+          o.class ? [o.class] : []).join(' ');
+      node.textContent = text;
+      const chipSz = sizeValue(o.size);
+      if (chipSz) node.style.setProperty('--gly-chip-h', chipSz);
+      node.setAttribute('role', 'img');
+      node.setAttribute('aria-label', o.aria || (text + ' button'));
+      if (o.title) node.title = o.title;
+      node.__glyph = { spec, opts: o, action };
+      return node;
+    }
+
     const g = buildGlyph(resolved, o);
 
     const classes = ['gly'];
@@ -1003,6 +1273,17 @@ export function createGlyphs(ctx, options) {
       node.style.setProperty('--gly-size', sz);
       node.style.setProperty('--gly-pad-size', sz);
       node.style.setProperty('--gly-arrows-size', sz);
+    }
+
+    // Width-driven mode. A corner glyph is measured across, not down: the pad
+    // and the keyboard have different proportions inside the same box, and only
+    // a fixed width keeps the corner from breathing when the device swaps.
+    const wide = sizeValue(o.width);
+    if (wide) {
+      node.classList.add('gly--fitw');
+      node.style.setProperty('--gly-w', wide);
+    } else {
+      node.style.removeProperty('--gly-w');
     }
 
     node.innerHTML = markup;
@@ -1076,10 +1357,49 @@ export function createGlyphs(ctx, options) {
     return row;
   }
 
+  /** A flat chip — `chip('tricklist')` gives LB on a pad, T on a keyboard. */
+  function chipFn(spec, opts) {
+    const o = Object.assign({}, opts || null);
+    o.chip = true;
+    return elFn(spec, o);
+  }
+
+  /**
+   * The device silhouette for the HUD corner.
+   *
+   * It is the *device* glyph, not the pad glyph: it draws the pad while a pad is
+   * in the player's hands and the keyboard the instant a key is touched, and it
+   * re-renders itself on the shared device signal because 'device' resolves
+   * through nameFor() like any other action.
+   *
+   * Sized by width (default 6u, the HUD's own unit) so the corner column is a
+   * fixed measure and the swap never moves the layout. Pass `device:'gamepad'`
+   * for a silhouette that must stay a pad (menus that talk about the pad).
+   */
   function controllerFn(opts) {
-    const node = document.createElement('span');
-    paint(node, 'controller', opts);
-    return node;
+    const o = Object.assign({ width: 'calc(var(--u, 14px) * 6)' }, opts || null);
+    return elFn(o.fixed ? 'controller' : 'device', o);
+  }
+
+  /**
+   * The same silhouette already parked bottom-right on the shared --pad inset,
+   * for a host that just wants the corner to exist. Returns the wrapper so the
+   * caller can still position it themselves if they would rather.
+   */
+  function padCornerFn(opts) {
+    const o = opts || {};
+    const wrap = document.createElement('div');
+    wrap.className = 'gly-corner' + (o.class ? ' ' + o.class : '');
+    if (o.width) wrap.style.setProperty('--gly-corner-w', sizeValue(o.width));
+    if (o.inset) wrap.style.setProperty('--pad', sizeValue(o.inset));
+    // the wrapper owns the width and the class; the glyph just fills it
+    const inner = Object.assign({}, o);
+    delete inner.class;
+    delete inner.mount;
+    inner.width = null;
+    wrap.appendChild(controllerFn(inner));
+    if (o.mount && typeof o.mount.appendChild === 'function') o.mount.appendChild(wrap);
+    return wrap;
   }
 
   // --- api ----------------------------------------------------------------
@@ -1099,7 +1419,9 @@ export function createGlyphs(ctx, options) {
 
     prompt: promptFn,
     hint: hintFn,
+    chip: chipFn,
     controller: controllerFn,
+    padCorner: padCornerFn,
     controllerSvg,
 
     set,
@@ -1112,7 +1434,7 @@ export function createGlyphs(ctx, options) {
     isAction,
 
     /** Every canonical glyph name this library can draw. */
-    names: PAD_NAMES.concat(['arrows', 'none']),
+    names: PAD_NAMES.concat(EXTRA_NAMES),
 
     get device() { return activeDevice; },
     set device(d) { setActiveDevice(d); },

@@ -219,7 +219,9 @@ function canvas2d(w, h) {
     ? new OffscreenCanvas(w, h)
     : document.createElement('canvas');
   c.width = w; c.height = h;
-  return { canvas: c, g: c.getContext('2d') };
+  // every one of these canvases is read back at least once (dilation, mip
+  // building, height->normal), and all of it happens once at load
+  return { canvas: c, g: c.getContext('2d', { willReadFrequently: true }) };
 }
 
 function makeTex(canvas, { srgb = true, wrap = THREE.ClampToEdgeWrapping, aniso = 8, repeat = null } = {}) {
@@ -1734,9 +1736,11 @@ export function createProps(ctx) {
       metalness: 0.85,
       envMapIntensity: 0.95,
     });
-    // Free anti-aliasing on the cut-out wherever the target is multisampled;
-    // a no-op (not an error) when it is not.
-    m.alphaToCoverage = true;
+    // NOTE: alphaToCoverage is deliberately left off. The engine composes
+    // through a non-multisampled HalfFloat target, and three's A2C path then
+    // smoothsteps the alpha into a channel nothing blends with — which fattens
+    // every wire edge instead of softening it. The coverage-corrected mip
+    // chain above is what actually stops the shimmer.
     return own(m);
   }
 
@@ -1908,7 +1912,6 @@ export function createProps(ctx) {
     metalness: 0,
     envMapIntensity: 0.9,
   }));
-  foliageMat.alphaToCoverage = true;
   patchVertex(foliageMat, windU, /* glsl */`
     uniform float uTime;
     uniform vec2 uWind;
@@ -1934,7 +1937,6 @@ export function createProps(ctx) {
     roughness: 0.95,
     metalness: 0,
   }));
-  weedMat.alphaToCoverage = true;
   patchVertex(weedMat, windU, /* glsl */`
     uniform float uTime;
     attribute float aWind;
@@ -1963,7 +1965,6 @@ export function createProps(ctx) {
     metalness: 0,
     envMapIntensity: 0.9,
   }));
-  palmMat.alphaToCoverage = true;
   patchVertex(palmMat, windU, /* glsl */`
     uniform float uTime;
     uniform vec2 uWind;
@@ -2007,7 +2008,6 @@ export function createProps(ctx) {
   const litterMat = own(new THREE.MeshStandardMaterial({
     name: 'props_litter', map: litterTex, alphaTest: LITTER_CUT, side: THREE.DoubleSide, roughness: 0.92, metalness: 0,
   }));
-  litterMat.alphaToCoverage = true;
   // per-instance atlas cell for the litter quads (2×2 atlas)
   litterMat.onBeforeCompile = (shader) => {
     shader.vertexShader = shader.vertexShader
@@ -3256,8 +3256,10 @@ export function createProps(ctx) {
       put(skin, i, calmSwatch(pick(SKINS), 0.88, 0.74));
       put(hair, i, calmSwatch(pick(s.hat === 'hair' ? HAIRS : CAPS), 0.78, 0.46));
       phase[i] = rand(0, TAU);
+      // column 3 of the bottoms row is the sleeve swatch, so trousers only ever
+      // reach column 2
       topCell[i] = randInt(0, 3);
-      botCell[i] = randInt(0, 3) === 3 ? 2 : randInt(0, 2);
+      botCell[i] = randInt(0, 2);
     }
     geo.setAttribute('aShirt', new THREE.InstancedBufferAttribute(shirt, 3));
     geo.setAttribute('aPants', new THREE.InstancedBufferAttribute(pants, 3));

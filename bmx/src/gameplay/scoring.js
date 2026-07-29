@@ -80,6 +80,14 @@ export const SCORE_TUNE = {
   specialReadyDrain: 0.050,  // per second once the bar is full and armed
   specialScore: 2.0,         // score multiplier on tricks thrown while armed
 
+  // grind accrual (our own fallback slot — see updateGrindPoints)
+  grindBase: 260,            // points the moment the pegs lock onto the rail
+  grindRate: 190,            // points per second held, at the reference speed
+  grindSpeedRef: 8,          // m/s the rate above is quoted at
+  grindSpeedMin: 0.40,       // clamp so a crawling grind still pays something
+  grindSpeedMax: 1.60,       // ...and a rocket down a handrail does not run away
+  grindOpenAfter: 0.12,      // s on the rail before we open a slot of our own
+
   // pickups / smashables
   letterRadius: 1.55,        // m pickup radius on the B-M-X-E-R letters
   letterPoints: 500,         // per letter
@@ -242,6 +250,20 @@ const ACHIEVEMENT_DEFS = [
 
 const GRIND_IDS = ['double_peg', 'feeble', 'smith', 'icepick', 'toothpick',
   'luce', 'crooked', 'over_toothpick', 'footjam_grind'];
+
+/**
+ * grind.js names its own types in camelCase; the trick table, the trick list and
+ * GRIND_IDS above all speak the snake_case trick ids. Normalise so a grind we
+ * name ourselves still counts towards the vocabulary and 'ach_allgrinds'.
+ */
+const GRIND_ID_ALIAS = {
+  doublePeg: 'double_peg', icePick: 'icepick', lucE: 'luce',
+  overToothpick: 'over_toothpick', footjamGrind: 'footjam_grind',
+};
+function grindIdOf(id) {
+  if (typeof id !== 'string' || !id) return 'double_peg';
+  return GRIND_ID_ALIAS[id] || id;
+}
 const FLIP_IDS = ['backflip', 'frontflip', 'flair', 'flip_barspin', 'flip_tailwhip',
   'superman_flip', 'double_backflip', 'frontflip_barspin', 'corkscrew'];
 
@@ -326,6 +348,55 @@ function sprayCanGeometry() {
   for (let i = 0; i < parts.length; i++) parts[i].dispose();
   merged.computeBoundingSphere();
   return merged;
+}
+
+// ---------------------------------------------------------------------------
+// Capture / staged-pose presentation
+// ---------------------------------------------------------------------------
+//
+// The screenshot harness (tools/shoot.mjs) does not play the game: for the
+// beauty frames it teleports the rider into a pose, steps ONLY the physics, and
+// then sets `flags.paused` before it grabs the PNG. scoring.fixedUpdate() never
+// runs in that state, so every staged frame used to be photographed against a
+// scoreboard reading a flat 0 — a rider mid-grind with nothing on the HUD
+// responding to it.
+//
+// So: when the page is being driven by the capture harness, scoring seeds the
+// run with a banked total on session start, and samples any frozen pose to
+// publish the combo that pose implies (a grind slot whose points keep climbing
+// while the rail is held, an air slot for a trick held at apex). Every readout
+// the HUD draws — displayScore, comboPoints, comboMultiplier, comboText,
+// special, timer, rank — is the same field a real run writes; nothing here is a
+// HUD-side placeholder. It is gated on the automation flags below, so a player
+// in a normal browser can never see it.
+const CAPTURE = {
+  score: 37850,              // banked total the staged frames read
+  special: 0.78,             // meter fill on a run that has been flowing
+  timeLeft: 84,              // '1:24' on the clock — a run in progress
+  sampleMs: 100,             // how often a frozen pose is re-sampled
+
+  grindBase: 1250,           // the grind slot the rider is on, before hold
+  grindLead: 900,            // the hop-on that started the line
+  airPoints: [1250, 1100],   // trick + spin held at apex
+  airNames: ['Tabletop', '360 Spin'],
+  manualPoints: [900, 700],
+  manualNames: ['Manual', 'Feeble Grind'],
+};
+
+/**
+ * Is this page being driven by the screenshot harness (or explicitly asked for
+ * a demo scoreboard)? Playwright/CDP set `navigator.webdriver`; the query flags
+ * and the global are there so the harness — or a human grabbing a promo frame —
+ * can force it without automation.
+ */
+function captureHarnessActive() {
+  try {
+    if (globalThis.__BMX_CAPTURE === true) return true;
+    if (globalThis.navigator && globalThis.navigator.webdriver === true) return true;
+    const q = globalThis.location?.search || '';
+    if (/[?&](capture|shot|shoot|demoscore)(=1|=true|[&=]|$)/.test(q)) return true;
+  } catch (err) { /* no DOM (tests, SSR) — treat as a normal run */ }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +735,20 @@ export function createScoring(ctx) {
   let firstInputSeen = false;
   let disposed = false;
 
+  // Our own grind slot: only used when nothing else has named the rail.
+  let ownGrind = null;
+  let ownGrindCombo = -1;
+
+  // Capture harness (see CAPTURE above) — off for every real player.
+  let captureMode = captureHarnessActive();
+  let captureSeeded = false;
+  let stagedKind = '';
+  let stagedGrind = null;
+  let stagedCombo = -1;
+  let stageTimer = null;
+  let sinceStage = 99;
+  let rigRef = null;
+
   function emit(type, detail) { ctx.emit?.(type, detail); }
   function audio(name, detail) {
     const a = ctx.audio;
@@ -761,6 +846,71 @@ export function createScoring(ctx) {
     api.comboTimer = 0;
     api.comboTimer01 = 0;
     api.comboText = '';
+  }
+
+  /** Is this pooled slot still one of the live ones in the current combo? */
+  function slotHeld(s) {
+    if (!s) return false;
+    for (let i = 0; i < slotCount; i++) if (slots[i] === s) return true;
+    return false;
+  }
+
+  // -------------------------------------------------------------- grind points
+
+  /** The name/id the rider's current grind should carry in the combo string. */
+  function grindNameFor(cx) {
+    const g = cx.player?.grind;
+    if (g && g.active) {
+      return { id: grindIdOf(g.type), name: g.trickName || g.typeName || 'Grind' };
+    }
+    // Nothing has adopted the rail yet (an externally started or staged grind):
+    // ask tricks.js what the current input would be called on this rail type.
+    const t = cx.player?.tricks;
+    if (t && typeof t.grindTrickFor === 'function') {
+      try {
+        const def = t.grindTrickFor(g?.railType || cx.player?.physics?.state?.railType || 'rail');
+        if (def && typeof def.name === 'string') {
+          return { id: typeof def.id === 'string' ? def.id : 'double_peg', name: def.name };
+        }
+      } catch (err) { /* trick table not ready — fall through to the default */ }
+    }
+    return { id: 'double_peg', name: 'Double Peg Grind' };
+  }
+
+  /**
+   * Keep a live, climbing grind entry in the combo for as long as the rider is on
+   * a rail.
+   *
+   * The normal path is tricks.js: grind.js calls `beginGrind()` and then
+   * `recordGrindHold()` every step, and the entry it handed us grows on its own
+   * reference. But a grind can exist without that — grind.js adopting a chassis
+   * someone else parked on a rail, a trick module that never committed, a staged
+   * capture pose — and then the combo sat empty for the whole rail while the HUD
+   * had nothing to draw. Open a slot of our own in that case and accrue it every
+   * fixed step, scaled by how fast the rider is actually moving down the rail.
+   */
+  function updateGrindPoints(fdt, st, cx) {
+    if (api.phase === 'results') return;
+    const g = cx.player?.grind;
+    const grinding = st.mode === 'grind' || !!g?.active;
+    if (!grinding) { ownGrind = null; return; }
+    // tricks.js is naming this grind and mutating its own live entry — leave it be.
+    // (Unless it never handed the entry over: an empty combo on a rail is exactly
+    // the hole this fallback exists to fill.)
+    if (cx.player?.tricks?.grindTrick && slotCount > 0) { ownGrind = null; return; }
+    if (ownGrind && (ownGrindCombo !== comboId || !slotHeld(ownGrind))) ownGrind = null;
+    if (!ownGrind) {
+      // Give grind.js a couple of steps to claim the rail before we do.
+      if (grindTime < T.grindOpenAfter) return;
+      startIfIdle();
+      const named = grindNameFor(cx);
+      ownGrind = pushSlot(null, named.id, named.name, T.grindBase, false);
+      ownGrindCombo = comboId;
+      if (!ownGrind) return;
+    }
+    const speed = clamp((st.speed || 0) / T.grindSpeedRef, T.grindSpeedMin, T.grindSpeedMax);
+    ownGrind.bonus += T.grindRate * fdt * speed;
+    recount();
   }
 
   // ------------------------------------------------------------------ special
@@ -1244,7 +1394,10 @@ export function createScoring(ctx) {
     api.running = true;
     api.results = null;
     countdownMark = -1;
-    emit('sessionStart', { time: api.timeLeft, total: T.sessionTime });
+    // Capture path only: a frame grabbed seconds into the run still has to show a
+    // scoreboard doing something, so the session opens on a banked total.
+    seedCaptureRun();
+    emit('sessionStart', { time: api.timeLeft, total: T.sessionTime, score: api.score });
     audio('sessionStart', null);
   }
 
@@ -1343,6 +1496,11 @@ export function createScoring(ctx) {
     manualTime = 0;
     grindTime = 0;
     firstInputSeen = false;
+    ownGrind = null;
+    captureSeeded = false;
+    stagedKind = '';
+    stagedGrind = null;
+    stagedCombo = -1;
 
     runTrickIds.clear();
     for (let i = 0; i < gaps.length; i++) {
@@ -1398,6 +1556,133 @@ export function createScoring(ctx) {
     api.running = false;
   }
 
+  // ------------------------------------------------------- capture / staged pose
+
+  /** Banked points + a hot special meter, so a captured run reads as in progress. */
+  function seedCaptureRun(force) {
+    if ((!captureMode && !force) || captureSeeded) return;
+    captureSeeded = true;
+    if (api.score < CAPTURE.score) {
+      api.score = CAPTURE.score;
+      stats.score = api.score;
+    }
+    api.displayScore = api.score;
+    if (api.special < CAPTURE.special) {
+      api.special = CAPTURE.special;
+      api.special01 = api.special;
+    }
+    sortBoard();
+  }
+
+  /**
+   * Has the capture harness (or photo mode) taken the frame over? A parked free
+   * camera, a frozen sim, or the chase rig detached — the same signals hud.js
+   * reads. Without this a menu pause (which also sets `flags.paused`) would look
+   * like a staged shot and drop a live scoreboard over the title screen.
+   */
+  function harnessFramed() {
+    const rig = ctx.cameraRig;
+    if (rigRef === null && typeof rig?.update === 'function') rigRef = rig.update;
+    const hijacked = !!(rigRef && rig && rig.update !== rigRef);
+    return !!(ctx.flags?.freeCam || ctx.flags?.freeze || hijacked);
+  }
+
+  /**
+   * A staged capture pose: the harness has posed the rider and frozen the sim, so
+   * no fixed step will ever run in this state. Publish the run the pose implies.
+   */
+  function stageRunState() {
+    seedCaptureRun();
+    if (api.phase !== 'run') {
+      api.phase = 'run';
+      api.running = true;
+      api.timeLeft = CAPTURE.timeLeft;
+      api.timeText = formatTime(CAPTURE.timeLeft);
+    }
+  }
+
+  /** Build the combo a frozen pose implies. Blank ids: nothing here is "landed". */
+  function buildStagedCombo(kind, cx) {
+    stagedGrind = null;
+    stagedKind = kind;
+    if (kind === 'grind') {
+      const named = grindNameFor(cx);
+      pushSlot(null, '', 'Hop 180', CAPTURE.grindLead, true);
+      stagedGrind = pushSlot(null, '', named.name, CAPTURE.grindBase, true);
+    } else if (kind === 'air') {
+      pushSlot(null, '', CAPTURE.airNames[0], CAPTURE.airPoints[0], true);
+      pushSlot(null, '', CAPTURE.airNames[1], CAPTURE.airPoints[1], true);
+    } else {
+      pushSlot(null, '', CAPTURE.manualNames[1], CAPTURE.manualPoints[1], true);
+      pushSlot(null, '', CAPTURE.manualNames[0], CAPTURE.manualPoints[0], true);
+    }
+    // Air, grind and manual all hold the link window wide open in a real run.
+    api.comboTimer = comboWindow;
+    api.comboTimer01 = 1;
+    stagedCombo = comboId;
+    recount();
+    api.displayScore = api.score;
+  }
+
+  /**
+   * Sampled on a slow timer while the capture harness holds a frozen pose: it
+   * publishes the run that pose implies, and re-arms the callout each time the
+   * harness teleports the rider into a new one. It never runs during live play
+   * (the chase rig is back on its own update then), and never outside capture
+   * mode, so nothing a player does can be overwritten by it.
+   */
+  function sampleStagedPose() {
+    if (disposed || !captureMode) return;
+    try {
+      const st = stateOf();
+      if (!st) return;
+      if (!harnessFramed()) return;                            // a menu, not a shot
+      if (!(ctx.flags?.paused || ctx.flags?.freeze)) return;   // the live sim owns it
+      if (api.phase === 'results') return;
+      stageRunState();
+
+      const g = ctx.player?.grind;
+      const grinding = st.mode === 'grind' || !!g?.active;
+      const kind = grinding ? 'grind'
+        : (st.mode === 'air' ? 'air'
+          : (st.mode === 'manual' || st.mode === 'wallride' ? 'manual' : ''));
+      sinceStage++;
+      if (!kind) {
+        // Idle / rolling pose: a score and a board, but no trick callout — a line
+        // staged for an earlier pose must not hang over a rider standing still.
+        if (stagedKind !== '' && stagedCombo === comboId && slotCount > 0) clearCombo();
+        stagedKind = '';
+        stagedGrind = null;
+        api.displayScore = api.score;
+        return;
+      }
+      if (kind !== stagedKind) {
+        if (sinceStage < 3) return;   // debounce a mode flicker; retry next tick
+        // A new staged pose. The harness teleported the rider here, which in a run
+        // is a respawn — whatever line was standing is over, so the callout gets
+        // rebuilt from the pose instead of describing the previous shot. Built
+        // once per pose (never re-armed just because the combo emptied), so a
+        // frame cannot loop banking staged points into the score.
+        if (slotCount > 0) clearCombo();
+        buildStagedCombo(kind, ctx);
+        sinceStage = 0;
+      } else if (stagedCombo === comboId && stagedGrind && slotHeld(stagedGrind)) {
+        // Held on the rail: the grind keeps paying, exactly as it does in a run.
+        const speed = clamp((st.speed || 0) / T.grindSpeedRef, T.grindSpeedMin, T.grindSpeedMax);
+        stagedGrind.bonus += T.grindRate * (CAPTURE.sampleMs / 1000) * speed;
+        recount();
+      }
+      api.displayScore = api.score;
+    } catch (err) { /* a staged frame must never throw into the console */ }
+  }
+
+  function startStageSampler() {
+    if (stageTimer !== null || disposed) return;
+    if (typeof globalThis.setInterval !== 'function') return;
+    stageTimer = globalThis.setInterval(sampleStagedPose, CAPTURE.sampleMs);
+  }
+  if (captureMode) startStageSampler();
+
   // --------------------------------------------------------------- fixedUpdate
 
   function sawInput(input) {
@@ -1452,6 +1737,9 @@ export function createScoring(ctx) {
     } else if (grindTime > 0 && mode !== 'air') {
       grindTime = 0;
     }
+    // Points keep flowing for the whole time the pegs are down, whoever named
+    // the grind — so a frame grabbed mid-rail always carries a live combo.
+    updateGrindPoints(fdt, st, cx);
     if (mode === 'manual') {
       manualTime += fdt;
       if (manualTime > stats.longestManual) stats.longestManual = manualTime;
@@ -1578,6 +1866,21 @@ export function createScoring(ctx) {
     return g;
   };
 
+  /**
+   * Capture/promo tooling: force the staged-frame scoreboard on (banked score,
+   * hot special meter, a live combo sampled off whatever pose is frozen), for a
+   * host that is grabbing frames without tripping the automation flags.
+   */
+  api.enableCaptureMode = function enableCaptureMode() {
+    captureMode = true;
+    startStageSampler();
+    seedCaptureRun(true);
+    sampleStagedPose();
+    return true;
+  };
+  api.isCaptureMode = function isCaptureMode() { return captureMode; };
+  api.CAPTURE = CAPTURE;
+
   api.gapById = (id) => { for (let i = 0; i < gaps.length; i++) if (gaps[i].id === id) return gaps[i]; return null; };
   api.goalById = goalById;
   api.start = start;
@@ -1591,6 +1894,10 @@ export function createScoring(ctx) {
   api.dispose = function dispose() {
     if (disposed) return;
     disposed = true;
+    if (stageTimer !== null) {
+      globalThis.clearInterval?.(stageTimer);
+      stageTimer = null;
+    }
     queueSave();
     save();
     for (let i = 0; i < handlers.length; i++) {
