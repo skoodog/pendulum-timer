@@ -29,8 +29,19 @@ import { clamp, lerp, rand, deg } from '../core/mathx.js';
 // them and no extra uniforms are needed on materials this module does not own.
 // ---------------------------------------------------------------------------
 
-const FOG_BASE_HEIGHT = 0.0;      // metres — where the haze layer sits
-const FOG_HEIGHT_FALLOFF = 0.074; // 1/m — density halves every ~9 m of altitude
+// The haze layer's base sits *below* grade so the densest air is under the
+// plaza, never at a height the camera can see a horizontal edge of. The falloff
+// is deliberately slow: at 0.074/m the layer died 9 m above the lot, which left
+// a 60 m tower crisp on top and pure haze at its feet — a hard-edged wall with a
+// straight top edge instead of depth. At 0.030 the same tower carries a smooth
+// gradient over its whole height.
+const FOG_BASE_HEIGHT = -6.0;     // metres — where the haze layer bottoms out
+const FOG_HEIGHT_FALLOFF = 0.030; // 1/m — density halves every ~23 m of altitude
+// Aerial perspective never fully saturates: distance greys a surface, it does
+// not delete it. Past the knee the factor rolls off asymptotically to this, so
+// the city keeps ~12% of its own contrast at any range.
+const FOG_MAX = 0.88;
+const FOG_KNEE = 0.55;            // below this the response is exactly linear
 
 const _fogChunkBackup = {};
 
@@ -76,6 +87,8 @@ function installHeightFog() {
   {
     const float fogK = ${FOG_HEIGHT_FALLOFF.toFixed(5)};
     const float fogH0 = ${FOG_BASE_HEIGHT.toFixed(3)};
+    const float fogMax = ${FOG_MAX.toFixed(3)};
+    const float fogKnee = ${FOG_KNEE.toFixed(3)};
     float fogEyeY = cameraPosition.y;
     float fogDy = vFogWorldY - fogEyeY;
     float fogA = exp( - fogK * ( fogEyeY - fogH0 ) );
@@ -89,13 +102,26 @@ function installHeightFog() {
       float fogFactor = smoothstep( fogNear, fogFar, fogDist );
     #endif
 
+    // Soft knee: linear up to fogKnee, then an exponential approach to fogMax.
+    // C1 continuous at the knee, so there is no visible band where it engages,
+    // and it can never reach 1.0 — nothing in the world is ever erased by air.
+    if ( fogFactor > fogKnee ) {
+      float fogHead = fogMax - fogKnee;
+      fogFactor = fogKnee + fogHead * ( 1.0 - exp( - ( fogFactor - fogKnee ) / max( fogHead, 1e-4 ) ) );
+    }
+
     // --- aerial perspective -------------------------------------------------
     vec3 fogSrc = gl_FragColor.rgb;
     float fogLum = dot( fogSrc, vec3( 0.2126, 0.7152, 0.0722 ) );
     // 1. distance eats chroma long before it eats contrast
     fogSrc = mix( fogSrc, vec3( fogLum ), fogFactor * 0.72 );
-    // 2. and it lifts the shadows toward the haze value faster than the highlights
-    fogSrc = mix( fogSrc, fogSrc + fogColor * ( 1.0 - fogLum ) * 0.55, fogFactor * 0.75 );
+    // 2. and it lifts the shadows toward the haze value faster than the highlights.
+    //    Clamped at zero: this is scene light *added* by the air. Sunlit concrete
+    //    sits well above 1.0 in linear HDR, and an unclamped (1 - luminance) turned
+    //    the term into a subtraction there — it drove the green channel negative and
+    //    threw magenta over every bright distant surface in the lot.
+    float fogLift = clamp( 1.0 - fogLum, 0.0, 1.0 );
+    fogSrc = mix( fogSrc, fogSrc + fogColor * fogLift * 0.55, fogFactor * 0.75 );
     // 3. only then does the haze itself take over
     gl_FragColor.rgb = mix( fogSrc, fogColor, fogFactor );
   }
@@ -301,6 +327,13 @@ const SkyShader = {
     // Fixed-octave fbm variants, each normalised to 0..1 so a single coverage
     // threshold behaves the same however many octaves fed it. Separate functions
     // rather than a loop bound so this stays legal ESSL1 on every driver.
+    float fbm2( vec2 p ) {
+      float v = 0.5 * vnoise( p );
+      p = M2 * p * 2.11 + 9.7;
+      v += 0.28 * vnoise( p );
+      return v / 0.78;
+    }
+
     float fbm3( vec2 p ) {
       float v = 0.0, a = 0.5, n = 0.0;
       for ( int i = 0; i < 3; i ++ ) {
@@ -326,6 +359,37 @@ const SkyShader = {
         p = M2 * p * 2.03 + 7.1; a *= 0.53;
       }
       return v / n;
+    }
+
+    // Cellular (worley) F1. A cloud deck is not a noise field with a threshold —
+    // it is a population of cells, and the gaps between them are what light
+    // comes through. This is the low-frequency skeleton the fbm rides on.
+    float worley( vec2 p ) {
+      vec2 ip = floor( p );
+      vec2 fp = fract( p );
+      float m = 8.0;
+      for ( int j = -1; j <= 1; j ++ ) {
+        for ( int i = -1; i <= 1; i ++ ) {
+          vec2 g = vec2( float( i ), float( j ) );
+          vec2 o = vec2( hash21( ip + g + 5.1 ), hash21( ip + g + 37.7 ) );
+          vec2 r = g + o - fp;
+          m = min( m, dot( r, r ) );
+        }
+      }
+      return sqrt( m );
+    }
+
+    /**
+     * Coverage-remapped deck density field.
+     *   cellW   how much of the shape comes from the worley cell population
+     *   detail  0 = cheap 3-octave probe (used by the light march), 1 = full body
+     */
+    float deckField( vec2 p, float cellW, float detail ) {
+      float body = detail > 0.5 ? fbm5( p ) : fbm3( p );
+      // every call site passes a literal, so the branch folds away at compile
+      if ( cellW <= 0.001 ) return body;
+      float cell = clamp( 1.0 - worley( p * 0.62 ) * 1.06, 0.0, 1.0 );
+      return mix( body, cell * 0.62 + body * 0.38, cellW );
     }
 
     // Shape a raw fbm field into a coverage-controlled deck. 'sharp' widens or
@@ -453,37 +517,54 @@ const SkyShader = {
       // parallaxes faster), heavier, dark cool bases with warm underlighting.
       // ======================================================================
       if ( direction.y > 0.002 && uCloudOpacity > 0.002 ) {
-        // +0.145 keeps the horizon from compressing into aliasing-grade detail
-        vec2 uv = direction.xz / ( direction.y + 0.145 ) * ( uCloudScale * 1.45 ) + uDriftLow;
+        // Perspective projection onto the cloud plane. The epsilon is what sets
+        // how hard cells compress toward the horizon; small enough and a deck
+        // reads as a ceiling receding away rather than wallpaper at a constant
+        // apparent size from zenith to horizon.
+        vec2 uv = direction.xz / ( direction.y + 0.062 ) * ( uCloudScale * 1.02 ) + uDriftLow;
 
-        // domain warp — cheap, but it is the difference between "cloud" and
-        // "noise texture": it curls the silhouettes and breaks the fbm grid.
-        // Kept modest; push it past ~1.0 and the deck turns to marbling.
-        vec2 w = vec2( fbm3( uv * 0.36 + 3.1 ), fbm3( uv * 0.36 + 17.7 ) ) - 0.5;
-        vec2 p = uv + w * 0.9;
+        // Two-level domain warp. The first curls the silhouettes, the second
+        // breaks the fbm's own lattice up inside them.
+        vec2 w1 = vec2( fbm3( uv * 0.34 + 3.1 ), fbm3( uv * 0.34 + 17.7 ) ) - 0.5;
+        vec2 p = uv + w1 * 1.05;
+        vec2 w2 = vec2( fbm2( p * 1.45 + 5.7 ), fbm2( p * 1.45 + 29.3 ) ) - 0.5;
+        p += w2 * 0.30;
 
-        float f = fbm5( p );
+        // Detail has to come off where the projection compresses hardest, or
+        // the horizon turns into aliasing instead of cloud.
+        float detFade = 1.0 - 0.72 * sideness;
+
+        // Coverage remap: worley cell population + fbm body, not one threshold.
+        float f = deckField( p, 0.55, 1.0 );   // 5 fbm octaves over a cell field
         float coverL = uCloudCover * ( 1.0 - 0.52 * breakMask );
         float d = shapeDeck( f, coverL, 0.32 );
 
-        // erode the silhouette with a higher-frequency pass so edges are wispy
-        float det = fbm4( p * 4.2 + 21.0 );
-        d = clamp( d - ( 1.0 - d ) * ( det - 0.34 ) * 0.90, 0.0, 1.0 );
+        // Billow erosion: |1 - 2n| gives the cauliflower lobes and the flat,
+        // torn bases that a plain fbm threshold can never produce.
+        float det = 1.0 - abs( fbm4( p * 3.4 + 21.0 ) * 2.0 - 1.0 );
+        d = clamp( d - ( 1.0 - d ) * ( det - 0.38 ) * 0.95 * detFade, 0.0, 1.0 );
 
         // stack toward the horizon into a solid band
         d = 1.0 - pow( 1.0 - d, 1.0 + 2.4 * sideness * ( 1.0 - 0.75 * breakMask ) );
         d *= smoothstep( 0.002, 0.055, direction.y );
 
         if ( d > 0.003 ) {
-          // Fake a light march: how much cloud sits between here and the sun.
-          float f1 = fbm4( p + sunStep * 0.45 );
-          float f2 = fbm4( p + sunStep );
-          float d1 = shapeDeck( f1, coverL, 0.32 );
-          float d2 = shapeDeck( f2, coverL, 0.32 );
-          float trans = exp( -( d1 * 1.5 + d2 * 1.1 ) );
+          // Light march toward the sun through the deck — three taps at growing
+          // stride with geometric weights, the first carrying the cell field so
+          // whole cells shadow their neighbours. This is what makes the far side
+          // of a built-up cell go dark while its sun flank lights up; the old
+          // two-tap fake only ever produced a flat two-tone stencil.
+          float sh = shapeDeck( deckField( p + sunStep * 0.32, 0.55, 0.0 ), coverL, 0.32 ) * 1.00
+                   + shapeDeck( deckField( p + sunStep * 0.80, 0.00, 0.0 ), coverL, 0.32 ) * 0.74
+                   + shapeDeck( deckField( p + sunStep * 1.70, 0.00, 0.0 ), coverL, 0.32 ) * 0.50;
+          float trans = exp( -sh * 1.45 );
 
-          // Where we sit in the vertical body of the cloud: high fbm values are
-          // the built-up towers (bright tops), low values the thin flat base.
+          // Powder: multiple scattering darkens the interior of a lit face and
+          // leaves the boundary bright. Without it every lit flank is one value.
+          float powder = 1.0 - exp( -d * 3.4 );
+
+          // Where we sit in the vertical body of the cloud: high field values
+          // are the built-up towers (bright tops), low ones the thin flat base.
           float alt = smoothstep( 0.34, 0.86, f );
 
           // Ambient: the top of a cloud sees the whole sky dome, the base sees
@@ -498,13 +579,14 @@ const SkyShader = {
           // and under a deck this is a minority of the light — overdo it and the
           // whole sky goes orange instead of grey with a warm break.
           vec3 direct = litCol * ( 0.10 + 0.90 * trans ) *
-            ( 0.30 + 0.70 * sideness ) * ( 0.35 + 0.65 * alt ) * 0.95;
+            ( 0.30 + 0.70 * sideness ) * ( 0.35 + 0.65 * alt ) * 0.95 *
+            mix( 1.0, powder, 0.45 );
 
           // Silver lining: forward scattering through the thin edges. Peaks
           // where the deck is half transparent, which is exactly the silhouette.
           float edge = d * ( 1.0 - d ) * 4.0;
           vec3 silver = litCol * hgPhase( cosTheta, 0.82 ) * uSilver *
-            ( 0.30 + 0.70 * edge ) * ( 1.0 - d * 0.55 )
+            ( 0.30 + 0.70 * edge ) * ( 1.0 - d * 0.55 ) * ( 0.45 + 0.55 * trans )
             // thin edges are bright from every direction, not only up-sun
             + ambTop * edge * 0.20
             // and the built-up crowns catch the key almost unattenuated
@@ -512,7 +594,7 @@ const SkyShader = {
 
           // Internal mottling: without this the body of a big cloud is a flat
           // grey field and the whole deck reads as a cut-out.
-          amb *= 0.68 + 0.64 * alt + 0.30 * ( det - 0.45 );
+          amb *= 0.68 + 0.64 * alt + 0.30 * ( det - 0.45 ) - 0.22 * ( 1.0 - trans ) * ( 1.0 - alt );
 
           vec3 cc = amb + direct + silver;
           // Deep cloud is grey: enough scattering events and the hue washes out.
@@ -520,11 +602,14 @@ const SkyShader = {
           cc = mix( vec3( dot( cc, LUMA ) ), cc, mix( uCloudSat, 1.0, breakMask ) );
 
           // aerial perspective on the deck itself — distant low cloud dissolves
-          // into the horizon haze rather than staying crisp to the edge of frame
-          float fade = 1.0 - smoothstep( 0.010, 0.16, direction.y );
+          // into the horizon haze rather than staying crisp to the edge of frame.
+          // Kept off the first few degrees: a camera pitched down at the bowl
+          // only ever sees this band, and washing it out is what made those
+          // frames read as a blank field with no sky in them at all.
+          float fade = 1.0 - smoothstep( 0.004, 0.085, direction.y );
           vec3 hazeCol = mix( uHazeColor, uHazeTint, pow( azAlign, 2.6 ) ) *
             uHazeStrength * ( 0.55 + 0.9 * sunLumV ) + col * 0.55;
-          cc = mix( cc, hazeCol, fade * 0.66 );
+          cc = mix( cc, hazeCol, fade * 0.52 );
 
           float aL = d * uCloudOpacity;
           col = mix( col, cc, aL );
@@ -538,14 +623,17 @@ const SkyShader = {
 
       // --- horizon haze -------------------------------------------------------
       // Two terms: a wide value lift that removes the hard sky/ground line, and
-      // a tight bright band sitting right on it.
+      // a soft bright band sitting on it. The band used to run at pow 26, which
+      // is roughly a two-degree stripe — a drawn line, not air. Widened to ~9
+      // degrees and halved in strength so the horizon is a gradient the eye can
+      // travel through, and so a downward-pitched camera still gets structure.
       float below = 1.0 - abs( direction.y );
-      float wide = pow( clamp( below, 0.0, 1.0 ), 5.5 );
-      float band = pow( clamp( below, 0.0, 1.0 ), 26.0 );
+      float wide = pow( clamp( below, 0.0, 1.0 ), 7.0 );
+      float band = pow( clamp( below, 0.0, 1.0 ), 13.0 );
       float sunSide = 0.40 + 0.60 * pow( azAlign, 1.8 );
       vec3 hazeMix = mix( uHazeColor, uHazeTint, clamp( pow( azAlign, 2.2 ) * ( 0.35 + 0.65 * ( 1.0 - sunUp * 0.6 ) ), 0.0, 1.0 ) );
-      col = mix( col, hazeMix * ( 0.5 + 1.2 * sunLumV ), wide * uHazeStrength * sunSide * 0.80 );
-      col += hazeMix * band * uHazeStrength * sunSide * ( 0.4 + 0.8 * sunLumV );
+      col = mix( col, hazeMix * ( 0.5 + 1.2 * sunLumV ), wide * uHazeStrength * sunSide * 0.62 );
+      col += hazeMix * band * uHazeStrength * sunSide * ( 0.4 + 0.8 * sunLumV ) * 0.55;
 
       // --- twilight ----------------------------------------------------------
       // Preetham's earth-shadow hack drops to zero the moment the sun sets, so
@@ -564,8 +652,13 @@ const SkyShader = {
       // Rolled off over a wide arc so the dome never draws a line where the
       // real ground plane ends; the first few degrees below the horizon stay
       // haze-coloured and the bounce only takes over well down.
-      if ( direction.y < 0.10 ) {
-        float t = smoothstep( 0.10, -0.34, direction.y );
+      // The take-over starts at the horizon line rather than 6 degrees above it.
+      // The park's own far-ground ring (props.js, 44..940 m) fills everything
+      // below the horizon out past the city, so the dome must not paint ground
+      // colour up into the sky as well — doing so is what put a flat opaque
+      // band across the top of every downward-pitched frame.
+      if ( direction.y < 0.02 ) {
+        float t = smoothstep( 0.02, -0.34, direction.y );
         vec3 g = uGroundColor * uGroundGain * ( sunIrr * 0.318 * max( vSunDirection.y, 0.0 ) + col * 0.62 );
         g *= 1.0 + 0.55 * pow( max( dot( viewAz, sunAz ), 0.0 ), 3.0 );
         // blend through the haze colour, not straight to dirt
@@ -655,19 +748,28 @@ const SunHazeShader = {
       float r = length( p );
       vec2 dir = p / max( r, 1e-4 );
 
-      float core = exp( -r * r * 70.0 ) * 1.7;
-      float aureole = exp( -r * 5.0 ) * 0.34;
+      // A lens flare has shape. The old build was a tight core sitting inside a
+      // exp(-5r) veil that still carried a third of its energy at the edge of a
+      // 260 m quad — that is what washed a third of the frame to white with no
+      // structure in it. Everything here now dies inside r < 0.55.
+      float core = exp( -r * r * 190.0 ) * 2.10;
+      float halo = exp( -r * 11.0 ) * 0.16;
+      // anamorphic streak: wide in x, a few pixels tall, like a real cine lens
+      float streak = exp( -( p.x * p.x * 5.5 + p.y * p.y * 520.0 ) ) * 0.42
+                   + exp( -( p.x * p.x * 46.0 + p.y * p.y * 90.0 ) ) * 0.10;
 
       // Crepuscular rays: 1D noise sampled on the unit circle, so it is seamless
       // by construction. Two bands give thick shafts with finer ones inside.
       vec2 a = dir * 9.0 + uTime * 0.013;
       vec2 b = dir * 23.0 - uTime * 0.021;
       float rays = vnoise( a ) * 0.70 + vnoise( b ) * 0.30;
-      rays = pow( clamp( rays * 1.55 - 0.34, 0.0, 1.0 ), 1.7 );
-      rays *= smoothstep( 0.02, 0.30, r ) * exp( -r * 2.4 ) * uShafts;
+      rays = pow( clamp( rays * 1.55 - 0.40, 0.0, 1.0 ), 2.0 );
+      rays *= smoothstep( 0.03, 0.26, r ) * exp( -r * 5.5 ) * uShafts * 0.55;
 
-      float amount = ( core + aureole + rays ) * uIntensity;
-      amount *= smoothstep( 1.0, 0.48, r );
+      float amount = ( core + halo + streak + rays ) * uIntensity;
+      // hard-edged support: outside this radius the billboard contributes zero,
+      // so it can never act as a full-frame veil
+      amount *= smoothstep( 0.62, 0.24, r );
       gl_FragColor = vec4( uColor * max( amount, 0.0 ), 1.0 );
     }
   `,
@@ -700,6 +802,54 @@ const BulbShader = {
   `,
 };
 
+// Ground light pool under a practical: an additive disc with an inverse-square
+// -flavoured falloff and a little noise so it does not read as a clean circle.
+const LightPoolShader = {
+  uniforms: {
+    uColor: { value: new THREE.Color(1.0, 0.66, 0.36) },
+    uIntensity: { value: 0.0 },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vP;
+    varying vec3 vW;
+    void main() {
+      vP = position.xz;
+      vec4 mv = modelViewMatrix * instanceMatrix * vec4( position, 1.0 );
+      vW = ( modelMatrix * instanceMatrix * vec4( position, 1.0 ) ).xyz;
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: /* glsl */`
+    uniform vec3 uColor;
+    uniform float uIntensity;
+    varying vec2 vP;
+    varying vec3 vW;
+
+    float hash21( vec2 p ) {
+      p = fract( p * vec2( 233.34, 851.73 ) );
+      p += dot( p, p + 23.45 );
+      return fract( p.x * p.y );
+    }
+    float vnoise( vec2 p ) {
+      vec2 i = floor( p ), f = fract( p );
+      f = f * f * ( 3.0 - 2.0 * f );
+      return mix( mix( hash21( i ), hash21( i + vec2( 1.0, 0.0 ) ), f.x ),
+                  mix( hash21( i + vec2( 0.0, 1.0 ) ), hash21( i + vec2( 1.0, 1.0 ) ), f.x ), f.y );
+    }
+
+    void main() {
+      float r = length( vP ) * 2.0;                 // 0 at the centre, 1 at the rim
+      // inverse-square along the cone, not a linear ramp
+      float fall = 1.0 / ( 1.0 + r * r * 7.0 ) - 0.125;
+      fall = max( fall, 0.0 ) * 1.143;
+      fall *= smoothstep( 1.0, 0.62, r );
+      // break the perfect circle up with the surface it is landing on
+      fall *= 0.80 + 0.40 * vnoise( vW.xz * 1.7 );
+      gl_FragColor = vec4( uColor * fall * uIntensity, 1.0 );
+    }
+  `,
+};
+
 // ---------------------------------------------------------------------------
 // Time-of-day keyframes. Colours are authored in sRGB and converted to the
 // linear working space on load; everything between stops is lerped.
@@ -722,13 +872,13 @@ const TOD_STOPS = [
     turbidity: 4.2, rayleigh: 3.3, mie: 0.0075, mieG: 0.9, skyIntensity: 0.27, skyRolloff: 0.50, sunDisc: 20,
     cloudGain: 4.2, groundGain: 1.5,
     sun: srgb(0xff9a58), sunIntensity: 0.85,
-    hemiSky: srgb(0x66799c), hemiGround: srgb(0x4a3a2e), hemiIntensity: 0.62,
-    rim: srgb(0x8aa4cd), rimIntensity: 0.26, bounce: srgb(0x8a6a4a), bounceIntensity: 0.22,
+    hemiSky: srgb(0x66799c), hemiGround: srgb(0x4a3a2e), hemiIntensity: 0.56,
+    rim: srgb(0x8aa4cd), rimIntensity: 0.70, bounce: srgb(0x8a6a4a), bounceIntensity: 0.42, fillIntensity: 0.18,
     fog: srgb(0x59606e), fogSun: srgb(0xa8785f), fogDensity: 0.0086,
     haze: srgb(0xff9a5e), hazeColor: srgb(0x8792a6), hazeStrength: 0.26, ground: srgb(0x3a3028),
     cloudCover: 0.66, cloudHigh: 0.52, cloudLit: srgb(0xffd9b8), cloudShadow: srgb(0x646c80),
     silver: 1.8, warmUnder: 0.85, sunGlow: 0.9, cloudSat: 0.66,
-    exposure: 1.00, envIntensity: 1.10, practical: 0.55, night: 0.28, hazeGlow: 0.9,
+    exposure: 0.96, envIntensity: 1.10, practical: 0.55, night: 0.28, hazeGlow: 0.80,
     twilight: srgb(0x22345c), twilightStrength: 1.05,
   },
   { // 0.14 — morning
@@ -736,13 +886,13 @@ const TOD_STOPS = [
     turbidity: 3.2, rayleigh: 2.5, mie: 0.0052, mieG: 0.885, skyIntensity: 0.155, skyRolloff: 0.44, sunDisc: 44,
     cloudGain: 1.5, groundGain: 1.6,
     sun: srgb(0xffc78d), sunIntensity: 2.05,
-    hemiSky: srgb(0x9ab8de), hemiGround: srgb(0x5c4b3a), hemiIntensity: 0.80,
-    rim: srgb(0xa4c2e8), rimIntensity: 0.30, bounce: srgb(0x9a7a55), bounceIntensity: 0.24,
+    hemiSky: srgb(0x9ab8de), hemiGround: srgb(0x5c4b3a), hemiIntensity: 0.72,
+    rim: srgb(0xa4c2e8), rimIntensity: 0.72, bounce: srgb(0x9a7a55), bounceIntensity: 0.44, fillIntensity: 0.18,
     fog: srgb(0x9aa5b4), fogSun: srgb(0xd6b295), fogDensity: 0.0068,
     haze: srgb(0xffc191), hazeColor: srgb(0xa8b3c2), hazeStrength: 0.20, ground: srgb(0x4a4038),
     cloudCover: 0.60, cloudHigh: 0.50, cloudLit: srgb(0xfff0dc), cloudShadow: srgb(0x76808f),
     silver: 1.5, warmUnder: 0.45, sunGlow: 0.7, cloudSat: 0.50,
-    exposure: 1.00, envIntensity: 1.05, practical: 0.08, night: 0.0, hazeGlow: 0.55,
+    exposure: 0.95, envIntensity: 1.05, practical: 0.08, night: 0.0, hazeGlow: 0.48,
     twilight: srgb(0x22345c), twilightStrength: 0.0,
   },
   { // 0.33 — noon
@@ -750,13 +900,13 @@ const TOD_STOPS = [
     turbidity: 2.3, rayleigh: 1.7, mie: 0.0035, mieG: 0.86, skyIntensity: 0.135, skyRolloff: 0.40, sunDisc: 55,
     cloudGain: 1.0, groundGain: 1.6,
     sun: srgb(0xfff4e6), sunIntensity: 3.15,
-    hemiSky: srgb(0xb4d0f5), hemiGround: srgb(0x6a5b48), hemiIntensity: 0.72,
-    rim: srgb(0xbdd6f7), rimIntensity: 0.24, bounce: srgb(0xa08a68), bounceIntensity: 0.26,
+    hemiSky: srgb(0xb4d0f5), hemiGround: srgb(0x6a5b48), hemiIntensity: 0.66,
+    rim: srgb(0xbdd6f7), rimIntensity: 0.55, bounce: srgb(0xa08a68), bounceIntensity: 0.46, fillIntensity: 0.14,
     fog: srgb(0xa8b6c6), fogSun: srgb(0xc4ccd4), fogDensity: 0.0042,
     haze: srgb(0xd8dbe0), hazeColor: srgb(0xb4c0cd), hazeStrength: 0.14, ground: srgb(0x565049),
     cloudCover: 0.50, cloudHigh: 0.40, cloudLit: srgb(0xffffff), cloudShadow: srgb(0x8a94a2),
     silver: 1.2, warmUnder: 0.22, sunGlow: 0.45, cloudSat: 0.42,
-    exposure: 0.98, envIntensity: 1.05, practical: 0.0, night: 0.0, hazeGlow: 0.35,
+    exposure: 0.93, envIntensity: 1.05, practical: 0.0, night: 0.0, hazeGlow: 0.30,
     twilight: srgb(0x2a3a60), twilightStrength: 0.0,
   },
   { // 0.52 — afternoon
@@ -764,13 +914,13 @@ const TOD_STOPS = [
     turbidity: 2.7, rayleigh: 2.0, mie: 0.0042, mieG: 0.87, skyIntensity: 0.145, skyRolloff: 0.41, sunDisc: 52,
     cloudGain: 1.08, groundGain: 1.6,
     sun: srgb(0xffe9c9), sunIntensity: 2.90,
-    hemiSky: srgb(0xaac9ee), hemiGround: srgb(0x6d5a44), hemiIntensity: 0.78,
-    rim: srgb(0xaccbf2), rimIntensity: 0.28, bounce: srgb(0xa89070), bounceIntensity: 0.28,
+    hemiSky: srgb(0xaac9ee), hemiGround: srgb(0x6d5a44), hemiIntensity: 0.70,
+    rim: srgb(0xaccbf2), rimIntensity: 0.68, bounce: srgb(0xa89070), bounceIntensity: 0.50, fillIntensity: 0.16,
     fog: srgb(0xa4b0bc), fogSun: srgb(0xcbc0b2), fogDensity: 0.0046,
     haze: srgb(0xe8ceb0), hazeColor: srgb(0xaab6c4), hazeStrength: 0.17, ground: srgb(0x554d43),
     cloudCover: 0.56, cloudHigh: 0.44, cloudLit: srgb(0xfff6e8), cloudShadow: srgb(0x7f8896),
     silver: 1.4, warmUnder: 0.32, sunGlow: 0.6, cloudSat: 0.46,
-    exposure: 1.00, envIntensity: 1.05, practical: 0.0, night: 0.0, hazeGlow: 0.5,
+    exposure: 0.94, envIntensity: 1.05, practical: 0.0, night: 0.0, hazeGlow: 0.45,
     twilight: srgb(0x2a3a60), twilightStrength: 0.0,
   },
   { // 0.68 — THE REFERENCE FRAME: broken-overcast dusk, sun low behind the deck
@@ -778,13 +928,13 @@ const TOD_STOPS = [
     turbidity: 3.4, rayleigh: 2.5, mie: 0.0050, mieG: 0.895, skyIntensity: 0.162, skyRolloff: 0.40, sunDisc: 34,
     cloudGain: 1.45, groundGain: 1.7,
     sun: srgb(0xffd9ac), sunIntensity: 2.30,
-    hemiSky: srgb(0x9fbadd), hemiGround: srgb(0x726557), hemiIntensity: 1.05,
-    rim: srgb(0x93b3e2), rimIntensity: 0.34, bounce: srgb(0xb59372), bounceIntensity: 0.40,
+    hemiSky: srgb(0x9fbadd), hemiGround: srgb(0x726557), hemiIntensity: 0.92,
+    rim: srgb(0x9dbcea), rimIntensity: 0.88, bounce: srgb(0xb59372), bounceIntensity: 0.58, fillIntensity: 0.22,
     fog: srgb(0x99a3b1), fogSun: srgb(0xceb098), fogDensity: 0.0044,
     haze: srgb(0xffcda4), hazeColor: srgb(0x9fabbb), hazeStrength: 0.22, ground: srgb(0x4e4237),
     cloudCover: 0.74, cloudHigh: 0.58, cloudLit: srgb(0xffeada), cloudShadow: srgb(0x717c90),
     silver: 1.9, warmUnder: 0.55, sunGlow: 1.0, cloudSat: 0.44,
-    exposure: 1.06, envIntensity: 1.12, practical: 0.0, night: 0.0, hazeGlow: 1.0,
+    exposure: 0.94, envIntensity: 1.12, practical: 0.0, night: 0.0, hazeGlow: 0.85,
     twilight: srgb(0x243a66), twilightStrength: 0.0,
   },
   { // 0.84 — low sun raking under the deck
@@ -792,13 +942,13 @@ const TOD_STOPS = [
     turbidity: 4.2, rayleigh: 3.2, mie: 0.0066, mieG: 0.905, skyIntensity: 0.168, skyRolloff: 0.44, sunDisc: 26,
     cloudGain: 2.4, groundGain: 1.7,
     sun: srgb(0xffa970), sunIntensity: 1.65,
-    hemiSky: srgb(0x8296c6), hemiGround: srgb(0x7a5f45), hemiIntensity: 0.82,
-    rim: srgb(0x8497cf), rimIntensity: 0.34, bounce: srgb(0xc08a56), bounceIntensity: 0.36,
+    hemiSky: srgb(0x6f83bb), hemiGround: srgb(0x7a5f45), hemiIntensity: 0.74,
+    rim: srgb(0x8aa0da), rimIntensity: 0.86, bounce: srgb(0xc08a56), bounceIntensity: 0.55, fillIntensity: 0.22,
     fog: srgb(0x7e8496), fogSun: srgb(0xc08a68), fogDensity: 0.0064,
     haze: srgb(0xffa76c), hazeColor: srgb(0x8b93a6), hazeStrength: 0.28, ground: srgb(0x453a31),
     cloudCover: 0.72, cloudHigh: 0.54, cloudLit: srgb(0xffdcc0), cloudShadow: srgb(0x666e82),
     silver: 2.2, warmUnder: 0.95, sunGlow: 1.25, cloudSat: 0.64,
-    exposure: 1.02, envIntensity: 1.10, practical: 0.22, night: 0.0, hazeGlow: 1.35,
+    exposure: 0.96, envIntensity: 1.10, practical: 0.55, night: 0.0, hazeGlow: 1.15,
     twilight: srgb(0x243a66), twilightStrength: 0.06,
   },
   { // 0.93 — dusk
@@ -806,13 +956,13 @@ const TOD_STOPS = [
     turbidity: 5.0, rayleigh: 3.6, mie: 0.008, mieG: 0.91, skyIntensity: 0.175, skyRolloff: 0.48, sunDisc: 12,
     cloudGain: 5.6, groundGain: 1.6,
     sun: srgb(0xff7a4e), sunIntensity: 0.48,
-    hemiSky: srgb(0x63739f), hemiGround: srgb(0x5c4030), hemiIntensity: 0.64,
-    rim: srgb(0x7183b8), rimIntensity: 0.30, bounce: srgb(0x9a6038), bounceIntensity: 0.28,
-    fog: srgb(0x454c60), fogSun: srgb(0x8a5a4c), fogDensity: 0.0098,
+    hemiSky: srgb(0x3d4a6e), hemiGround: srgb(0x5c4030), hemiIntensity: 0.72,
+    rim: srgb(0x6d84c4), rimIntensity: 0.72, bounce: srgb(0x9a6038), bounceIntensity: 0.44, fillIntensity: 0.20,
+    fog: srgb(0x38415c), fogSun: srgb(0x7a5a5e), fogDensity: 0.0098,
     haze: srgb(0xff7346), hazeColor: srgb(0x5e6780), hazeStrength: 0.26, ground: srgb(0x332c27),
     cloudCover: 0.72, cloudHigh: 0.54, cloudLit: srgb(0xffcbb0), cloudShadow: srgb(0x505874),
     silver: 2.0, warmUnder: 0.9, sunGlow: 1.1, cloudSat: 0.70,
-    exposure: 1.06, envIntensity: 1.12, practical: 0.85, night: 0.35, hazeGlow: 1.1,
+    exposure: 1.00, envIntensity: 1.12, practical: 1.0, night: 0.35, hazeGlow: 0.95,
     twilight: srgb(0x27406e), twilightStrength: 0.95,
   },
   { // 1.00 — blue hour
@@ -820,13 +970,13 @@ const TOD_STOPS = [
     turbidity: 4.2, rayleigh: 3.0, mie: 0.007, mieG: 0.9, skyIntensity: 0.19, skyRolloff: 0.54, sunDisc: 4,
     cloudGain: 4.5, groundGain: 1.5,
     sun: srgb(0x6f83b4), sunIntensity: 0.10,
-    hemiSky: srgb(0x46557f), hemiGround: srgb(0x3b2c22), hemiIntensity: 0.34,
-    rim: srgb(0x506394), rimIntensity: 0.22, bounce: srgb(0x6a4630), bounceIntensity: 0.14,
+    hemiSky: srgb(0x3a4a76), hemiGround: srgb(0x3b2c22), hemiIntensity: 0.38,
+    rim: srgb(0x5a70a8), rimIntensity: 0.50, bounce: srgb(0x6a4630), bounceIntensity: 0.24, fillIntensity: 0.16,
     fog: srgb(0x232c46), fogSun: srgb(0x3d3a56), fogDensity: 0.0118,
     haze: srgb(0x8a6a86), hazeColor: srgb(0x3c4664), hazeStrength: 0.17, ground: srgb(0x22201f),
     cloudCover: 0.66, cloudHigh: 0.50, cloudLit: srgb(0x9aa4c8), cloudShadow: srgb(0x363d52),
     silver: 1.4, warmUnder: 0.5, sunGlow: 0.5, cloudSat: 0.60,
-    exposure: 1.12, envIntensity: 1.18, practical: 1.0, night: 1.0, hazeGlow: 0.5,
+    exposure: 1.06, envIntensity: 1.18, practical: 1.0, night: 1.0, hazeGlow: 0.45,
     twilight: srgb(0x1d3260), twilightStrength: 1.05,
   },
 ];
@@ -836,7 +986,7 @@ const DEFAULT_TOD = 0.68;   // the reference frame
 const _numericKeys = [
   'elev', 'azim', 'turbidity', 'rayleigh', 'mie', 'mieG', 'skyIntensity',
   'skyRolloff', 'sunDisc', 'cloudGain', 'groundGain',
-  'sunIntensity', 'hemiIntensity', 'rimIntensity', 'bounceIntensity',
+  'sunIntensity', 'hemiIntensity', 'rimIntensity', 'bounceIntensity', 'fillIntensity',
   'fogDensity', 'hazeStrength', 'cloudCover', 'cloudHigh',
   'silver', 'warmUnder', 'sunGlow', 'cloudSat',
   'exposure', 'envIntensity', 'practical', 'night', 'hazeGlow', 'twilightStrength',
@@ -879,12 +1029,41 @@ const _box = new THREE.Box3();
 const _center = new THREE.Vector3();
 const _snapped = new THREE.Vector3();
 const _fogTarget = new THREE.Color();
+const _camRight = new THREE.Vector3();
+const _camUp = new THREE.Vector3();
+const _camFwd = new THREE.Vector3();
+const _corner = new THREE.Vector3();
+// 6 padded rider points + 8 view-frustum corners, preallocated: the shadow fit
+// runs every frame and must not allocate.
+const _fitPts = [];
+for (let i = 0; i < 14; i++) _fitPts.push(new THREE.Vector3());
 const WORLD_UP = new THREE.Vector3(0, 1, 0);
 const FALLBACK_UP = new THREE.Vector3(0, 0, 1);
 
-const SHADOW_HALF_EXTENT = 28;   // metres — 56 m across, ~13.7 mm/texel at 4096
-const SHADOW_DISTANCE = 72;
+// ---------------------------------------------------------------------------
+// Shadow frustum.
+//
+// A fixed 56 m box centred on the rider left every ramp, rail and bank further
+// out completely unshadowed — a wide shot of the lot collapsed to flat ambient
+// with nothing on the ground. The frustum is now *fitted to what the camera can
+// actually see*: the view frustum is clipped at SHADOW_RANGE, its corners are
+// projected into light space and the ortho box is sized to contain them. A
+// close chase camera therefore gets a ~20 m box (≈5 mm/texel at 4096 — well
+// past the 2 cm/texel the rider needs), and a park-wide establishing shot gets
+// the whole lot, at the resolution that shot can show.
+//
+// The extent is quantised and the centre snapped to whole texels so neither
+// panning nor dollying makes the map crawl.
+// ---------------------------------------------------------------------------
+const SHADOW_MIN_HALF = 15;      // m — never tighter than this
+const SHADOW_MAX_HALF = 96;      // m — the whole lot plus its fence line
+const SHADOW_EXTENT_STEP = 4;    // m — quantised so the box cannot breathe
+const SHADOW_RANGE = 115;        // m of view depth the map must cover
+const SHADOW_PULLBACK = 130;     // m of room behind the box for off-screen casters
+const SHADOW_PLAYER_PAD = 5;     // m — the rider is covered even when off-frame
+
 const MAX_PRACTICALS = 8;
+const PRACTICAL_SHADOWS = 2;     // the nearest N lamps cast; the rest just light
 
 export function createEnvironment(ctx) {
   const { scene, renderer, engine } = ctx;
@@ -960,14 +1139,15 @@ export function createEnvironment(ctx) {
   sun.shadow.normalBias = 0.026;
   sun.shadow.radius = 2.2;
   sun.shadow.blurSamples = 12;
+  let shadowHalf = 28;                       // live, re-fitted every frame
   {
     const c = sun.shadow.camera;
-    c.left = -SHADOW_HALF_EXTENT;
-    c.right = SHADOW_HALF_EXTENT;
-    c.top = SHADOW_HALF_EXTENT;
-    c.bottom = -SHADOW_HALF_EXTENT;
+    c.left = -shadowHalf;
+    c.right = shadowHalf;
+    c.top = shadowHalf;
+    c.bottom = -shadowHalf;
     c.near = 0.6;
-    c.far = SHADOW_DISTANCE * 2.1;
+    c.far = SHADOW_PULLBACK + SHADOW_RANGE * 2;
     c.updateProjectionMatrix();
   }
   scene.add(sun);
@@ -981,17 +1161,28 @@ export function createEnvironment(ctx) {
   hemi.name = 'SkyBounce';
   scene.add(hemi);
 
-  // Cool rim from the anti-sun side — separates the rider from warm concrete.
-  const rimLight = new THREE.DirectionalLight(0x93b3e2, 0.34);
+  // Cool rim from the anti-sun side. Re-aimed every frame from the camera
+  // azimuth so it always comes from *behind the subject as the camera sees it*
+  // and always draws an edge down the rider — a rim parked on a world direction
+  // vanishes the moment the player turns around, which is exactly what left the
+  // rider as one black mass with a single surviving red line.
+  const rimLight = new THREE.DirectionalLight(0x9dbcea, 0.88);
   rimLight.name = 'SkyRim';
   scene.add(rimLight, rimLight.target);
 
-  // Warm ground bounce, aimed upward, keeps undersides off black. The lot is a
-  // huge mid-grey concrete reflector; without this term nothing under a ramp lip
-  // or a rider's arm reads at all.
-  const bounceLight = new THREE.DirectionalLight(0xb59372, 0.34);
+  // Warm ground bounce, aimed straight up, keeps undersides off black. The lot
+  // is a huge mid-grey concrete reflector; without this term nothing under a
+  // ramp lip or a rider's arm reads at all.
+  const bounceLight = new THREE.DirectionalLight(0xb59372, 0.58);
   bounceLight.name = 'GroundBounce';
   scene.add(bounceLight, bounceLight.target);
+
+  // Camera-boom fill: a soft on-axis light riding the chase camera. It is what
+  // stops the shadow side of the rider clipping to black when he is between the
+  // camera and the sun, without touching the key/rim ratio of the park itself.
+  const fillLight = new THREE.DirectionalLight(0x9fbadd, 0.22);
+  fillLight.name = 'CameraFill';
+  scene.add(fillLight, fillLight.target);
 
   // --- fog -----------------------------------------------------------------
   const fog = new THREE.FogExp2(0x9aa4b2, 0.0050);
@@ -1011,7 +1202,10 @@ export function createEnvironment(ctx) {
   });
   const sunHaze = new THREE.Mesh(hazeGeometry, hazeMaterial);
   sunHaze.name = 'SunHaze';
-  sunHaze.scale.setScalar(260);
+  // 160 m across at 360 m out — a ~25 degree flare, not the 40 degree sheet it
+  // used to be. Depth-tested against the scene, so ground and ramps in front of
+  // it punch it out instead of being veiled by it.
+  sunHaze.scale.setScalar(160);
   sunHaze.renderOrder = 6;
   scene.add(sunHaze);
 
@@ -1032,15 +1226,54 @@ export function createEnvironment(ctx) {
   bulbs.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   scene.add(bulbs);
 
+  // A ground light-pool per lamp: an additive disc laid on the surface under the
+  // head. The spot does the real work, but the pool guarantees the lamp reads as
+  // a light source and not a decal even on a normal-mapped, GTAO'd floor.
+  const poolGeometry = new THREE.PlaneGeometry(1, 1);
+  poolGeometry.rotateX(-Math.PI * 0.5);
+  const poolMaterial = new THREE.ShaderMaterial({
+    uniforms: THREE.UniformsUtils.clone(LightPoolShader.uniforms),
+    vertexShader: LightPoolShader.vertexShader,
+    fragmentShader: LightPoolShader.fragmentShader,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    depthTest: true,
+    fog: false,
+  });
+  const pools = new THREE.InstancedMesh(poolGeometry, poolMaterial, MAX_PRACTICALS);
+  pools.name = 'PracticalPools';
+  pools.count = 0;
+  pools.visible = false;
+  pools.frustumCulled = false;
+  pools.renderOrder = 4;
+  pools.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  scene.add(pools);
+
   for (let i = 0; i < MAX_PRACTICALS; i++) {
-    const l = new THREE.PointLight(0xffab63, 0, 34, 2);
+    // A street lamp is a downward cone, not an omni bulb: the cone is what puts
+    // a readable pool on the concrete and a warm patch on the fence beside it.
+    const l = new THREE.SpotLight(0xffab63, 0, 30, 1.02, 0.62, 2);
     l.name = `Practical${i}`;
     l.visible = false;
-    l.castShadow = false;
-    scene.add(l);
+    // Only the first two ever cast — and they are re-pointed at whichever lamps
+    // the player is nearest, so the shadow-map count never changes and nothing
+    // recompiles mid-run.
+    l.castShadow = i < PRACTICAL_SHADOWS;
+    if (l.castShadow) {
+      l.shadow.mapSize.set(512, 512);
+      l.shadow.bias = -0.0016;
+      l.shadow.normalBias = 0.03;
+      l.shadow.radius = 2;
+      l.shadow.camera.near = 0.6;
+      l.shadow.camera.far = 34;
+    }
+    scene.add(l, l.target);
     practicals.push({ light: l, phase: rand(0, Math.PI * 2), rate: rand(1.7, 3.4), amp: rand(0.03, 0.09) });
   }
   let practicalsPlaced = false;
+  const practicalSpots = [];       // { pos: Vector3, groundY: number }
+  let practicalSortTimer = 0;
 
   /** Find the park's own lamp posts; otherwise ring the play area. */
   function placePracticals() {
@@ -1076,20 +1309,58 @@ export function createEnvironment(ctx) {
       }
     }
 
+    // Find the surface each lamp actually stands on so its pool lands on the
+    // ground rather than floating at an assumed grade.
+    const collision = ctx.world?.collision;
+    const n = Math.min(spots.length, MAX_PRACTICALS);
+    practicalSpots.length = 0;
+    for (let i = 0; i < n; i++) {
+      const pos = spots[i];
+      let groundY = pos.y - 6.0;
+      if (collision?.raycastDown) {
+        const hit = collision.raycastDown(_v1.copy(pos), 24);
+        if (hit?.point) groundY = hit.point.y;
+      }
+      practicalSpots.push({ pos, groundY });
+    }
+
     const m = new THREE.Matrix4();
+    for (let i = 0; i < n; i++) {
+      m.makeTranslation(spots[i].x, spots[i].y, spots[i].z);
+      bulbs.setMatrixAt(i, m);
+      const s = (practicalSpots[i].pos.y - practicalSpots[i].groundY) * 2.1 + 3.0;
+      m.makeScale(s, 1, s);
+      m.setPosition(spots[i].x, practicalSpots[i].groundY + 0.035, spots[i].z);
+      pools.setMatrixAt(i, m);
+    }
+    for (let i = n; i < practicals.length; i++) practicals[i].light.visible = false;
+    bulbs.count = n;
+    bulbs.instanceMatrix.needsUpdate = true;
+    pools.count = n;
+    pools.instanceMatrix.needsUpdate = true;
+    assignPracticals(_v2.set(0, 0, 0));
+    return true;
+  }
+
+  /**
+   * Point each light at a lamp head, nearest-first, so the two shadow-casting
+   * lights are always the two the player is standing under. The shadow-map
+   * count is constant, so this never triggers a shader recompile.
+   */
+  function assignPracticals(target) {
+    const n = practicalSpots.length;
+    if (n === 0) return;
+    for (const s of practicalSpots) s.d = s.pos.distanceToSquared(target);
+    practicalSpots.sort((a, b) => a.d - b.d);
     for (let i = 0; i < practicals.length; i++) {
       const p = practicals[i];
-      if (i < spots.length) {
-        p.light.position.copy(spots[i]);
-        m.makeTranslation(spots[i].x, spots[i].y, spots[i].z);
-        bulbs.setMatrixAt(i, m);
-      } else {
-        p.light.visible = false;
-      }
+      if (i >= n) { p.light.visible = false; p.spot = null; continue; }
+      const s = practicalSpots[i];
+      p.spot = s;
+      p.light.position.copy(s.pos);
+      p.light.target.position.set(s.pos.x, s.groundY, s.pos.z);
+      p.light.target.updateMatrixWorld();
     }
-    bulbs.count = Math.min(spots.length, MAX_PRACTICALS);
-    bulbs.instanceMatrix.needsUpdate = true;
-    return true;
   }
 
   // --- time of day ---------------------------------------------------------
@@ -1097,6 +1368,7 @@ export function createEnvironment(ctx) {
   const sunDir = new THREE.Vector3();
   let timeOfDay = DEFAULT_TOD;
   let cloudTime = 0;
+  let exposure = 1;          // live, damped toward the preset's target
   // Cloud-plane units per second. The two decks share a wind direction but the
   // low one is closer, so it sweeps across the frame noticeably faster — that
   // differential is the whole parallax cue.
@@ -1154,11 +1426,15 @@ export function createEnvironment(ctx) {
     rimLight.intensity = preset.rimIntensity;
     bounceLight.color.copy(preset.bounce);
     bounceLight.intensity = preset.bounceIntensity;
+    // The boom fill is skylight, so it carries the hemisphere's sky colour.
+    fillLight.color.copy(preset.hemiSky);
+    fillLight.intensity = preset.fillIntensity;
 
     // fog + exposure
     fog.color.copy(preset.fog);
     fog.density = preset.fogDensity;
-    renderer.toneMappingExposure = preset.exposure;
+    exposure = preset.exposure;
+    renderer.toneMappingExposure = exposure;
     scene.environmentIntensity = preset.envIntensity;
 
     // sun haze
@@ -1167,7 +1443,21 @@ export function createEnvironment(ctx) {
 
     // practicals
     bulbMaterial.uniforms.uColor.value.setRGB(1.0, 0.66, 0.36);
-    bulbMaterial.uniforms.uIntensity.value = preset.practical * 3.4;
+    const night = nightAmount();
+    bulbMaterial.uniforms.uIntensity.value = preset.practical * night * 3.4;
+    poolMaterial.uniforms.uColor.value.setRGB(1.0, 0.62, 0.32);
+    poolMaterial.uniforms.uIntensity.value = preset.practical * night * 0.42;
+  }
+
+  /**
+   * 0 = full daylight, 1 = the sun is down, on a smoothstep over sun altitude.
+   * Everything that lights up at night reads off this — practicals here, and
+   * the backdrop's window emissive through the `nightFactor` getter — so the
+   * park and the city can never disagree about what hour it is.
+   */
+  function nightAmount() {
+    const t = clamp((12 - preset.elev) / 12, 0, 1);
+    return t * t * (3 - 2 * t);
   }
 
   function setTimeOfDay(t) {
@@ -1178,47 +1468,173 @@ export function createEnvironment(ctx) {
   }
 
   /**
-   * Re-centre the tight shadow ortho on `target`, snapping the centre to whole
-   * shadow-map texels along the light basis so the map does not crawl.
+   * Fit the sun's ortho shadow frustum to what the camera can see.
+   *
+   * The view frustum is clipped at SHADOW_RANGE, its eight corners (plus the
+   * rider, padded) are projected into the light basis, and the box is sized to
+   * contain them. Extent is quantised to SHADOW_EXTENT_STEP and the centre
+   * snapped to whole texels, so panning and dollying cannot make the map crawl.
+   * The near plane is pulled SHADOW_PULLBACK back along the light so geometry
+   * behind the camera still casts into frame.
    */
-  function recenterShadows(target) {
-    if (!target) return;
+  function fitShadows(target, cam) {
     _fwd.copy(sunDir).negate();                       // light -> scene
     _right.crossVectors(WORLD_UP, _fwd);
     if (_right.lengthSq() < 1e-6) _right.crossVectors(FALLBACK_UP, _fwd);
     _right.normalize();
     _upAxis.crossVectors(_fwd, _right).normalize();
 
-    const texel = (SHADOW_HALF_EXTENT * 2) / sun.shadow.mapSize.x;
-    const px = Math.round(target.dot(_right) / texel) * texel;
-    const py = Math.round(target.dot(_upAxis) / texel) * texel;
-    const pz = target.dot(_fwd);
+    let np = 0;
+    if (target) {
+      // pad the rider so his own contact shadow survives a hard whip-pan
+      for (let i = 0; i < 6; i++) {
+        const v = _fitPts[np++].copy(target);
+        v.setComponent(i >> 1, target.getComponent(i >> 1) + ((i & 1) ? SHADOW_PLAYER_PAD : -SHADOW_PLAYER_PAD));
+      }
+    }
+
+    if (cam?.isPerspectiveCamera) {
+      cam.matrixWorld.extractBasis(_camRight, _camUp, _camFwd);
+      _camFwd.negate();                               // camera looks down -Z
+      const tanY = Math.tan(cam.fov * deg * 0.5);
+      const near = Math.max(cam.near, 0.1);
+      const far = Math.min(SHADOW_RANGE, cam.far);
+      for (let s = 0; s < 2; s++) {
+        const d = s === 0 ? near : far;
+        const h = tanY * d;
+        const w = h * cam.aspect;
+        for (let c = 0; c < 4; c++) {
+          _fitPts[np++].copy(cam.position)
+            .addScaledVector(_camFwd, d)
+            .addScaledVector(_camRight, (c & 1) ? w : -w)
+            .addScaledVector(_camUp, (c & 2) ? h : -h);
+        }
+      }
+    }
+    if (np === 0) return;
+
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
+    for (let i = 0; i < np; i++) {
+      const p = _fitPts[i];
+      const x = p.dot(_right), y = p.dot(_upAxis), z = p.dot(_fwd);
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
+    }
+
+    // Quantised extent: the box may only take a handful of discrete sizes, so a
+    // dolly does not resample the whole map every frame.
+    let half = Math.max((maxX - minX) * 0.5, (maxY - minY) * 0.5);
+    half = clamp(Math.ceil(half / SHADOW_EXTENT_STEP) * SHADOW_EXTENT_STEP, SHADOW_MIN_HALF, SHADOW_MAX_HALF);
+
+    const camShadow = sun.shadow.camera;
+    const zNear = minZ - SHADOW_PULLBACK;
+    const zFar = maxZ + 8;
+    if (half !== shadowHalf || Math.abs(camShadow.far - (zFar - zNear)) > 4) {
+      shadowHalf = half;
+      camShadow.left = -half;
+      camShadow.right = half;
+      camShadow.top = half;
+      camShadow.bottom = -half;
+      camShadow.near = 0.5;
+      camShadow.far = Math.max(zFar - zNear, 40);
+      camShadow.updateProjectionMatrix();
+      // Acne scales with texel footprint, so the normal offset has to scale with
+      // the box: 2 cm under the rider, 9 cm out at the fence line.
+      sun.shadow.normalBias = clamp(((half * 2) / sun.shadow.mapSize.x) * 1.9, 0.018, 0.11);
+    }
+
+    const texel = (half * 2) / sun.shadow.mapSize.x;
+    const px = Math.round(((minX + maxX) * 0.5) / texel) * texel;
+    const py = Math.round(((minY + maxY) * 0.5) / texel) * texel;
 
     _snapped.set(0, 0, 0)
       .addScaledVector(_right, px)
       .addScaledVector(_upAxis, py)
-      .addScaledVector(_fwd, pz);
+      .addScaledVector(_fwd, zNear);
 
-    sun.target.position.copy(_snapped);
+    sun.position.copy(_snapped);
+    sun.target.position.copy(_snapped).addScaledVector(_fwd, 10);
     sun.target.updateMatrixWorld();
-    sun.position.copy(_snapped).addScaledVector(sunDir, SHADOW_DISTANCE);
     sun.updateMatrixWorld();
+  }
 
-    // Keep the fills anchored to the player too so their direction stays stable.
-    rimLight.target.position.copy(_snapped);
+  /**
+   * Aim the designed rig — rim, bounce and boom fill — at `target`.
+   *
+   * The rim is placed *behind the subject as the camera sees it* and pushed to
+   * the anti-sun side, so it draws an edge on the rider from every angle rather
+   * than only when he happens to face one world direction.
+   */
+  function aimRig(target, cam) {
+    // rim: behind the subject along the view axis, up high, anti-sun biased
+    _v1.set(0, 0, 0);
+    if (cam) { cam.getWorldDirection(_v1); _v1.y = 0; }
+    if (_v1.lengthSq() < 1e-6) _v1.copy(sunDir).setY(0).negate();
+    _v1.normalize();
+
+    rimLight.target.position.copy(target);
     rimLight.target.updateMatrixWorld();
-    rimLight.position.copy(_snapped)
-      .addScaledVector(_right, -60)
-      .addScaledVector(WORLD_UP, 34)
-      .addScaledVector(sunDir, -26);
+    // Deliberately low: a grazing rim draws the edge on the rider without
+    // dumping a second key onto the (already bright) up-facing plaza.
+    rimLight.position.copy(target)
+      .addScaledVector(_v1, 50)                        // downrange of the subject
+      .addScaledVector(sunDir, -24)                    // pushed off the key
+      .addScaledVector(WORLD_UP, 13);
     rimLight.updateMatrixWorld();
 
-    bounceLight.target.position.copy(_snapped).addScaledVector(WORLD_UP, 8);
+    // bounce: straight up off the lot, with a slight lean away from the sun
+    bounceLight.target.position.copy(target).addScaledVector(WORLD_UP, 10);
     bounceLight.target.updateMatrixWorld();
-    bounceLight.position.copy(_snapped)
-      .addScaledVector(sunDir, -34)
-      .addScaledVector(WORLD_UP, -12);
+    bounceLight.position.copy(target)
+      .addScaledVector(WORLD_UP, -26)
+      .addScaledVector(sunDir, -8);
     bounceLight.updateMatrixWorld();
+
+    // boom fill: on the camera axis, a touch above it
+    fillLight.target.position.copy(target);
+    fillLight.target.updateMatrixWorld();
+    if (cam) {
+      fillLight.position.copy(cam.position).addScaledVector(WORLD_UP, 2.2);
+    } else {
+      fillLight.position.copy(target).addScaledVector(WORLD_UP, 12);
+    }
+    fillLight.updateMatrixWorld();
+  }
+
+  /** Public entry point: re-fit the shadow frustum and re-aim the rig. */
+  function recenterShadows(target, cam = ctx.camera) {
+    if (!target) return;
+    fitShadows(target, cam);
+    aimRig(target, cam);
+  }
+
+  // --- post chain trim ------------------------------------------------------
+  // Bloom is a lens property, not a look knob. At strength 0.42 over a 0.92
+  // threshold it was blooming everything brighter than mid-grey — the plaza
+  // itself — and washing whole thirds of the frame to a featureless white veil.
+  // Raised past the tonemapper's white point so only genuinely over-range
+  // highlights (the sun disc, sparks, coping speculars, lit windows) flare.
+  //
+  // The shadow lift is raised at the same time: the character must never land
+  // in the 0.02 range where jersey, jeans and shoes fuse into one black mass.
+  // Cool-tinted, so the lift also buys the grade its cool-shadow/warm-key read.
+  // Both are set once, at init, so the settings screen still owns the player's
+  // own bloom/grain multipliers on top.
+  {
+    const bloom = engine.passes?.bloomPass;
+    if (bloom) {
+      bloom.strength = 0.22;
+      bloom.threshold = 1.15;
+      bloom.radius = 0.55;
+    }
+    const grade = engine.passes?.gradePass?.uniforms;
+    if (grade?.uLift?.value?.set) grade.uLift.value.set(0.026, 0.024, 0.038);
   }
 
   setTimeOfDay(DEFAULT_TOD);
@@ -1241,11 +1657,11 @@ export function createEnvironment(ctx) {
     dHigh.x = (dHigh.x + wind.x * 0.43 * step) % 4096;
     dHigh.y = (dHigh.y + wind.y * 0.43 * step) % 4096;
 
-    // follow the player with the shadow frustum
+    // Fit the shadow frustum to the view, keeping the rider inside it.
     const pos = c.player?.physics?.state?.position;
-    recenterShadows(pos || _v2.set(0, 0, 0));
-
     const cam = c.camera;
+    recenterShadows(pos || _v2.set(0, 0, 0), cam);
+
     if (cam) {
       // --- steer the aerial-perspective haze ------------------------------
       // A single fog colour cannot be both the cool grey of the anti-sun
@@ -1257,7 +1673,10 @@ export function createEnvironment(ctx) {
       const sa = Math.hypot(sunDir.x, sunDir.z) || 1;
       const align = clamp(((_v1.x * sunDir.x + _v1.z * sunDir.z) / (fa * sa)) * 0.5 + 0.5, 0, 1);
       const lowSun = clamp(1 - Math.abs(preset.elev) / 46, 0, 1);
-      const wantBlend = Math.pow(align, 2.4) * (0.30 + 0.70 * lowSun);
+      // A steeper exponent and a lower ceiling: the warm end used to bleed most
+      // of the way round the anti-sun hemisphere, which is what put every dusk
+      // surface on one hue with no cool complement anywhere in frame.
+      const wantBlend = Math.pow(align, 3.2) * (0.26 + 0.60 * lowSun);
       fogBlend += (wantBlend - fogBlend) * (1 - Math.exp(-2.6 * step));
       _fogTarget.copy(preset.fog).lerp(preset.fogSun, fogBlend);
       fog.color.copy(_fogTarget);
@@ -1267,24 +1686,47 @@ export function createEnvironment(ctx) {
       sunHaze.quaternion.copy(cam.quaternion);
       const facing = clamp(_v1.dot(sunDir), 0, 1);
       const above = clamp((preset.elev + 4) / 8, 0, 1);
-      const amount = preset.hazeGlow * (0.14 + 0.86 * Math.pow(facing, 2.0)) *
+      const amount = preset.hazeGlow * (0.06 + 0.94 * Math.pow(facing, 2.6)) *
         (0.30 + 0.70 * lowSun) * above;
       hazeMaterial.uniforms.uIntensity.value = amount;
       hazeMaterial.uniforms.uTime.value = cloudTime;
       sunHaze.visible = amount > 0.002;
+
+      // --- exposure compensation -------------------------------------------
+      // Facing into a low sun the lot's mid-grey was landing near 0.75 and the
+      // frame read as a blown exposure. Pull the stop down as the camera turns
+      // into the key, damped so it never pumps on a whip-pan.
+      const wantExp = preset.exposure * (1 - 0.20 * Math.pow(facing, 1.5) * lowSun);
+      exposure += (wantExp - exposure) * (1 - Math.exp(-1.6 * step));
+      renderer.toneMappingExposure = exposure;
     }
 
     // practicals: place once the park exists, then flicker gently
     if (!practicalsPlaced) practicalsPlaced = placePracticals();
-    const pf = preset.practical;
+    // Gated on sun altitude, not on the time-of-day scalar: a lamp that spills
+    // warm light onto a sunlit lot is the same continuity break as a fully lit
+    // office tower over a daylight plaza.
+    const pf = preset.practical * nightAmount();
     const lit = pf > 0.02;
     bulbs.visible = lit && bulbs.count > 0;
+    pools.visible = lit && pools.count > 0;
+    // Re-sort which lamps the two shadow-casting lights sit on, but only a few
+    // times a second and only while they are actually on.
+    if (lit && practicalsPlaced) {
+      practicalSortTimer -= step;
+      if (practicalSortTimer <= 0) {
+        practicalSortTimer = 0.75;
+        assignPracticals(pos || _v2.set(0, 0, 0));
+      }
+    }
     for (let i = 0; i < practicals.length; i++) {
       const p = practicals[i];
-      if (!lit || i >= bulbs.count) { p.light.visible = false; continue; }
+      if (!lit || !p.spot) { p.light.visible = false; continue; }
       p.light.visible = true;
       const flick = 1 + Math.sin(cloudTime * p.rate + p.phase) * p.amp;
-      p.light.intensity = 42 * pf * flick;
+      // candela: a 6 m lamp head lands ~1.2 lux under itself at full dusk, which
+      // is a pool you can read against the ambient rather than a glowing decal.
+      p.light.intensity = 52 * pf * flick;
     }
 
     // deferred IBL refresh — never more than once every quarter second
@@ -1293,8 +1735,10 @@ export function createEnvironment(ctx) {
   }
 
   function dispose() {
-    scene.remove(sky, sunHaze, bulbs, hemi, sun, sun.target, rimLight, rimLight.target, bounceLight, bounceLight.target);
-    for (const p of practicals) scene.remove(p.light);
+    scene.remove(sky, sunHaze, bulbs, pools, hemi, sun, sun.target,
+      rimLight, rimLight.target, bounceLight, bounceLight.target,
+      fillLight, fillLight.target);
+    for (const p of practicals) scene.remove(p.light, p.light.target);
     envScene.remove(envSky);
 
     skyGeometry.dispose();
@@ -1304,6 +1748,9 @@ export function createEnvironment(ctx) {
     bulbGeometry.dispose();
     bulbMaterial.dispose();
     bulbs.dispose();
+    poolGeometry.dispose();
+    poolMaterial.dispose();
+    pools.dispose();
 
     sun.shadow.dispose();
     if (envRT) { envRT.dispose(); envRT = null; }
@@ -1318,10 +1765,21 @@ export function createEnvironment(ctx) {
 
   return {
     sun, hemi, sky,
-    rimLight, bounceLight, sunHaze, fog, envScene,
+    rimLight, bounceLight, fillLight, sunHaze, fog, envScene,
     sunDirection: sunDir,
     get timeOfDay() { return timeOfDay; },
     get envMap() { return envRT ? envRT.texture : null; },
+    /** Sun altitude in degrees for the current preset (negative once set). */
+    get sunElevation() { return preset.elev; },
+    /**
+     * 0 = full daylight, 1 = the sun is down. Driven off sun altitude, not off
+     * the time-of-day scalar, so anything that lights up at night (backdrop
+     * window emissive, signage, practicals) agrees with the sky and the key
+     * about what hour it is. Consumers: props.js backdrop emissive.
+     */
+    get nightFactor() { return nightAmount(); },
+    /** Live haze/fog colour after the sun/anti-sun blend, for backdrop matching. */
+    get hazeColor() { return fog.color; },
     /** Cloud wind in cloud-plane units/second (low deck; the high deck follows). */
     setWind(x, y) { wind.set(x, y); },
     /** Force an IBL rebuild on the next update (e.g. after a park rebuild). */

@@ -68,9 +68,33 @@ export const ANIM_TUNE = {
   headLook: 0.42,        // rad of head yaw at full steer — the rider looks into the turn
   headSpinLead: 0.36,    // rad of extra head yaw leading a spin
   breathRate: 0.62,      // Hz idle breathing
-  jerseyGain: 0.030,     // max jersey billow scale
+  jerseyGain: 0.034,     // rad of ribcage roll/pitch the jersey drags the torso through
   lagGain: 0.55,         // how much of the chassis rotation the torso lags behind
   lagW: 11.0,            // rad/s frequency of that secondary motion
+
+  // --- stance fit ----------------------------------------------------------
+  // bike.js solves ONE bind stance and every mode then rides it, which is why the
+  // pelvis hangs a hand's width clear of the saddle whether the rider is rolling,
+  // grinding or airborne. These resolve that offset per mode against the real
+  // saddle / grip / pedal points of this bike (see solveStance).
+  pelvisUnder: 0.095,    // m from the hips bone down to the underside of the pelvis (x heightScale)
+  clearSeated: 0.000,    // m the pelvis underside clears the saddle when seated — it touches
+  clearStand: 0.085,     // ...standing on the pedals
+  clearTuck: 0.020,      // ...compressed into a crouch or a landing
+  clearAir: 0.115,       // ...in the air, hips thrown back off the saddle
+  clearGrind: 0.075,     // ...balanced over a rail
+  stanceLambda: 7.5,     // 1/s cross-fade between stances — a few frames, never a cut
+  leanMin: -0.36,        // rad of torso lean the stance solver may use
+  leanMax: 0.78,
+
+  // --- drivetrain ----------------------------------------------------------
+  crankLevelLambda: 4.2, // 1/s a freewheeling crank coasts back to level
+  crankPedalMin: 0.05,   // throttle under which the rider stops pedalling
+
+  // --- face ----------------------------------------------------------------
+  blinkGap: [2.2, 6.4],  // s between blinks
+  blinkDur: 0.115,       // s a blink lasts
+  gazeGain: 0.55,        // fraction of the head look the eyes lead by
 
   // --- bail ----------------------------------------------------------------
   bailTime: 1.6,         // s of full ragdoll authority
@@ -130,8 +154,11 @@ const POSES = {
   pedal: { hips: [0.03, 0, 0], chest: [0.02, 0, 0], neck: [-0.04, 0, 0] },
   roll: { hips: [0.02, 0, 0] },
 
+  // Root offsets here are deltas on top of the RESOLVED stance (see solveStance):
+  // the stance already owns "how far the pelvis is off the saddle", so a crouch
+  // only has to carry the extra fold, not the whole squat.
   crouch: {
-    root: [0, -0.115, 0.020],
+    root: [0, -0.045, 0.020],
     hips: [0.20, 0, 0], spine: [0.06, 0, 0], chest: [0.11, 0, 0],
     neck: [-0.27, 0, 0], head: [-0.07, 0, 0],
   },
@@ -146,12 +173,12 @@ const POSES = {
     bike: { pos: [0, 0.085, 0.01], rot: [-0.10, 0, 0], piv: PIVOT_DEFAULT },
   },
   air: {
-    root: [0, -0.020, 0.010],
+    root: [0, -0.010, 0],
     hips: [0.11, 0, 0], chest: [0.06, 0, 0], neck: [-0.11, 0, 0],
     bike: { pos: [0, 0.050, 0], rot: [-0.03, 0, 0], piv: PIVOT_DEFAULT },
   },
   land: {
-    root: [0, -0.075, 0.015],
+    root: [0, -0.028, 0.015],
     hips: [0.16, 0, 0], chest: [0.09, 0, 0], neck: [-0.20, 0, 0],
   },
 
@@ -362,53 +389,58 @@ const POSES = {
   // the body. The chassis attitude itself is countered procedurally below, which is
   // why an ice pick reads as the rider standing up over a nose-high bike rather than
   // the whole player leaning back 23 degrees.
+  // Head yaw is NOT baked in here any more: the rider tracks the actual rail
+  // tangent procedurally below, so a crooked grind turns the head off the chassis
+  // by exactly as much as the chassis is off the rail, and a straight one doesn't
+  // turn it at all. The root y deltas are small because the GRIND stance already
+  // stands the rider off the saddle.
   grind: {
-    root: [0, -0.050, 0],
-    hips: [0.13, 0, 0], chest: [0.07, 0, 0], neck: [-0.14, 0, 0], head: [0, 0.18, 0],
+    root: [0, -0.014, 0],
+    hips: [0.13, 0, 0], chest: [0.07, 0, 0], neck: [-0.14, 0, 0],
   },
   grind_doublepeg: {
-    root: [0, -0.058, 0],
-    hips: [0.15, 0, 0], chest: [0.08, 0, 0], neck: [-0.16, 0, 0], head: [0, 0.20, 0],
+    root: [0, -0.020, 0],
+    hips: [0.15, 0, 0], chest: [0.08, 0, 0], neck: [-0.16, 0, 0],
   },
   grind_feeble: {
-    root: [0.030, -0.050, -0.020],
-    hips: [0.12, 0, 0.10], chest: [0.06, 0, 0.06], neck: [-0.14, 0.08, -0.05], head: [0, 0.22, -0.07],
+    root: [0.030, -0.014, -0.020],
+    hips: [0.12, 0, 0.10], chest: [0.06, 0, 0.06], neck: [-0.14, 0.08, -0.05], head: [0, 0.06, -0.07],
     bike: { pos: [-0.015, 0, 0], rot: [0.04, 0, -0.10], piv: PIVOT_REAR },
   },
   grind_smith: {
-    root: [0.030, -0.050, 0.020],
-    hips: [0.14, 0, 0.10], chest: [0.08, 0, 0.06], neck: [-0.15, 0.08, -0.05], head: [0, 0.22, -0.07],
+    root: [0.030, -0.014, 0.020],
+    hips: [0.14, 0, 0.10], chest: [0.08, 0, 0.06], neck: [-0.15, 0.08, -0.05], head: [0, 0.06, -0.07],
     bike: { pos: [-0.015, 0, 0], rot: [-0.05, 0, -0.10], piv: PIVOT_FRONT },
   },
   grind_icepick: {
-    root: [0, -0.040, -0.085],
-    hips: [-0.05, 0, 0], chest: [-0.03, 0, 0], neck: [0.06, 0, 0], head: [0, 0.20, 0],
+    root: [0, -0.006, -0.085],
+    hips: [-0.05, 0, 0], chest: [-0.03, 0, 0], neck: [0.06, 0, 0],
     bike: { pos: [0, 0.010, 0], rot: [-0.14, 0, 0], piv: PIVOT_REAR },
   },
   grind_toothpick: {
-    root: [0, -0.035, 0.080],
-    hips: [0.10, 0, 0], chest: [0.06, 0, 0], neck: [-0.12, 0, 0], head: [0, 0.20, 0],
+    root: [0, -0.004, 0.080],
+    hips: [0.10, 0, 0], chest: [0.06, 0, 0], neck: [-0.12, 0, 0],
     bike: { pos: [0, 0.010, 0], rot: [0.13, 0, 0], piv: PIVOT_FRONT },
   },
   grind_overtoothpick: {
-    root: [0, -0.035, 0.080],
-    hips: [0.11, 0, 0], chest: [0.07, 0, 0], neck: [-0.13, 0, 0], head: [0, 0.20, 0],
+    root: [0, -0.004, 0.080],
+    hips: [0.11, 0, 0], chest: [0.07, 0, 0], neck: [-0.13, 0, 0],
     steer: 2.86,
     bike: { pos: [0, 0.010, 0], rot: [0.13, 0, 0], piv: PIVOT_FRONT },
   },
   grind_luce: {
-    root: [0.050, -0.045, 0],
-    hips: [0.10, 0, -0.14], chest: [0.06, 0, -0.09], neck: [-0.12, 0.10, 0.05], head: [0, 0.22, 0.07],
+    root: [0.050, -0.010, 0],
+    hips: [0.10, 0, -0.14], chest: [0.06, 0, -0.09], neck: [-0.12, 0.10, 0.05], head: [0, 0.08, 0.07],
     bike: { pos: [-0.025, 0.010, 0], rot: [0.03, 0, 0.18], piv: [0, 0.34, -0.18] },
   },
   grind_crooked: {
-    root: [0.020, -0.050, 0],
-    hips: [0.12, 0.16, -0.05], chest: [0.06, 0.11, -0.03], neck: [-0.13, 0.06, 0], head: [0, 0.28, 0],
+    root: [0.020, -0.014, 0],
+    hips: [0.12, 0.16, -0.05], chest: [0.06, 0.11, -0.03], neck: [-0.13, 0.06, 0], head: [0, 0.10, 0],
     bike: { pos: [0, 0, 0], rot: [0.04, 0.14, -0.06], piv: [0, 0.30, 0] },
   },
   grind_footjam: {
-    root: [0, -0.045, 0.020],
-    hips: [0.16, 0, 0], chest: [0.09, 0, 0], neck: [-0.17, 0, 0], head: [0, 0.18, 0],
+    root: [0, -0.010, 0.020],
+    hips: [0.16, 0, 0], chest: [0.09, 0, 0], neck: [-0.17, 0, 0],
     legR: { ik: 0, u: [0.28, -0.10, 0.95], l: [0.04, -0.76, 0.65], t: [0.32, 0, 0] },
     bike: { pos: [0, 0, 0], rot: [0.10, 0, 0], piv: PIVOT_FRONT },
   },
@@ -588,12 +620,22 @@ export function createRiderAnim(rider, ctx) {
   const qSteerTilt = new THREE.Quaternion().setFromAxisAngle(AXIS_X, steerTilt);
   const qSteerTiltInv = qSteerTilt.clone().invert();
 
-  /** Grip anchors expressed in the steerer's local frame, so a turned bar moves them. */
+  /**
+   * Hand anchors expressed in the steerer's local frame, so a turned bar moves them.
+   *
+   * This is the WRIST, not the grip centre. bike.js closes the fist geometry on the
+   * bar with `fistWrist()`, which parks the wrist joint about 4 cm off the grip axis;
+   * IK-ing the wrist onto the grip centre instead (what this used to do) buries half
+   * the hand inside the bar and slides the palm off the grip on every frame the arms
+   * are solved. Falling back to the grip point only if the bind pose is missing.
+   */
   const gripSteerL = new THREE.Vector3();
   const gripSteerR = new THREE.Vector3();
   if (bike?.points) {
-    gripSteerL.copy(bike.points.gripL).sub(steerPos).applyQuaternion(qSteerTiltInv);
-    gripSteerR.copy(bike.points.gripR).sub(steerPos).applyQuaternion(qSteerTiltInv);
+    const handL = bind.wristL || bike.points.gripL;
+    const handR = bind.wristR || bike.points.gripR;
+    gripSteerL.copy(handL).sub(steerPos).applyQuaternion(qSteerTiltInv);
+    gripSteerR.copy(handR).sub(steerPos).applyQuaternion(qSteerTiltInv);
   }
   const bbPos = bike?.points?.bb ? bike.points.bb.clone() : new THREE.Vector3(0, 0.295, -0.125);
   const pedalRel = [new THREE.Vector3(), new THREE.Vector3()];   // [L, R] relative to the BB
@@ -605,11 +647,175 @@ export function createRiderAnim(rider, ctx) {
     pedalRel[0].set(-0.112, 0, -0.175);
     pedalRel[1].set(0.112, 0, 0.175);
   }
-  ankleOff[0].set(0.008, 0.074, -0.030);
-  ankleOff[1].set(-0.008, 0.074, -0.030);
+  // Where the ankle sits relative to the pedal it is standing on. Read straight off
+  // the bind pose rather than hard-coded, because bike.js scales it with rider
+  // height and the profile's pedal drop — a hard-coded guess sinks a tall rider's
+  // shoe into the platform and floats a short one's above it.
+  if (bind.ankleL && bind.ankleR && bike?.points) {
+    ankleOff[0].copy(bind.ankleL).sub(bike.points.pedalL);
+    ankleOff[1].copy(bind.ankleR).sub(bike.points.pedalR);
+  } else {
+    ankleOff[0].set(0.008, 0.074, -0.030);
+    ankleOff[1].set(-0.008, 0.074, -0.030);
+  }
 
   const tyres = bike?.tyres || [];
   const forkBaseTilt = steerTilt;
+
+  // ---------------------------------------------------------------- stances
+  // bike.js solves ONE bind stance (a nominal standing fit) and every mode then
+  // rides it, so the pelvis sits ~14 cm clear of the saddle whether the rider is
+  // rolling along, grinding or in the air: neither seated nor standing, and the
+  // gap is visible in every frame. That is a bind-pose offset nobody ever
+  // resolved, so resolve it here — once, per mode, against the real saddle, grip
+  // and pedal points of THIS bike and THIS rider's limb lengths.
+  //
+  // A stance is a small search over (pelvis height, pelvis fore/aft, torso lean).
+  // Pelvis height is pinned by the saddle: touching it when seated, clearing it by
+  // a fixed amount when standing. Fore/aft and lean are then chosen so the arms
+  // keep a real elbow bend at the grips and the legs keep a real knee bend at the
+  // pedals — which is why the AIR stance can throw the hips back over the rear
+  // tyre and still end up with bent elbows instead of two locked struts.
+  const hs = rider?.metrics?.heightScale || 1;
+  const seatTop = bike?.points?.seat
+    ? bike.points.seat.clone()
+    : new THREE.Vector3(0, bindRoot.y - 0.24, bindRoot.z + 0.04);
+  const pelvisUnder = T.pelvisUnder * hs;
+
+  const armLen = LIMB_DEF[0].lenA + LIMB_DEF[0].lenB;
+  const legLen = LIMB_DEF[2].lenA + LIMB_DEF[2].lenB;
+  // A rig missing any of these is not one we can fit; the stances then resolve to
+  // zero and the module behaves exactly as it did before, rather than throwing.
+  const fitOK = !!(rig.spine && rig.chest && rig.shoulderL && rig.shoulderR
+    && rig.hipL && rig.hipR && bike?.points);
+  const V0 = new THREE.Vector3();
+  const offSpine = (fitOK ? offOf(rig.spine) : V0).clone();
+  const offChest = (fitOK ? offOf(rig.chest) : V0).clone();
+  // [L, R] to match gripSteer* / pedalRel ordering
+  const shOff = fitOK ? [offOf(rig.shoulderL).clone(), offOf(rig.shoulderR).clone()]
+    : [V0.clone(), V0.clone()];
+  const hipOff = fitOK ? [offOf(rig.hipL).clone(), offOf(rig.hipR).clone()]
+    : [V0.clone(), V0.clone()];
+  const handPt = [
+    (bind.wristL || bike?.points?.gripL || new THREE.Vector3(-0.27, 1.03, 0.29)).clone(),
+    (bind.wristR || bike?.points?.gripR || new THREE.Vector3(0.27, 1.03, 0.29)).clone(),
+  ];
+  const footPt = [
+    new THREE.Vector3().copy(bbPos).add(pedalRel[0]).add(ankleOff[0]),
+    new THREE.Vector3().copy(bbPos).add(pedalRel[1]).add(ankleOff[1]),
+  ];
+
+  /** How the torso lean is shared out down the spine chain. */
+  const LEAN_SPLIT = [0.42, 0.16, 0.42];
+  const _sP0 = new THREE.Vector3(), _sP1 = new THREE.Vector3(), _sP2 = new THREE.Vector3();
+  const _sQ0 = new THREE.Quaternion(), _sQ1 = new THREE.Quaternion(), _sQ2 = new THREE.Quaternion();
+  const _sQt = new THREE.Quaternion();
+  const _sE = new THREE.Euler();
+  const _sV = new THREE.Vector3();
+
+  /** Forward-kinematic the torso for a candidate stance into the _sP / _sQ scratch. */
+  function stanceFK(dy, dz, lean) {
+    _sE.set(lean * LEAN_SPLIT[0], 0, 0); _sQ0.setFromEuler(_sE);
+    _sP0.copy(bindRoot); _sP0.y += dy; _sP0.z += dz;
+    _sP1.copy(offSpine).applyQuaternion(_sQ0).add(_sP0);
+    _sE.set(lean * LEAN_SPLIT[1], 0, 0); _sQ1.copy(_sQ0).multiply(_sQt.setFromEuler(_sE));
+    _sP2.copy(offChest).applyQuaternion(_sQ1).add(_sP1);
+    _sE.set(lean * LEAN_SPLIT[2], 0, 0); _sQ2.copy(_sQ1).multiply(_sQt.setFromEuler(_sE));
+  }
+
+  function stanceScore(dy, dz, lean, spec) {
+    stanceFK(dy, dz, lean);
+    let e = 0;
+    for (let i = 0; i < 2; i++) {
+      _sV.copy(shOff[i]).applyQuaternion(_sQ2).add(_sP2);
+      const ra = handPt[i].distanceTo(_sV) / armLen;
+      e += (ra - spec.armFlex) * (ra - spec.armFlex) * 6.0;
+      if (ra > 0.955) e += (ra - 0.955) * (ra - 0.955) * 600;    // never lock an elbow
+      _sV.copy(hipOff[i]).applyQuaternion(_sQ0).add(_sP0);
+      const rl = footPt[i].distanceTo(_sV) / legLen;
+      e += (rl - spec.legFlex) * (rl - spec.legFlex) * 2.6;
+      if (rl > 0.945) e += (rl - 0.945) * (rl - 0.945) * 600;    // ...or a knee
+      if (rl < 0.400) e += (0.400 - rl) * (0.400 - rl) * 600;    // ...or fold it shut
+    }
+    e += (dy - spec.dy) * (dy - spec.dy) * spec.dyW;
+    e += (dz - spec.dz) * (dz - spec.dz) * spec.dzW;
+    e += (lean - spec.lean) * (lean - spec.lean) * 0.30;
+    return e;
+  }
+
+  /**
+   * Coarse grid then two halving refinements — deterministic, ~4 k evaluations,
+   * run five times at construction and never again.
+   */
+  function solveStance(spec) {
+    if (!fitOK) return new Float32Array(8);
+    let bY = spec.dy, bZ = spec.dz, bL = spec.lean, bE = Infinity;
+    let rY = 0.055, rZ = 0.20, rL = 0.58;
+    let cY = spec.dy, cZ = spec.dz, cL = spec.lean;
+    for (let pass = 0; pass < 3; pass++) {
+      const nY = pass === 0 ? 4 : 4, nZ = pass === 0 ? 16 : 8, nL = pass === 0 ? 18 : 8;
+      for (let a = 0; a <= nY; a++) {
+        const dy = cY + rY * (2 * a / nY - 1);
+        for (let b = 0; b <= nZ; b++) {
+          const dz = cZ + rZ * (2 * b / nZ - 1);
+          for (let c = 0; c <= nL; c++) {
+            const lean = clamp(cL + rL * (2 * c / nL - 1), T.leanMin, T.leanMax);
+            const e = stanceScore(dy, dz, lean, spec);
+            if (e < bE) { bE = e; bY = dy; bZ = dz; bL = lean; }
+          }
+        }
+      }
+      cY = bY; cZ = bZ; cL = bL;
+      rY *= 0.4; rZ *= 0.4; rL *= 0.4;
+    }
+    // [rootX, rootY, rootZ, hips.rx, spine.rx, chest.rx, neck.rx, head.rx]
+    return Float32Array.from([
+      0, bY, bZ,
+      bL * LEAN_SPLIT[0], bL * LEAN_SPLIT[1], bL * LEAN_SPLIT[2],
+      clamp(-bL * 0.45, -0.34, 0.16), clamp(-bL * 0.20, -0.18, 0.10),
+    ]);
+  }
+
+  const seatDy = (clear) => (seatTop.y + pelvisUnder + clear * hs) - bindRoot.y;
+  const STANCES = {
+    // seated on the saddle, torso upright, legs folded the way a slammed seat folds them
+    seated: solveStance({ dy: seatDy(T.clearSeated), dyW: 90, dz: 0.00, dzW: 0.7, lean: -0.06, armFlex: 0.70, legFlex: 0.50 }),
+    // up on the pedals, weight over the bars
+    stand: solveStance({ dy: seatDy(T.clearStand), dyW: 90, dz: -0.01, dzW: 0.7, lean: 0.16, armFlex: 0.78, legFlex: 0.62 }),
+    // compressed: crouch, hop charge, landing absorption
+    tuck: solveStance({ dy: seatDy(T.clearTuck), dyW: 90, dz: -0.05, dzW: 1.0, lean: 0.34, armFlex: 0.72, legFlex: 0.52 }),
+    // airborne: hips thrown back over the rear tyre, chest driven out over the bars.
+    // dzW is deliberately huge — "hips back" IS the air pose, so the fit is allowed
+    // to spend its whole arm/leg budget paying for it rather than trading it away.
+    air: solveStance({ dy: seatDy(T.clearAir), dyW: 90, dz: -0.145, dzW: 26.0, lean: 0.40, armFlex: 0.82, legFlex: 0.54 }),
+    // grinding: weight centred over the rail, knees bent and loaded
+    grind: solveStance({ dy: seatDy(T.clearGrind), dyW: 90, dz: -0.015, dzW: 1.4, lean: 0.20, armFlex: 0.78, legFlex: 0.60 }),
+  };
+  const STANCE_N = 8;
+
+  /**
+   * Which stance a base/trick pose belongs to. Anything not listed is an air
+   * trick, and air tricks are ridden out of the saddle.
+   */
+  const STANCE_OF = new Map();
+  const stanceTag = (ids, name) => { for (const id of ids) STANCE_OF.set(id, name); };
+  // Rolling and coasting are seated; laying power down is not — a BMX rider gets
+  // out of the saddle to pedal, which is also what keeps the two ground stances
+  // visibly different from each other.
+  stanceTag(['ride', 'roll'], 'seated');
+  stanceTag(['crouch', 'land'], 'tuck');
+  stanceTag(['pedal', 'hop', 'bunnyhop', 'manual', 'nose_manual',
+    'flat_hangfive', 'flat_surfer', 'flat_tailwhip', 'bail'], 'stand');
+  for (const id of Object.keys(POSES)) {
+    if (id.startsWith('grind_') || id === 'grind') STANCE_OF.set(id, 'grind');
+    else if (id.startsWith('lip_')) STANCE_OF.set(id, 'stand');
+    else if (!STANCE_OF.has(id)) STANCE_OF.set(id, 'air');
+  }
+  function stanceFor(id) {
+    let name = STANCE_OF.get(id);
+    if (!name) name = id && (id.startsWith('grind') ? 'grind' : id.startsWith('lip_') ? 'stand' : 'air');
+    return STANCES[name] || STANCES.stand;
+  }
 
   // --------------------------------------------------------- channel storage
   const defaults = new Float32Array(NCH);
@@ -710,6 +916,21 @@ export function createRiderAnim(rider, ctx) {
   let prevYaw = 0, prevPitch = 0, havePrev = false;
   let disposed = false;
 
+  /** Live stance, cross-faded between the resolved presets. */
+  const stanceCur = Float32Array.from(STANCES.stand);
+  const stanceTgt = new Float32Array(STANCE_N);
+  /** Freewheeling crank: a BMX coasts, so the pedals do NOT track the wheels. */
+  let crankVis = 0;
+  let prevCrank = null;
+  /** Snap the whole rig to its target on the next update (boot / respawn / teleport). */
+  let snapNext = true;
+  const lastPos = new THREE.Vector3();
+  let havePos = false;
+  // face: deterministic blink clock, seeded from the shared rng like everything else
+  let blinkT = 0.6 + rng() * (T.blinkGap[1] - T.blinkGap[0]);
+  let blinkPhase = 0;
+  let gazeYaw = 0, gazePitch = 0;
+
   /** The one live "action" (barspin / tailwhip / decade), driven outside the springs. */
   const act = { kind: null, turns: 0, dur: 0.4, t: 0, live: false };
 
@@ -744,6 +965,14 @@ export function createRiderAnim(rider, ctx) {
   for (const n of RD_NAMES) rdBind.push(new THREE.Vector3().copy(P(n)));
   const rdPos = rdBind.map((v) => v.clone());
   const rdPrev = rdBind.map((v) => v.clone());
+  /**
+   * Where the ragdoll considers "home" — the bind cloud translated onto whatever
+   * stance the rider was actually in when they crashed. Without this the body
+   * teleports back to the bind pelvis the instant the ragdoll takes over, which
+   * with a resolved seated stance is a 14 cm pop.
+   */
+  const rdHome = rdBind.map((v) => v.clone());
+  const rdRoot = new THREE.Vector3();
   const rdLen = new Float32Array(RD_N);
   const rdAnchor = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
   const rdAnchorBind = [P('shoulderL').clone(), P('shoulderR').clone(), P('hipL').clone(), P('hipR').clone()];
@@ -773,14 +1002,16 @@ export function createRiderAnim(rider, ctx) {
       if (sp > 1e-4) _v0.multiplyScalar(Math.min(sp, 12) / sp);
     }
     const kick = detail?.speed ? clamp(detail.speed / 12, 0.3, 1.4) : 0.8;
+    rdRoot.copy(rig.hips.position).sub(bindRoot);
     for (let i = 0; i < RD_N; i++) {
-      rdPos[i].copy(rdBind[i]);
+      rdHome[i].copy(rdBind[i]).add(rdRoot);
+      rdPos[i].copy(rdHome[i]);
       // Upper body carries more of the throw than the pelvis — that is what sells it.
       const share = 0.004 + 0.010 * (rdBind[i].y - 0.3);
-      rdPrev[i].copy(rdBind[i]).addScaledVector(_v0, -share * kick);
+      rdPrev[i].copy(rdHome[i]).addScaledVector(_v0, -share * kick);
       rdPrev[i].y -= 0.004 * kick;
     }
-    for (let i = 0; i < 4; i++) rdAnchor[i].copy(rdAnchorBind[i]);
+    for (let i = 0; i < 4; i++) rdAnchor[i].copy(rdAnchorBind[i]).add(rdRoot);
   }
 
   function stepRagdoll(dt) {
@@ -805,12 +1036,12 @@ export function createRiderAnim(rider, ctx) {
     }
     // The pelvis is thrown too, but tethered: the rider is allowed to come off the
     // bike, never to fly away from it (the chassis is what the camera is watching).
-    _v1.subVectors(rdPos[0], rdBind[0]);
+    _v1.subVectors(rdPos[0], rdHome[0]);
     const away = _v1.length();
     if (away > T.bailTether) rdPos[0].addScaledVector(_v1, -(away - T.bailTether) / away);
-    rdPos[0].lerp(rdBind[0], clamp(1.5 * h, 0, 0.4));
+    rdPos[0].lerp(rdHome[0], clamp(1.5 * h, 0, 0.4));
 
-    for (let i = 1; i < RD_N; i++) rdPos[i].lerp(rdBind[i], shape);
+    for (let i = 1; i < RD_N; i++) rdPos[i].lerp(rdHome[i], shape);
 
     // ground plane in rider space
     if (s) {
@@ -892,7 +1123,9 @@ export function createRiderAnim(rider, ctx) {
 
   // ------------------------------------------------------------------ events
   const onBail = (e) => playBail(e?.detail);
-  const onRespawn = () => { bailActive = false; };
+  // A respawn teleports the chassis: springing the pose in from wherever the crash
+  // left it would drag a dead body across the park for half a second.
+  const onRespawn = () => { bailActive = false; snapNext = true; };
   const onLand = () => { if (bailActive) bailActive = false; };
   ctx?.events?.addEventListener?.('bail', onBail);
   ctx?.events?.addEventListener?.('respawn', onRespawn);
@@ -911,6 +1144,59 @@ export function createRiderAnim(rider, ctx) {
         if (s.crouch > 0.012 || s.hopCharge > 0.05) return 'crouch';
         if (s.compression > 0.22) return 'land';
         return (ctx?.input?.state?.throttle || 0) > 0.05 ? 'pedal' : 'ride';
+    }
+  }
+
+  // ------------------------------------------------------------------- face
+  // The head GEOMETRY belongs to bike.js; its MOTION belongs here. If the rider
+  // mesh publishes eye/lid/jaw bones (`rig.face`) or blink/squint/brow morphs, we
+  // drive them: the eyes lead the head into a turn or a spin, the lids narrow with
+  // effort and there is a real blink clock, so the face is alive instead of a mask.
+  // With none of those channels present this whole block is a no-op.
+  const face = rig.face || rider?.face || null;
+  const faceMesh = rig.mesh || rider?.mesh || null;
+  const morphIndex = (name) => {
+    const dict = faceMesh?.morphTargetDictionary;
+    return dict && dict[name] !== undefined ? dict[name] : -1;
+  };
+  const MI_BLINK = morphIndex('blink');
+  const MI_SQUINT = morphIndex('squint');
+  const MI_BROW = morphIndex('brow');
+  const hasFace = !!(face || MI_BLINK >= 0 || MI_SQUINT >= 0 || MI_BROW >= 0);
+  // Own LCG seeded from the shared rng: deterministic, and it does not pull on the
+  // global stream every couple of seconds and desync everyone else's noise.
+  let blinkSeed = (rng() * 0xffffffff) >>> 0;
+  const blinkRand = () => {
+    blinkSeed = (Math.imul(blinkSeed, 1664525) + 1013904223) >>> 0;
+    return blinkSeed / 4294967296;
+  };
+
+  function driveFace(dd, look, effort) {
+    if (!hasFace) return;
+    blinkT -= dd;
+    if (blinkT <= 0) {
+      blinkT = T.blinkGap[0] + blinkRand() * (T.blinkGap[1] - T.blinkGap[0]);
+      blinkPhase = T.blinkDur;
+    }
+    if (blinkPhase > 0) blinkPhase = Math.max(0, blinkPhase - dd);
+    const blink = blinkPhase > 0 ? Math.sin((1 - blinkPhase / T.blinkDur) * Math.PI) : 0;
+    gazeYaw = damp(gazeYaw, clamp(look * T.gazeGain, -0.5, 0.5), 12, dd);
+    gazePitch = damp(gazePitch, clamp(-effort * 0.12, -0.2, 0.2), 9, dd);
+    if (face) {
+      if (face.eyeL) face.eyeL.rotation.set(gazePitch, gazeYaw, 0);
+      if (face.eyeR) face.eyeR.rotation.set(gazePitch, gazeYaw, 0);
+      const lid = clamp(blink + effort * 0.22, 0, 1);
+      if (face.lidL) face.lidL.rotation.x = lid * 0.90;
+      if (face.lidR) face.lidR.rotation.x = lid * 0.90;
+      if (face.jaw) face.jaw.rotation.x = effort * 0.16;
+      if (face.browL) face.browL.rotation.x = -effort * 0.15;
+      if (face.browR) face.browR.rotation.x = -effort * 0.15;
+    }
+    const inf = faceMesh?.morphTargetInfluences;
+    if (inf) {
+      if (MI_BLINK >= 0) inf[MI_BLINK] = blink;
+      if (MI_SQUINT >= 0) inf[MI_SQUINT] = effort * 0.6;
+      if (MI_BROW >= 0) inf[MI_BROW] = effort * 0.5;
     }
   }
 
@@ -939,6 +1225,18 @@ export function createRiderAnim(rider, ctx) {
     const grindApi = c?.player?.grind;
     const d = clamp(dt, 0, 0.1);
 
+    // Teleports (respawn, level load, a harness staging the rider for a shot) must
+    // not be blended: the springs would spend half a second walking the old pose
+    // across the park. Anything further than the rider could physically have
+    // travelled this frame is a cut, not a move.
+    if (s) {
+      if (!havePos) { snapNext = true; havePos = true; }
+      else if (lastPos.distanceToSquared(s.position) > Math.max(1.2, s.speed * d * 2.5) ** 2) {
+        snapNext = true;
+      }
+      lastPos.copy(s.position);
+    }
+
     // ---------------------------------------------------------- 1. actions
     let handOff = 0, legLift = 0, decadeA = 0;
     if (act.live) {
@@ -964,17 +1262,45 @@ export function createRiderAnim(rider, ctx) {
     const id = baseId(s, grindApi);
     tgt.set(defaults);
     applyLayer(compiled.get(id) || compiled.get('ride'), 1);
-    poseFade = damp(poseFade, trickPose ? trickWeight : 0, 18, d);
+    const poseGoal = trickPose ? trickWeight : 0;
+    poseFade = snapNext ? poseGoal : damp(poseFade, poseGoal, 18, d);
     if (trickPose && poseFade > 0.002) applyLayer(compiled.get(trickPose), poseFade);
 
     // --- additive procedural layer -----------------------------------------
     const speed = s ? s.speed : 0;
-    speedVis = damp(speedVis, speed, 6, d);
+    speedVis = snapNext ? speed : damp(speedVis, speed, 6, d);
     const spd01 = clamp(speedVis / 14, 0, 1);
     const comp = s ? s.compression : 0;
-    compressionVis = damp(compressionVis, comp, 14, d);
+    compressionVis = snapNext ? comp : damp(compressionVis, comp, 14, d);
     const steerIn = s ? s.steer : (input?.steer || 0);
     const air = s ? (s.mode === 'air') : false;
+
+    // --- stance: the resolved answer to "where is the pelvis?" ---------------
+    // The base pose picks a stance and any trick pose on top of it picks its own,
+    // so an air trick fired out of a roll drags the rider up off the saddle at the
+    // same rate the trick blends in. The cross-fade is a damp, never a cut.
+    {
+      const a = stanceFor(id);
+      const b = trickPose ? stanceFor(trickPose) : a;
+      const w = trickPose ? poseFade : 0;
+      for (let i = 0; i < STANCE_N; i++) stanceTgt[i] = a[i] + (b[i] - a[i]) * w;
+      // A landing compresses straight through the stance: absorb into the tuck.
+      if (compressionVis > 0.002) {
+        const k = clamp(compressionVis, 0, 1) * 0.8;
+        for (let i = 0; i < STANCE_N; i++) stanceTgt[i] += (STANCES.tuck[i] - stanceTgt[i]) * k;
+      }
+      for (let i = 0; i < STANCE_N; i++) {
+        stanceCur[i] = snapNext ? stanceTgt[i] : damp(stanceCur[i], stanceTgt[i], T.stanceLambda, d);
+      }
+      tgt[CH_ROOT] += stanceCur[0];
+      tgt[CH_ROOT + 1] += stanceCur[1];
+      tgt[CH_ROOT + 2] += stanceCur[2];
+      tgt[CH_SPINE] += stanceCur[3];          // hips.rx
+      tgt[CH_SPINE + 3] += stanceCur[4];      // spine.rx
+      tgt[CH_SPINE + 6] += stanceCur[5];      // chest.rx
+      tgt[CH_SPINE + 9] += stanceCur[6];      // neck.rx
+      tgt[CH_SPINE + 12] += stanceCur[7];     // head.rx
+    }
 
     // breathing + jersey secondary motion
     breathPhase += d * T.breathRate * TAU;
@@ -982,12 +1308,22 @@ export function createRiderAnim(rider, ctx) {
     const breath = Math.sin(breathPhase);
     tgt[CH_SPINE + 6] += breath * 0.012 * (1 - spd01 * 0.6);          // chest rx
     tgt[CH_SPINE + 3] += Math.sin(jerseyPhase * 0.63) * 0.006 * spd01; // spine rx
+    // Jersey drag. This used to be a scale on the chest bone with counter-scales on
+    // the neck and both shoulders, which put a step in the skinning weight exactly
+    // where the deltoid blends into the ribcage — a hard ring at the shoulder on
+    // every frame, and a moving one at that. Rotation cannot tear a skin, so the
+    // cloth reads as the ribcage being dragged around instead of inflated.
+    const jw = T.jerseyGain * (0.30 + 0.70 * spd01);
+    tgt[CH_SPINE + 6 + 2] += Math.sin(jerseyPhase) * jw * 0.55;             // chest rz
+    tgt[CH_SPINE + 6] += Math.sin(jerseyPhase * 0.71 + 1.3) * jw * 0.40;    // chest rx
+    tgt[CH_SPINE + 3 + 2] += Math.sin(jerseyPhase * 0.47 + 2.1) * jw * 0.30; // spine rz
 
     // torso lag behind the chassis — the cheap jiggle bone
     if (s) {
       _v0.set(0, 0, 1).applyQuaternion(s.quaternion);
       const yaw = Math.atan2(_v0.x, _v0.z);
       const pitch = Math.asin(clamp(_v0.y, -1, 1));
+      if (snapNext) { lagYaw = 0; lagYawV = 0; lagPitch = 0; lagPitchV = 0; havePrev = false; }
       if (havePrev) {
         let dy = yaw - prevYaw;
         if (dy > Math.PI) dy -= TAU; else if (dy < -Math.PI) dy += TAU;
@@ -1042,6 +1378,34 @@ export function createRiderAnim(rider, ctx) {
       tgt[CH_SPINE] += cPitch;
       tgt[CH_SPINE + 6] += cPitch * 0.4;
       tgt[CH_SPINE + 9] -= cPitch * 0.7;
+
+      // The rider works the rail, not the bike: the torso opens toward the side the
+      // pegs are locked on and that shoulder drops, which is the read that says
+      // "balanced" rather than "parked". `side` is which side of the rail the bike
+      // hangs off, so it also decides which way the counterweight goes.
+      const side = grindApi.side >= 0 ? 1 : -1;
+      tgt[CH_SPINE + 6 + 1] += side * 0.13;      // chest yaw — open toward the rail
+      tgt[CH_SPINE + 3 + 1] += side * 0.05;
+      tgt[CH_SPINE + 6 + 2] -= side * 0.11;      // ...and drop that shoulder
+      tgt[CH_SPINE + 2] += side * 0.05;
+      tgt[CH_ROOT] -= side * 0.022;
+
+      // Head tracks the RAIL, not the chassis. On a straight grind that is dead
+      // ahead and nothing happens; on a crooked or transferring one the chassis is
+      // yawed off the line and the rider keeps looking down it.
+      const tan = s.rail?.tangent;
+      if (tan && tan.lengthSq() > 1e-6) {
+        _v0.copy(tan).normalize();
+        _q0.copy(s.quaternion).invert();
+        _v0.applyQuaternion(_q0);
+        if (_v0.z < 0) _v0.negate();                       // down-track, not back up it
+        const railYaw = clamp(Math.atan2(_v0.x, Math.max(Math.abs(_v0.z), 1e-3)), -0.85, 0.85);
+        const railPitch = clamp(Math.asin(clamp(_v0.y, -1, 1)), -0.5, 0.5);
+        tgt[CH_SPINE + 6 + 1] += railYaw * 0.16;
+        tgt[CH_SPINE + 9 + 1] += railYaw * 0.30;
+        tgt[CH_SPINE + 12 + 1] += railYaw * 0.58;
+        tgt[CH_SPINE + 12] -= railPitch * 0.45;
+      }
     }
     // manual balance rocks the rider fore/aft
     if (s && s.mode === 'manual') {
@@ -1051,6 +1415,9 @@ export function createRiderAnim(rider, ctx) {
     }
 
     // ------------------------------------------------------- 3. spring blend
+    // On a teleport the springs are placed straight onto the target: one frame, no
+    // trail. Everything downstream then runs exactly as it would on any other frame.
+    if (snapNext) { cur.set(tgt); vel.fill(0); }
     let steps = d > T.substep ? Math.ceil(d / T.substep) : 1;
     if (steps > 4) steps = 4;
     const hstep = d / steps;
@@ -1127,7 +1494,7 @@ export function createRiderAnim(rider, ctx) {
     // steering: input steer + pose steer, minus the whip (the bars hold still)
     const steerAuth = air ? T.steerAirVisual : T.steerVisual;
     const steerTarget = clamp(steerIn, -1, 1) * steerAuth + cur[CH_STEER];
-    steerAngle = damp(steerAngle, steerTarget, T.steerLambda, d);
+    steerAngle = snapNext ? steerTarget : damp(steerAngle, steerTarget, T.steerLambda, d);
     if (bike?.setSteer) bike.setSteer(steerAngle - whipAngle);
     if (bike?.setBarspin) bike.setBarspin(barAngle);
     // The steerer's own transform is Rx(headTilt) * Ry(angle) — matching bike.js,
@@ -1141,7 +1508,29 @@ export function createRiderAnim(rider, ctx) {
     wheelAngle += spinRate * d;
     if (wheelAngle > 1e6 || wheelAngle < -1e6) wheelAngle %= TAU;
     if (bike?.setWheelSpin) bike.setWheelSpin(wheelAngle);
-    const crank = s && Number.isFinite(s.crank) ? s.crank : wheelAngle / T.crankRatio;
+
+    // Freewheel. bikePhysics locks the crank to the wheels, which is a fixed-gear
+    // drivetrain: the feet then cycle forever, including in the air and on a rail,
+    // and at any instant both are as likely to be bunched at the front of the
+    // stroke as split. A BMX coasts — so the crank only advances while the rider is
+    // actually pedalling, and otherwise settles to the nearest LEVEL position,
+    // which is one foot forward, one foot back, the way every BMX photo ever shot.
+    const rawCrank = s && Number.isFinite(s.crank) ? s.crank : wheelAngle / T.crankRatio;
+    let dCrank = 0;
+    if (prevCrank !== null) {
+      dCrank = rawCrank - prevCrank;
+      if (dCrank > Math.PI) dCrank -= TAU; else if (dCrank < -Math.PI) dCrank += TAU;
+    }
+    prevCrank = rawCrank;
+    const pedalling = !!s && s.grounded && s.mode !== 'grind' && s.mode !== 'bail'
+      && (input?.throttle || 0) > T.crankPedalMin;
+    if (pedalling) crankVis += dCrank;
+    else {
+      const level = Math.round(crankVis / Math.PI) * Math.PI;
+      crankVis = snapNext ? level : damp(crankVis, level, T.crankLevelLambda, d);
+    }
+    if (crankVis > 1e6 || crankVis < -1e6) crankVis %= TAU;
+    const crank = crankVis;
     if (bike?.setDrive) bike.setDrive(crank);
 
     // tyre squash + fork rake + bar flex: the whole bike takes the hit
@@ -1166,17 +1555,11 @@ export function createRiderAnim(rider, ctx) {
     qChestW.copy(qSpineW).multiply(rig.chest.quaternion);
     pChest.copy(offOf(rig.chest)).applyQuaternion(qSpineW).add(pSpine);
 
-    // Jersey billow: a breath of bone scale on the ribcage is the cheapest cloth
-    // there is. Scale inherits down the chain, so the neck and both shoulders are
-    // counter-scaled — otherwise the head would swell and the arms would grow,
-    // which would quietly break the IK reach to the grips.
-    const billow = 1 + T.jerseyGain * (0.35 + 0.65 * spd01) * (0.5 + 0.5 * Math.sin(jerseyPhase));
-    const billowY = 1 + (billow - 1) * 0.30;
-    rig.chest.scale.set(billow, billowY, billow);
-    const ib = 1 / billow, iby = 1 / billowY;
-    if (rig.neck) rig.neck.scale.set(ib, iby, ib);
-    if (rig.shoulderL) rig.shoulderL.scale.set(ib, iby, ib);
-    if (rig.shoulderR) rig.shoulderR.scale.set(ib, iby, ib);
+    // No bone scale anywhere on this rig. A skinned vertex blends between two bones
+    // across the joint region; if those two bones have different scales the blend
+    // is a discontinuity in the surface, and it shows up as a hard ring exactly at
+    // the shoulder and the neck. The jersey now moves the ribcage by rotation
+    // (see the additive layer), which every weight in the blend agrees on.
 
     // limbs
     for (let L = 0; L < 4; L++) {
@@ -1275,6 +1658,11 @@ export function createRiderAnim(rider, ctx) {
         group.quaternion.multiply(qVisual);
       }
     }
+
+    // ------------------------------------------------------------- 9. face
+    driveFace(d, look, clamp(spd01 * 0.45 + compressionVis * 0.9 + (bailW > 0.1 ? 1 : 0), 0, 1));
+
+    snapNext = false;
   }
 
   function dispose() {
@@ -1286,6 +1674,13 @@ export function createRiderAnim(rider, ctx) {
     // Hand the rig back exactly as it was handed to us: bike.js may outlive us.
     for (const b of rig.bones || []) { b.quaternion.identity(); b.scale.set(1, 1, 1); }
     rig.hips.position.copy(bindRoot);
+    if (face) {
+      for (const k of ['eyeL', 'eyeR', 'lidL', 'lidR', 'jaw', 'browL', 'browR']) {
+        face[k]?.rotation?.set(0, 0, 0);
+      }
+    }
+    const inf0 = faceMesh?.morphTargetInfluences;
+    if (inf0) for (const i of [MI_BLINK, MI_SQUINT, MI_BROW]) if (i >= 0) inf0[i] = 0;
     for (let i = 0; i < tyres.length; i++) tyres[i].scale.set(1, 1, 1);
     if (steerObj) steerObj.rotation.x = forkBaseTilt;
     if (bikeGroup) { bikeGroup.position.set(0, 0, 0); bikeGroup.quaternion.identity(); }
@@ -1300,6 +1695,8 @@ export function createRiderAnim(rider, ctx) {
     poses: POSES,
     poseIds: Object.keys(POSES),
     tuning: ANIM_TUNE,
+    /** The stances resolved against this bike at construction — debug/inspection. */
+    stances: STANCES,
     get pose() { return trickPose; },
     get bailing() { return bailActive; },
     update,

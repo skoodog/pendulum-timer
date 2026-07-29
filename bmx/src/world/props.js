@@ -33,6 +33,15 @@ const FENCE_H = 2.2;
 const BAY = 3.0;                     // fence bay width (metres)
 const GATE = { centre: 14, width: 5.4 };   // opening in the +Z run
 const SHADOW_RADIUS = 46;            // beyond this nothing casts shadows
+const GROUND_Y = -0.32;              // the plane the whole backdrop stands on
+
+// Cut-out thresholds. Every one of these is fed to both the material and the
+// mip builder, so the coverage the artist authored survives every mip level.
+const LEAF_CUT = 0.42;
+const PALM_CUT = 0.36;
+const WEED_CUT = 0.40;
+const LITTER_CUT = 0.35;
+const FENCE_CUT = 0.50;
 
 // scratch — no allocation in any loop that runs more than once per build
 const _m4 = new THREE.Matrix4();
@@ -221,6 +230,170 @@ function makeTex(canvas, { srgb = true, wrap = THREE.ClampToEdgeWrapping, aniso 
   if (repeat) t.repeat.set(repeat[0], repeat[1]);
   t.needsUpdate = true;
   return t;
+}
+
+// ---------------------------------------------------------------------------
+// alpha cut-out plumbing
+//
+// Canvas 2D leaves fully transparent texels at RGB 0. Mipmapping and bilinear
+// filtering then average that black into every leaf, frond and wire edge, and
+// once the sRGB decode plus the tonemapper get hold of the result it shows up
+// as the coloured sparkle the art director called out. Two passes fix it for
+// good:
+//
+//   1. dilate the albedo outward under the alpha, so a transparent texel
+//      carries its neighbour's colour instead of the key colour;
+//   2. build the mip chain by hand and rescale the alpha of every level so the
+//      fraction of texels passing `alphaTest` matches level 0 — otherwise a
+//      chainlink weave that covers 30 % of its tile simply dissolves (or, with
+//      a low threshold, floods solid) as soon as the first mip kicks in.
+// ---------------------------------------------------------------------------
+
+function pixelsOf(canvas) {
+  return canvas.getContext('2d', { willReadFrequently: true })
+    .getImageData(0, 0, canvas.width, canvas.height);
+}
+
+/** Push opaque RGB outward into the transparent texels, in place. */
+function dilateAlpha(canvas, passes = 6) {
+  const w = canvas.width, h = canvas.height;
+  if (w < 2 || h < 2) return canvas;
+  const g = canvas.getContext('2d', { willReadFrequently: true });
+  const img = g.getImageData(0, 0, w, h);
+  const d = img.data;
+  const n = w * h;
+  const filled = new Uint8Array(n);
+  let opaque = 0;
+  for (let i = 0; i < n; i++) { if (d[i * 4 + 3] > 6) { filled[i] = 1; opaque++; } }
+  if (!opaque || opaque === n) return canvas;
+  const next = new Uint8Array(n);
+  for (let p = 0; p < passes; p++) {
+    next.set(filled);
+    let grew = 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (filled[i]) continue;
+        let r = 0, gg = 0, b = 0, c = 0;
+        for (let oy = -1; oy <= 1; oy++) {
+          const sy = y + oy;
+          if (sy < 0 || sy >= h) continue;
+          for (let ox = -1; ox <= 1; ox++) {
+            const sx = x + ox;
+            if (sx < 0 || sx >= w) continue;
+            const j = sy * w + sx;
+            if (!filled[j]) continue;
+            r += d[j * 4]; gg += d[j * 4 + 1]; b += d[j * 4 + 2]; c++;
+          }
+        }
+        if (!c) continue;
+        d[i * 4] = (r / c) | 0; d[i * 4 + 1] = (gg / c) | 0; d[i * 4 + 2] = (b / c) | 0;
+        next[i] = 1; grew = 1;
+      }
+    }
+    filled.set(next);
+    if (!grew) break;
+  }
+  g.putImageData(img, 0, 0);
+  return canvas;
+}
+
+function alphaCoverage(data, cut) {
+  let n = 0;
+  for (let i = 3; i < data.length; i += 4) if (data[i] >= cut) n++;
+  return n / (data.length >> 2);
+}
+
+/** Scale a level's alpha so `target` of its texels still pass the cut. */
+function rescaleAlphaToCoverage(data, cut, target) {
+  const px = data.length >> 2;
+  let lo = 0.05, hi = 12, s = 1;
+  for (let it = 0; it < 18; it++) {
+    s = (lo + hi) * 0.5;
+    let n = 0;
+    for (let i = 3; i < data.length; i += 4) if (data[i] * s >= cut) n++;
+    if (n / px > target) hi = s; else lo = s;
+  }
+  if (Math.abs(s - 1) < 0.01) return;
+  for (let i = 3; i < data.length; i += 4) data[i] = Math.min(255, Math.round(data[i] * s));
+}
+
+/** Full mip chain down to 1x1, alpha-rescaled to hold level 0's coverage. */
+function coverageMipChain(base, alphaTest) {
+  const cut = alphaTest * 255;
+  const target = alphaCoverage(pixelsOf(base).data, cut);
+  const chain = [base];
+  let src = base, w = base.width, h = base.height;
+  while (w > 1 || h > 1) {
+    w = Math.max(1, w >> 1); h = Math.max(1, h >> 1);
+    const { canvas, g } = canvas2d(w, h);
+    g.imageSmoothingEnabled = true;
+    if ('imageSmoothingQuality' in g) g.imageSmoothingQuality = 'high';
+    g.clearRect(0, 0, w, h);
+    g.drawImage(src, 0, 0, w, h);
+    if (w > 1 && h > 1 && target > 0 && target < 1) {
+      const img = g.getImageData(0, 0, w, h);
+      rescaleAlphaToCoverage(img.data, cut, target);
+      g.putImageData(img, 0, 0);
+      dilateAlpha(canvas, 2);
+    }
+    chain.push(canvas);
+    src = canvas;
+  }
+  return chain;
+}
+
+/**
+ * Texture for an alpha-tested cut-out: dilated albedo, hand-built
+ * coverage-preserving mips, anisotropy forced to at least 8 whatever the
+ * quality tier says (these are the maps that alias the hardest).
+ */
+function makeCutoutTex(canvas, {
+  alphaTest = 0.5, aniso = 8, wrap = THREE.ClampToEdgeWrapping,
+  repeat = null, srgb = true, dilate = 6,
+} = {}) {
+  dilateAlpha(canvas, dilate);
+  const t = new THREE.CanvasTexture(canvas);
+  t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+  t.wrapS = t.wrapT = wrap;
+  t.anisotropy = Math.max(8, aniso);
+  t.magFilter = THREE.LinearFilter;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.generateMipmaps = false;
+  t.mipmaps = coverageMipChain(canvas, alphaTest);
+  if (repeat) t.repeat.set(repeat[0], repeat[1]);
+  t.needsUpdate = true;
+  return t;
+}
+
+/** Grey height field -> tangent-space normal map canvas. */
+function normalFromHeight(src, strength = 2.0) {
+  const w = src.width, h = src.height;
+  const s = pixelsOf(src).data;
+  const { canvas, g } = canvas2d(w, h);
+  const out = g.createImageData(w, h);
+  const o = out.data;
+  const at = (x, y) => {
+    const xx = (x + w) % w, yy = (y + h) % h;
+    const i = (yy * w + xx) * 4;
+    return (s[i] * 0.299 + s[i + 1] * 0.587 + s[i + 2] * 0.114) / 255;
+  };
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const dx = (at(x + 1, y) - at(x - 1, y)) * strength;
+      const dy = (at(x, y + 1) - at(x, y - 1)) * strength;
+      let nx = -dx, ny = dy, nz = 1;
+      const l = Math.hypot(nx, ny, nz);
+      nx /= l; ny /= l; nz /= l;
+      const i = (y * w + x) * 4;
+      o[i] = (nx * 0.5 + 0.5) * 255;
+      o[i + 1] = (ny * 0.5 + 0.5) * 255;
+      o[i + 2] = (nz * 0.5 + 0.5) * 255;
+      o[i + 3] = 255;
+    }
+  }
+  g.putImageData(out, 0, 0);
+  return canvas;
 }
 
 const FONT = '"Arial Narrow", "Helvetica Neue", Impact, sans-serif';
@@ -953,39 +1126,511 @@ function makeLitterTexture() {
 }
 
 /**
- * Tileable galvanised chainlink with a real alpha cut-out. Only used when the
- * material library is unavailable — the library's version carries normal/rough
- * maps too — but it must still read as woven wire, never as a grey wall.
+ * Tileable galvanised chainlink with a real alpha cut-out, plus the matching
+ * height field for a normal map. Authored at 512 so the wire is several texels
+ * wide at level 0 — a two-texel wire is what turned the fence into a band of
+ * sparkle in the first place — and the galvanising is a mid grey, not white,
+ * so the fabric averages down to a haze at distance instead of a bright wall.
+ *
+ * Returns `{ color, height }` canvases.
  */
 function makeChainlinkTexture() {
-  const S = 256, T = 8;            // 8 diamonds per tile ~ 110 mm mesh
-  const { canvas, g } = canvas2d(S, S);
+  const S = 512, T = 8;            // 8 diamonds per tile ~ 110 mm mesh
+  const c = canvas2d(S, S), hgt = canvas2d(S, S);
+  const g = c.g, hg = hgt.g;
   g.clearRect(0, 0, S, S);
+  hg.fillStyle = '#000'; hg.fillRect(0, 0, S, S);
   const cell = S / T;
-  g.lineCap = 'square';
-  for (let pass = 0; pass < 2; pass++) {
-    // shadow pass first, then the lit wire, so the weave has depth
-    g.lineWidth = pass === 0 ? cell * 0.20 : cell * 0.13;
-    g.strokeStyle = pass === 0 ? 'rgba(28,30,32,0.85)' : 'rgba(196,201,205,1)';
-    const off = pass === 0 ? 1.5 : 0;
+
+  /** One diagonal family of wires. */
+  const weave = (ctxG, width, style, off, down) => {
+    ctxG.lineCap = 'round';
+    ctxG.lineWidth = width;
+    ctxG.strokeStyle = style;
     for (let i = -T; i <= T * 2; i++) {
-      g.beginPath();
-      g.moveTo(i * cell + off, -cell + off);
-      g.lineTo(i * cell + S + cell + off, S + off);
-      g.stroke();
-      g.beginPath();
-      g.moveTo(i * cell + off, S + cell + off);
-      g.lineTo(i * cell + S + cell + off, -off);
-      g.stroke();
+      ctxG.beginPath();
+      if (down) {
+        ctxG.moveTo(i * cell + off, -cell + off);
+        ctxG.lineTo(i * cell + S + cell + off, S + off);
+      } else {
+        ctxG.moveTo(i * cell + off, S + cell + off);
+        ctxG.lineTo(i * cell + S + cell + off, -off);
+      }
+      ctxG.stroke();
     }
+  };
+
+  // contact shadow under the weave, then the wire core, then the specular
+  // highlight down the middle of each wire: a round wire, not a flat ribbon.
+  for (const down of [true, false]) {
+    weave(g, cell * 0.185, 'rgba(24,26,28,0.9)', 2.4, down);
   }
-  // rust speckle along the wires
+  for (const down of [true, false]) {
+    weave(g, cell * 0.145, 'rgb(118,124,128)', 0, down);
+    weave(g, cell * 0.075, 'rgb(158,164,168)', -0.6, down);
+    weave(g, cell * 0.030, 'rgb(186,192,196)', -1.4, down);
+    weave(hg, cell * 0.150, 'rgb(90,90,90)', 0, down);
+    weave(hg, cell * 0.070, 'rgb(215,215,215)', -0.6, down);
+  }
+  // rust speckle and grime along the wires only
   g.globalCompositeOperation = 'source-atop';
-  for (let i = 0; i < 700; i++) {
-    g.fillStyle = `rgba(${randInt(90, 150)},${randInt(60, 95)},${randInt(35, 60)},${rand(0.05, 0.5)})`;
-    g.beginPath(); g.arc(rand(0, S), rand(0, S), rand(0.6, 2.6), 0, TAU); g.fill();
+  for (let i = 0; i < 2200; i++) {
+    g.fillStyle = `rgba(${randInt(84, 140)},${randInt(56, 92)},${randInt(32, 58)},${rand(0.05, 0.5)})`;
+    g.beginPath(); g.arc(rand(0, S), rand(0, S), rand(0.8, 3.2), 0, TAU); g.fill();
+  }
+  for (let i = 0; i < 900; i++) {
+    g.fillStyle = `rgba(40,42,44,${rand(0.04, 0.22)})`;
+    g.beginPath(); g.arc(rand(0, S), rand(0, S), rand(1.0, 4.5), 0, TAU); g.fill();
   }
   g.globalCompositeOperation = 'source-over';
+  return { color: c.canvas, height: hgt.canvas };
+}
+
+// ---------------------------------------------------------------------------
+// crowd wardrobe
+//
+// The spectators used to be flat vertex-colour boxes. They now sample a 4x4
+// atlas of garment swatches at ~730 px/m, with a normal map baked from the same
+// weave, so a tee reads as knit, jeans read as denim and a face reads as a
+// face. Instances pick their own atlas column for the top and the bottom, so
+// one geometry still covers a whole crowd of different outfits.
+//
+// Cell grid (column, row), row 0 at the TOP of the canvas:
+//   (0..3, 0)  tops:    plain jersey / printed tee / stripe tee / hoodie
+//   (0..3, 1)  bottoms: denim / canvas / track pant / (3) sleeve knit
+//   (0..3, 2)  head:    skin / face / hair / cap
+//   (0..3, 3)  misc:    shoe / dark fabric / beanie / bag canvas
+// ---------------------------------------------------------------------------
+
+const CROWD_CELL = 256;
+const CROWD_ATLAS = 4;
+
+function makeCrowdAtlas() {
+  const S = CROWD_CELL * CROWD_ATLAS;
+  const col = canvas2d(S, S), hei = canvas2d(S, S);
+  const g = col.g, hg = hei.g;
+  g.fillStyle = '#ffffff'; g.fillRect(0, 0, S, S);
+  hg.fillStyle = '#808080'; hg.fillRect(0, 0, S, S);
+
+  /** Run `fn(g, hg, x, y, C)` clipped to cell (cx, cy). */
+  const cell = (cx, cy, fn) => {
+    const C = CROWD_CELL, x = cx * C, y = cy * C;
+    g.save(); hg.save();
+    g.beginPath(); g.rect(x, y, C, C); g.clip();
+    hg.beginPath(); hg.rect(x, y, C, C); hg.clip();
+    g.translate(x, y); hg.translate(x, y);
+    fn(g, hg, C);
+    g.restore(); hg.restore();
+  };
+
+  /** Knit weave: fine crossing threads plus a slack fold gradient. */
+  const knit = (gg, hh, C, base, pitch, contrast) => {
+    gg.fillStyle = base; gg.fillRect(0, 0, C, C);
+    hh.fillStyle = '#7a7a7a'; hh.fillRect(0, 0, C, C);
+    gg.lineWidth = pitch * 0.42;
+    hh.lineWidth = pitch * 0.42;
+    for (let i = -1; i * pitch < C + pitch; i++) {
+      const yy = i * pitch;
+      gg.strokeStyle = `rgba(255,255,255,${contrast})`;
+      gg.beginPath(); gg.moveTo(0, yy); gg.lineTo(C, yy + pitch * 0.5); gg.stroke();
+      gg.strokeStyle = `rgba(0,0,0,${contrast * 1.15})`;
+      gg.beginPath(); gg.moveTo(0, yy + pitch * 0.5); gg.lineTo(C, yy + pitch); gg.stroke();
+      hh.strokeStyle = 'rgba(255,255,255,0.5)';
+      hh.beginPath(); hh.moveTo(0, yy); hh.lineTo(C, yy + pitch * 0.5); hh.stroke();
+      hh.strokeStyle = 'rgba(0,0,0,0.5)';
+      hh.beginPath(); hh.moveTo(0, yy + pitch * 0.5); hh.lineTo(C, yy + pitch); hh.stroke();
+    }
+    // soft folds — the value break that stops a torso reading as one fill
+    for (let i = 0; i < 9; i++) {
+      const fx = rand(-C * 0.1, C * 1.1), fw = rand(C * 0.10, C * 0.34);
+      const grad = gg.createLinearGradient(fx, 0, fx + fw, 0);
+      grad.addColorStop(0, 'rgba(0,0,0,0)');
+      grad.addColorStop(0.5, `rgba(0,0,0,${rand(0.08, 0.20)})`);
+      grad.addColorStop(1, 'rgba(255,255,255,0.05)');
+      gg.fillStyle = grad; gg.fillRect(fx, 0, fw, C);
+      const hgrad = hh.createLinearGradient(fx, 0, fx + fw, 0);
+      hgrad.addColorStop(0, 'rgba(128,128,128,0)');
+      hgrad.addColorStop(0.5, 'rgba(0,0,0,0.30)');
+      hgrad.addColorStop(1, 'rgba(255,255,255,0.22)');
+      hh.fillStyle = hgrad; hh.fillRect(fx, 0, fw, C);
+    }
+    // grubby hem
+    const hem = gg.createLinearGradient(0, C * 0.72, 0, C);
+    hem.addColorStop(0, 'rgba(50,44,36,0)');
+    hem.addColorStop(1, 'rgba(50,44,36,0.20)');
+    gg.fillStyle = hem; gg.fillRect(0, C * 0.72, C, C * 0.28);
+  };
+
+  // --- row 0: tops ---------------------------------------------------------
+  cell(0, 0, (gg, hh, C) => knit(gg, hh, C, '#e6e6e6', 7, 0.055));
+  cell(1, 0, (gg, hh, C) => {
+    knit(gg, hh, C, '#e6e6e6', 7, 0.055);
+    // invented screen print — a wheel mark and a wordmark, never a real brand
+    gg.save(); gg.translate(C * 0.5, C * 0.46);
+    gg.strokeStyle = 'rgba(28,26,30,0.82)'; gg.lineWidth = C * 0.030;
+    gg.beginPath(); gg.arc(0, 0, C * 0.20, 0, TAU); gg.stroke();
+    gg.lineWidth = C * 0.016;
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * TAU;
+      gg.beginPath();
+      gg.moveTo(Math.cos(a) * C * 0.05, Math.sin(a) * C * 0.05);
+      gg.lineTo(Math.cos(a) * C * 0.185, Math.sin(a) * C * 0.185);
+      gg.stroke();
+    }
+    gg.fillStyle = 'rgba(28,26,30,0.86)';
+    fitText(gg, 'LOT 14', 0, C * 0.30, C * 0.66, C * 0.13);
+    gg.restore();
+    hh.fillStyle = 'rgba(255,255,255,0.12)';
+    hh.beginPath(); hh.arc(C * 0.5, C * 0.46, C * 0.21, 0, TAU); hh.fill();
+  });
+  cell(2, 0, (gg, hh, C) => {
+    knit(gg, hh, C, '#e6e6e6', 7, 0.055);
+    for (let i = 0; i < 7; i++) {
+      gg.fillStyle = `rgba(24,22,26,${0.20 + (i % 2) * 0.06})`;
+      gg.fillRect(0, i * C * 0.145 + C * 0.02, C, C * 0.058);
+    }
+  });
+  cell(3, 0, (gg, hh, C) => {
+    knit(gg, hh, C, '#dcdcdc', 11, 0.075);
+    // hoodie: kangaroo pocket seam and a drawcord
+    gg.strokeStyle = 'rgba(20,18,22,0.30)'; gg.lineWidth = C * 0.012;
+    gg.beginPath(); gg.moveTo(C * 0.16, C * 0.62); gg.lineTo(C * 0.84, C * 0.62); gg.stroke();
+    hh.strokeStyle = 'rgba(0,0,0,0.55)'; hh.lineWidth = C * 0.014;
+    hh.beginPath(); hh.moveTo(C * 0.16, C * 0.62); hh.lineTo(C * 0.84, C * 0.62); hh.stroke();
+    gg.strokeStyle = 'rgba(245,242,235,0.85)'; gg.lineWidth = C * 0.020;
+    gg.beginPath(); gg.moveTo(C * 0.42, C * 0.05); gg.lineTo(C * 0.44, C * 0.30); gg.stroke();
+    gg.beginPath(); gg.moveTo(C * 0.58, C * 0.05); gg.lineTo(C * 0.56, C * 0.26); gg.stroke();
+  });
+
+  // --- row 1: bottoms + sleeve --------------------------------------------
+  cell(0, 1, (gg, hh, C) => {
+    // denim: twill diagonal, a leg seam, knee fade
+    gg.fillStyle = '#dedede'; gg.fillRect(0, 0, C, C);
+    hh.fillStyle = '#787878'; hh.fillRect(0, 0, C, C);
+    gg.lineWidth = 2.2; hh.lineWidth = 2.2;
+    for (let i = -C; i < C * 2; i += 5) {
+      gg.strokeStyle = `rgba(255,255,255,${rand(0.05, 0.12)})`;
+      gg.beginPath(); gg.moveTo(i, 0); gg.lineTo(i + C, C); gg.stroke();
+      gg.strokeStyle = `rgba(0,0,0,${rand(0.05, 0.12)})`;
+      gg.beginPath(); gg.moveTo(i + 2.5, 0); gg.lineTo(i + 2.5 + C, C); gg.stroke();
+      hh.strokeStyle = `rgba(255,255,255,${rand(0.10, 0.26)})`;
+      hh.beginPath(); hh.moveTo(i, 0); hh.lineTo(i + C, C); hh.stroke();
+    }
+    // outseam with topstitching
+    for (const sx of [C * 0.10, C * 0.90]) {
+      gg.strokeStyle = 'rgba(20,20,24,0.34)'; gg.lineWidth = C * 0.020;
+      gg.beginPath(); gg.moveTo(sx, 0); gg.lineTo(sx, C); gg.stroke();
+      gg.strokeStyle = 'rgba(226,206,150,0.55)'; gg.lineWidth = C * 0.007;
+      gg.setLineDash([5, 4]);
+      gg.beginPath(); gg.moveTo(sx + C * 0.016, 0); gg.lineTo(sx + C * 0.016, C); gg.stroke();
+      gg.setLineDash([]);
+      hh.strokeStyle = 'rgba(0,0,0,0.6)'; hh.lineWidth = C * 0.022;
+      hh.beginPath(); hh.moveTo(sx, 0); hh.lineTo(sx, C); hh.stroke();
+    }
+    // knee/seat fade
+    const fade = gg.createRadialGradient(C * 0.5, C * 0.42, 0, C * 0.5, C * 0.42, C * 0.42);
+    fade.addColorStop(0, 'rgba(255,255,255,0.20)');
+    fade.addColorStop(1, 'rgba(255,255,255,0)');
+    gg.fillStyle = fade; gg.fillRect(0, 0, C, C);
+  });
+  cell(1, 1, (gg, hh, C) => {
+    knit(gg, hh, C, '#d8d8d8', 5, 0.045);
+    // cargo pocket
+    gg.strokeStyle = 'rgba(30,28,26,0.30)'; gg.lineWidth = C * 0.012;
+    gg.strokeRect(C * 0.24, C * 0.36, C * 0.34, C * 0.28);
+    hh.strokeStyle = 'rgba(0,0,0,0.5)'; hh.lineWidth = C * 0.014;
+    hh.strokeRect(C * 0.24, C * 0.36, C * 0.34, C * 0.28);
+  });
+  cell(2, 1, (gg, hh, C) => {
+    knit(gg, hh, C, '#d0d0d0', 4, 0.04);
+    gg.fillStyle = 'rgba(248,246,240,0.75)';
+    gg.fillRect(C * 0.08, 0, C * 0.035, C);
+    gg.fillStyle = 'rgba(24,22,26,0.30)';
+    gg.fillRect(C * 0.125, 0, C * 0.018, C);
+  });
+  cell(3, 1, (gg, hh, C) => {
+    // sleeve: same knit, ribbed cuff at the bottom
+    knit(gg, hh, C, '#dadada', 6, 0.06);
+    for (let i = 0; i < 14; i++) {
+      gg.fillStyle = `rgba(0,0,0,${0.05 + (i % 2) * 0.05})`;
+      gg.fillRect(i * C / 14, C * 0.82, C / 28, C * 0.18);
+      hh.fillStyle = `rgba(${i % 2 ? 220 : 40},${i % 2 ? 220 : 40},${i % 2 ? 220 : 40},0.6)`;
+      hh.fillRect(i * C / 14, C * 0.82, C / 28, C * 0.18);
+    }
+  });
+
+  // --- row 2: head ---------------------------------------------------------
+  const skinBase = (gg, hh, C) => {
+    gg.fillStyle = '#e8ded6'; gg.fillRect(0, 0, C, C);
+    hh.fillStyle = '#808080'; hh.fillRect(0, 0, C, C);
+    for (let i = 0; i < 500; i++) {
+      gg.fillStyle = `rgba(${randInt(150, 210)},${randInt(120, 170)},${randInt(110, 150)},${rand(0.03, 0.12)})`;
+      gg.beginPath(); gg.arc(rand(0, C), rand(0, C), rand(1, 5), 0, TAU); gg.fill();
+    }
+  };
+  cell(0, 2, skinBase);
+  cell(1, 2, (gg, hh, C) => {
+    skinBase(gg, hh, C);
+    // The head is a lat-long sphere: u = 0.25 faces +Z, so the features go a
+    // quarter of the way across the cell and just above the middle.
+    const fx = C * 0.25;
+    const brow = C * 0.42, eye = C * 0.46, mouth = C * 0.62;
+    gg.fillStyle = 'rgba(60,44,34,0.72)';
+    for (const s of [-1, 1]) {
+      gg.beginPath();
+      gg.ellipse(fx + s * C * 0.058, eye, C * 0.030, C * 0.016, 0, 0, TAU);
+      gg.fill();
+    }
+    gg.fillStyle = 'rgba(18,16,18,0.85)';
+    for (const s of [-1, 1]) {
+      gg.beginPath();
+      gg.ellipse(fx + s * C * 0.058, eye, C * 0.013, C * 0.012, 0, 0, TAU);
+      gg.fill();
+    }
+    gg.strokeStyle = 'rgba(52,38,30,0.65)'; gg.lineWidth = C * 0.016; gg.lineCap = 'round';
+    for (const s of [-1, 1]) {
+      gg.beginPath();
+      gg.moveTo(fx + s * C * 0.030, brow);
+      gg.lineTo(fx + s * C * 0.088, brow - C * 0.008);
+      gg.stroke();
+    }
+    // nose shadow + mouth
+    gg.strokeStyle = 'rgba(120,88,70,0.45)'; gg.lineWidth = C * 0.012;
+    gg.beginPath(); gg.moveTo(fx, eye + C * 0.02); gg.lineTo(fx - C * 0.012, mouth - C * 0.045); gg.stroke();
+    gg.strokeStyle = 'rgba(110,64,58,0.60)'; gg.lineWidth = C * 0.014;
+    gg.beginPath();
+    gg.moveTo(fx - C * 0.038, mouth);
+    gg.quadraticCurveTo(fx, mouth + C * 0.018, fx + C * 0.038, mouth);
+    gg.stroke();
+    hh.strokeStyle = 'rgba(40,40,40,0.6)'; hh.lineWidth = C * 0.02;
+    hh.beginPath();
+    hh.moveTo(fx - C * 0.038, mouth);
+    hh.quadraticCurveTo(fx, mouth + C * 0.018, fx + C * 0.038, mouth);
+    hh.stroke();
+  });
+  cell(2, 2, (gg, hh, C) => {
+    gg.fillStyle = '#dcdcdc'; gg.fillRect(0, 0, C, C);
+    hh.fillStyle = '#6e6e6e'; hh.fillRect(0, 0, C, C);
+    gg.lineCap = 'round'; hh.lineCap = 'round';
+    for (let i = 0; i < 260; i++) {
+      const x0 = rand(0, C), y0 = rand(-C * 0.1, C);
+      const l = rand(C * 0.10, C * 0.45), a = rand(1.1, 2.1);
+      gg.strokeStyle = rng() < 0.5 ? `rgba(255,255,255,${rand(0.05, 0.16)})` : `rgba(0,0,0,${rand(0.08, 0.24)})`;
+      gg.lineWidth = rand(1.5, 4);
+      gg.beginPath();
+      gg.moveTo(x0, y0);
+      gg.quadraticCurveTo(x0 + Math.cos(a) * l * 0.4, y0 + Math.sin(a) * l * 0.4,
+        x0 + Math.cos(a) * l, y0 + Math.sin(a) * l);
+      gg.stroke();
+      hh.strokeStyle = `rgba(${rng() < 0.5 ? 230 : 30},${rng() < 0.5 ? 230 : 30},${128},0.45)`;
+      hh.lineWidth = gg.lineWidth;
+      hh.beginPath();
+      hh.moveTo(x0, y0);
+      hh.quadraticCurveTo(x0 + Math.cos(a) * l * 0.4, y0 + Math.sin(a) * l * 0.4,
+        x0 + Math.cos(a) * l, y0 + Math.sin(a) * l);
+      hh.stroke();
+    }
+  });
+  cell(3, 2, (gg, hh, C) => {
+    // six-panel cap: crown seams, a top button, a stitched brim edge
+    gg.fillStyle = '#dedede'; gg.fillRect(0, 0, C, C);
+    hh.fillStyle = '#8a8a8a'; hh.fillRect(0, 0, C, C);
+    gg.strokeStyle = 'rgba(20,18,22,0.34)'; gg.lineWidth = C * 0.014;
+    hh.strokeStyle = 'rgba(0,0,0,0.55)'; hh.lineWidth = C * 0.016;
+    for (let i = 0; i < 6; i++) {
+      const x = (i + 0.5) * C / 6;
+      gg.beginPath(); gg.moveTo(x, 0); gg.lineTo(x, C); gg.stroke();
+      hh.beginPath(); hh.moveTo(x, 0); hh.lineTo(x, C); hh.stroke();
+    }
+    gg.fillStyle = 'rgba(250,248,242,0.55)';
+    gg.fillRect(0, C * 0.06, C, C * 0.02);
+    // sweat/dust at the band
+    const band = gg.createLinearGradient(0, C * 0.70, 0, C);
+    band.addColorStop(0, 'rgba(60,52,42,0)');
+    band.addColorStop(1, 'rgba(60,52,42,0.30)');
+    gg.fillStyle = band; gg.fillRect(0, C * 0.70, C, C * 0.30);
+  });
+
+  // --- row 3: misc ---------------------------------------------------------
+  cell(0, 3, (gg, hh, C) => {
+    gg.fillStyle = '#cfcfcf'; gg.fillRect(0, 0, C, C);
+    hh.fillStyle = '#808080'; hh.fillRect(0, 0, C, C);
+    // sole band + laces
+    gg.fillStyle = 'rgba(238,236,228,0.95)'; gg.fillRect(0, C * 0.74, C, C * 0.26);
+    gg.fillStyle = 'rgba(30,28,30,0.45)'; gg.fillRect(0, C * 0.90, C, C * 0.10);
+    hh.fillStyle = 'rgba(220,220,220,0.7)'; hh.fillRect(0, C * 0.74, C, C * 0.26);
+    gg.strokeStyle = 'rgba(240,238,230,0.8)'; gg.lineWidth = C * 0.020;
+    for (let i = 0; i < 4; i++) {
+      gg.beginPath();
+      gg.moveTo(C * 0.28, C * (0.16 + i * 0.13));
+      gg.lineTo(C * 0.72, C * (0.22 + i * 0.13));
+      gg.stroke();
+    }
+  });
+  cell(1, 3, (gg, hh, C) => knit(gg, hh, C, '#bcbcbc', 6, 0.05));
+  cell(2, 3, (gg, hh, C) => {
+    // ribbed beanie
+    gg.fillStyle = '#d6d6d6'; gg.fillRect(0, 0, C, C);
+    hh.fillStyle = '#808080'; hh.fillRect(0, 0, C, C);
+    for (let i = 0; i < 20; i++) {
+      const x = i * C / 20;
+      gg.fillStyle = `rgba(0,0,0,${i % 2 ? 0.10 : 0.03})`;
+      gg.fillRect(x, 0, C / 40, C);
+      hh.fillStyle = `rgba(${i % 2 ? 40 : 220},${i % 2 ? 40 : 220},128,0.55)`;
+      hh.fillRect(x, 0, C / 40, C);
+    }
+    gg.fillStyle = 'rgba(0,0,0,0.10)'; gg.fillRect(0, C * 0.74, C, C * 0.26);
+  });
+  cell(3, 3, (gg, hh, C) => knit(gg, hh, C, '#c6c6c6', 9, 0.06));
+
+  return { color: col.canvas, height: hei.canvas };
+}
+
+// ---------------------------------------------------------------------------
+// other surface textures added for the art pass
+// ---------------------------------------------------------------------------
+
+/** Sawn softwood: grain lines, knots, weathering. Tileable, ~1 m per tile. */
+function makeWoodTexture() {
+  const S = 512;
+  const c = canvas2d(S, S), hei = canvas2d(S, S);
+  const g = c.g, hg = hei.g;
+  g.fillStyle = '#8a6a44'; g.fillRect(0, 0, S, S);
+  hg.fillStyle = '#8c8c8c'; hg.fillRect(0, 0, S, S);
+  // broad colour banding across the board
+  for (let i = 0; i < 26; i++) {
+    const y = rand(0, S), h = rand(4, 26);
+    g.fillStyle = `rgba(${randInt(88, 150)},${randInt(62, 108)},${randInt(36, 72)},${rand(0.10, 0.30)})`;
+    g.fillRect(0, y, S, h);
+  }
+  // grain lines — long, slightly wandering, running along the board
+  g.lineCap = 'round'; hg.lineCap = 'round';
+  for (let i = 0; i < 300; i++) {
+    const y = rand(-8, S + 8);
+    const amp = rand(1.5, 7), ph = rand(0, TAU), freq = rand(0.008, 0.03);
+    const dark = rng() < 0.55;
+    g.strokeStyle = dark
+      ? `rgba(${randInt(52, 92)},${randInt(34, 62)},${randInt(20, 40)},${rand(0.10, 0.45)})`
+      : `rgba(${randInt(170, 215)},${randInt(140, 180)},${randInt(100, 140)},${rand(0.06, 0.22)})`;
+    g.lineWidth = rand(0.8, 2.8);
+    hg.strokeStyle = dark ? `rgba(40,40,40,${rand(0.25, 0.6)})` : `rgba(220,220,220,${rand(0.15, 0.4)})`;
+    hg.lineWidth = g.lineWidth;
+    g.beginPath(); hg.beginPath();
+    for (let x = 0; x <= S; x += 8) {
+      const yy = y + Math.sin(x * freq + ph) * amp;
+      if (x === 0) { g.moveTo(x, yy); hg.moveTo(x, yy); } else { g.lineTo(x, yy); hg.lineTo(x, yy); }
+    }
+    g.stroke(); hg.stroke();
+  }
+  // knots
+  for (let i = 0; i < 5; i++) {
+    const kx = rand(0, S), ky = rand(0, S), kr = rand(6, 17);
+    for (let r = kr; r > 0; r -= 1.6) {
+      g.strokeStyle = `rgba(${randInt(60, 96)},${randInt(40, 64)},${randInt(24, 44)},0.5)`;
+      g.lineWidth = 1.4;
+      g.beginPath(); g.ellipse(kx, ky, r, r * 0.62, 0.4, 0, TAU); g.stroke();
+      hg.strokeStyle = 'rgba(60,60,60,0.4)'; hg.lineWidth = 1.4;
+      hg.beginPath(); hg.ellipse(kx, ky, r, r * 0.62, 0.4, 0, TAU); hg.stroke();
+    }
+  }
+  // splits and weathering
+  for (let i = 0; i < 40; i++) {
+    g.strokeStyle = `rgba(38,28,20,${rand(0.15, 0.4)})`;
+    g.lineWidth = rand(0.6, 1.8);
+    const sx = rand(0, S), sy = rand(0, S), l = rand(20, 110);
+    g.beginPath(); g.moveTo(sx, sy); g.lineTo(sx + l, sy + rand(-3, 3)); g.stroke();
+  }
+  weather(g, 0, 0, S, S, 0.5);
+  return { color: c.canvas, height: hei.canvas };
+}
+
+/** One-sided grime gradient used along tread/riser junctions and kerb lines. */
+function makeGrimeTexture() {
+  const W = 256, H = 128;
+  const { canvas, g } = canvas2d(W, H);
+  g.clearRect(0, 0, W, H);
+  const grad = g.createLinearGradient(0, H, 0, 0);
+  grad.addColorStop(0.00, 'rgba(34,30,24,0.85)');
+  grad.addColorStop(0.35, 'rgba(44,39,31,0.42)');
+  grad.addColorStop(0.75, 'rgba(52,46,37,0.12)');
+  grad.addColorStop(1.00, 'rgba(52,46,37,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, W, H);
+  // break the straight edge up so it never reads as a painted line
+  g.globalCompositeOperation = 'destination-out';
+  for (let i = 0; i < 220; i++) {
+    g.fillStyle = `rgba(0,0,0,${rand(0.10, 0.55)})`;
+    g.beginPath();
+    g.ellipse(rand(0, W), rand(0, H * 0.95), rand(3, 22), rand(2, 12), rand(0, Math.PI), 0, TAU);
+    g.fill();
+  }
+  g.globalCompositeOperation = 'source-over';
+  for (let i = 0; i < 90; i++) {
+    g.fillStyle = `rgba(${randInt(20, 60)},${randInt(18, 52)},${randInt(14, 40)},${rand(0.08, 0.3)})`;
+    g.beginPath();
+    g.ellipse(rand(0, W), rand(H * 0.55, H), rand(2, 10), rand(1.5, 6), 0, 0, TAU);
+    g.fill();
+  }
+  return canvas;
+}
+
+/**
+ * A city seen from the air: blocks, roof plant, streets and lot markings. Used
+ * on the far ground so the sprawl the skyline stands on reads as ground rather
+ * than as a second patch of sky.
+ */
+function makeCityFloorTexture() {
+  const S = 512;
+  const { canvas, g } = canvas2d(S, S);
+  g.fillStyle = '#4c4a45'; g.fillRect(0, 0, S, S);
+  // asphalt mottle
+  for (let i = 0; i < 900; i++) {
+    g.fillStyle = `rgba(${randInt(52, 96)},${randInt(50, 92)},${randInt(46, 86)},${rand(0.05, 0.22)})`;
+    g.beginPath(); g.ellipse(rand(0, S), rand(0, S), rand(4, 34), rand(3, 22), rand(0, Math.PI), 0, TAU); g.fill();
+  }
+  // street grid — two pitches so it never reads as graph paper
+  const street = (x, y, w, h) => {
+    g.fillStyle = 'rgba(36,35,33,0.85)';
+    g.fillRect(x, y, w, h);
+    g.fillStyle = 'rgba(178,172,150,0.30)';
+    if (w > h) g.fillRect(x, y + h * 0.5 - 0.7, w, 1.4);
+    else g.fillRect(x + w * 0.5 - 0.7, y, 1.4, h);
+  };
+  for (let i = 0; i < 4; i++) street(0, i * S / 4 + 6, S, 11);
+  for (let i = 0; i < 4; i++) street(i * S / 4 + 22, 0, 9, S);
+  // roof blocks in each city block
+  for (let by = 0; by < 4; by++) {
+    for (let bx = 0; bx < 4; bx++) {
+      const x0 = bx * S / 4 + 33, y0 = by * S / 4 + 19;
+      const w0 = S / 4 - 42, h0 = S / 4 - 42;
+      let x = x0;
+      while (x < x0 + w0 - 8) {
+        const w = Math.min(rand(14, 40), x0 + w0 - x);
+        let y = y0;
+        while (y < y0 + h0 - 8) {
+          const h = Math.min(rand(14, 38), y0 + h0 - y);
+          const v = randInt(64, 126);
+          g.fillStyle = `rgb(${v},${(v * 0.97) | 0},${(v * 0.90) | 0})`;
+          g.fillRect(x + 1, y + 1, w - 2.5, h - 2.5);
+          g.fillStyle = 'rgba(0,0,0,0.28)';
+          g.fillRect(x + w - 3.5, y + 1, 2.5, h - 2.5);
+          g.fillRect(x + 1, y + h - 3.5, w - 2.5, 2.5);
+          // roof plant / a parked-car row on the flat lots
+          if (rng() < 0.5) {
+            g.fillStyle = `rgba(${randInt(40, 80)},${randInt(40, 80)},${randInt(40, 80)},0.7)`;
+            g.fillRect(x + rand(3, w * 0.5), y + rand(3, h * 0.5), rand(3, 9), rand(3, 9));
+          }
+          y += h;
+        }
+        x += w;
+      }
+      // a green lot now and then
+      if (rng() < 0.22) {
+        g.fillStyle = `rgba(${randInt(58, 88)},${randInt(74, 104)},${randInt(46, 66)},0.85)`;
+        g.fillRect(x0 + rand(0, w0 * 0.4), y0 + rand(0, h0 * 0.4), rand(20, 44), rand(20, 44));
+      }
+    }
+  }
   return canvas;
 }
 
@@ -1055,23 +1700,43 @@ export function createProps(ctx) {
     return own(m);
   }
 
-  /** Library chainlink if it exists, otherwise a self-built alpha-cut weave. */
+  /**
+   * The perimeter fence fabric.
+   *
+   * This deliberately does NOT take the material library's `chainlink`: that
+   * map is built with automatic mipmaps, which is exactly what made the fence
+   * shimmer with coloured speckles along its whole run in three separate
+   * frames. The weave here goes through `makeCutoutTex` so the transparent
+   * texels carry wire colour and every mip level keeps the same open area, and
+   * anisotropy is forced up regardless of the quality tier.
+   */
   function chainlinkMaterial() {
-    if (lib && typeof lib.has === 'function' && lib.has('chainlink')) return lib.get('chainlink');
-    const t = ownTex(makeTex(makeChainlinkTexture(), {
-      aniso, wrap: THREE.RepeatWrapping, repeat: [1 / 0.9, 1 / 0.9],
+    const src = makeChainlinkTexture();
+    const rep = [1 / 0.9, 1 / 0.9];
+    const t = ownTex(makeCutoutTex(src.color, {
+      alphaTest: FENCE_CUT, aniso, wrap: THREE.RepeatWrapping, repeat: rep,
+    }));
+    // the normal map has to be cut by the same alpha or the wire lights up
+    // where there is no wire, so it is built from the weave's own height field
+    const nrm = ownTex(makeCutoutTex(normalFromHeight(src.height, 2.6), {
+      alphaTest: 0.0, aniso, wrap: THREE.RepeatWrapping, repeat: rep, srgb: false, dilate: 0,
     }));
     const m = new THREE.MeshStandardMaterial({
       name: 'props_chainlink',
       map: t,
-      alphaTest: 0.42,
+      normalMap: nrm,
+      normalScale: new THREE.Vector2(0.7, 0.7),
+      alphaTest: FENCE_CUT,
       transparent: false,
       side: THREE.DoubleSide,
       shadowSide: THREE.DoubleSide,
-      roughness: 0.58,
-      metalness: 0.55,
-      envMapIntensity: 1.1,
+      roughness: 0.62,
+      metalness: 0.85,
+      envMapIntensity: 0.95,
     });
+    // Free anti-aliasing on the cut-out wherever the target is multisampled;
+    // a no-op (not an error) when it is not.
+    m.alphaToCoverage = true;
     return own(m);
   }
 
@@ -1100,15 +1765,19 @@ export function createProps(ctx) {
 
   // --- procedural textures + the materials that need them ------------------
   const bannerTex = ownTex(makeTex(makeBannerAtlas(), { aniso }));
-  const leafTex = ownTex(makeTex(makeLeafTexture(), { aniso }));
-  const palmTex = ownTex(makeTex(makePalmTexture(), { aniso }));
-  const weedTex = ownTex(makeTex(makeWeedTexture(), { aniso }));
+  // Every alpha-tested map goes through makeCutoutTex: dilated albedo plus a
+  // coverage-preserving mip chain, which is what kills the coloured sparkle
+  // along leaf and wire edges.
+  const leafTex = ownTex(makeCutoutTex(makeLeafTexture(), { alphaTest: LEAF_CUT, aniso }));
+  const palmTex = ownTex(makeCutoutTex(makePalmTexture(), { alphaTest: PALM_CUT, aniso }));
+  const weedTex = ownTex(makeCutoutTex(makeWeedTexture(), { alphaTest: WEED_CUT, aniso }));
   const graffitiTex = ownTex(makeTex(makeGraffitiTexture(), { aniso }));
   const coneTex = ownTex(makeTex(makeConeTexture(), { aniso, wrap: THREE.RepeatWrapping }));
   const dustTex = ownTex(makeTex(makeDustTexture(), { aniso }));
   const skidTex = ownTex(makeTex(makeSkidTexture(), { aniso }));
-  const litterTex = ownTex(makeTex(makeLitterTexture(), { aniso }));
+  const litterTex = ownTex(makeCutoutTex(makeLitterTexture(), { alphaTest: LITTER_CUT, aniso }));
   const distantTex = ownTex(makeTex(makeDistantCityTexture(), { aniso, wrap: THREE.RepeatWrapping, repeat: [3, 1] }));
+  const grimeTex = ownTex(makeTex(makeGrimeTexture(), { aniso }));
 
   // ---------------------------------------------------------------------
   // Aerial perspective for the backdrop.
@@ -1233,12 +1902,13 @@ export function createProps(ctx) {
   const foliageMat = own(new THREE.MeshStandardMaterial({
     name: 'props_foliage',
     map: leafTex,
-    alphaTest: 0.42,
+    alphaTest: LEAF_CUT,
     side: THREE.DoubleSide,
     roughness: 0.88,
     metalness: 0,
     envMapIntensity: 0.9,
   }));
+  foliageMat.alphaToCoverage = true;
   patchVertex(foliageMat, windU, /* glsl */`
     uniform float uTime;
     uniform vec2 uWind;
@@ -1259,11 +1929,12 @@ export function createProps(ctx) {
   const weedMat = own(new THREE.MeshStandardMaterial({
     name: 'props_weeds',
     map: weedTex,
-    alphaTest: 0.4,
+    alphaTest: WEED_CUT,
     side: THREE.DoubleSide,
     roughness: 0.95,
     metalness: 0,
   }));
+  weedMat.alphaToCoverage = true;
   patchVertex(weedMat, windU, /* glsl */`
     uniform float uTime;
     attribute float aWind;
@@ -1286,12 +1957,13 @@ export function createProps(ctx) {
   const palmMat = own(new THREE.MeshStandardMaterial({
     name: 'props_palm',
     map: palmTex,
-    alphaTest: 0.34,
+    alphaTest: PALM_CUT,
     side: THREE.DoubleSide,
     roughness: 0.84,
     metalness: 0,
     envMapIntensity: 0.9,
   }));
+  palmMat.alphaToCoverage = true;
   patchVertex(palmMat, windU, /* glsl */`
     uniform float uTime;
     uniform vec2 uWind;
@@ -1333,8 +2005,9 @@ export function createProps(ctx) {
   const dustMat = own(new THREE.MeshStandardMaterial({ name: 'props_dust', map: dustTex, opacity: 0.95, ...decalBase }));
   const skidMat = own(new THREE.MeshStandardMaterial({ name: 'props_skid', map: skidTex, opacity: 0.95, ...decalBase }));
   const litterMat = own(new THREE.MeshStandardMaterial({
-    name: 'props_litter', map: litterTex, alphaTest: 0.35, side: THREE.DoubleSide, roughness: 0.92, metalness: 0,
+    name: 'props_litter', map: litterTex, alphaTest: LITTER_CUT, side: THREE.DoubleSide, roughness: 0.92, metalness: 0,
   }));
+  litterMat.alphaToCoverage = true;
   // per-instance atlas cell for the litter quads (2×2 atlas)
   litterMat.onBeforeCompile = (shader) => {
     shader.vertexShader = shader.vertexShader
@@ -1342,6 +2015,40 @@ export function createProps(ctx) {
       .replace('#include <uv_vertex>', '#include <uv_vertex>\n\tvMapUv = vMapUv * 0.5 + aCell;');
   };
   litterMat.customProgramCacheKey = () => 'props_litter_cell';
+
+  /** Dirt that collects where two surfaces meet — tread/riser, kerb, plinth. */
+  const grimeMat = own(new THREE.MeshStandardMaterial({
+    name: 'props_grime',
+    map: grimeTex,
+    transparent: true,
+    depthWrite: false,
+    opacity: 0.95,
+    roughness: 1,
+    metalness: 0,
+    polygonOffset: true,
+    polygonOffsetFactor: -5,
+    polygonOffsetUnits: -5,
+  }));
+
+  // --- sawn timber: benches, picnic tables, pallet slats -------------------
+  // The library's `wood` had no grain at this texel density, which is why the
+  // benches read as a single grey value. This one is authored at 512 over a
+  // 1 m tile (box UVs are already in metres) and carries its own normal map.
+  const woodSrc = makeWoodTexture();
+  const woodRep = [1, 1];
+  const benchWoodMat = own(new THREE.MeshStandardMaterial({
+    name: 'props_bench_wood',
+    map: ownTex(makeTex(woodSrc.color, { aniso, wrap: THREE.RepeatWrapping, repeat: woodRep })),
+    normalMap: ownTex(makeTex(normalFromHeight(woodSrc.height, 1.6), {
+      srgb: false, aniso, wrap: THREE.RepeatWrapping, repeat: woodRep,
+    })),
+    normalScale: new THREE.Vector2(0.85, 0.85),
+    vertexColors: true,
+    color: 0xffffff,
+    roughness: 0.86,
+    metalness: 0,
+    envMapIntensity: 0.7,
+  }));
 
   const lampMat = own(new THREE.MeshStandardMaterial({
     name: 'props_lamp',
@@ -1715,16 +2422,116 @@ export function createProps(ctx) {
   const BLEACH = { x: -LOT.hx + 6.0, z: 0, len: 18, tiers: 5, rise: 0.42, run: 0.80 };
   const seatRows = [];             // world-space seat lines for the crowd
 
+  /** Vertex-darken a slat toward its sawn ends — end grain drinks the stain. */
+  function endGrain(g, amount = 0.42, half = null) {
+    const p = g.attributes.position;
+    if (!g.attributes.color) tintGeo(g, 0xffffff);
+    const c = g.attributes.color;
+    let hx = half;
+    if (hx == null) {
+      hx = 0;
+      for (let i = 0; i < p.count; i++) hx = Math.max(hx, Math.abs(p.getX(i)));
+    }
+    for (let i = 0; i < p.count; i++) {
+      const t = clamp((Math.abs(p.getX(i)) - hx * 0.90) / (hx * 0.10 + 1e-4), 0, 1);
+      const s = 1 - t * amount;
+      c.setXYZ(i, c.getX(i) * s, c.getY(i) * s, c.getZ(i) * s);
+    }
+    return g;
+  }
+
+  /** A slat of sawn timber: metre UVs, per-piece tone, darkened end grain. */
+  function slat(w, h, d, tone = 1) {
+    const g = box(w, h, d);
+    tintGeo(g, 0xffffff);
+    const c = g.attributes.color;
+    const t = tone * rand(0.86, 1.10);
+    for (let i = 0; i < c.count; i++) c.setXYZ(i, c.getX(i) * t, c.getY(i) * t, c.getZ(i) * t);
+    return endGrain(g, 0.40, w * 0.5);
+  }
+
+  /**
+   * Grime strips. The gradient texture is opaque along v = 0, so the helpers
+   * flip v to choose which edge the dirt collects against, and tile u along
+   * the run so the blotches never repeat visibly.
+   */
+  function grimeUV(g, lenU, flip) {
+    const uv = g.attributes.uv;
+    const rep = Math.max(1, Math.round(lenU / 2.2));
+    for (let i = 0; i < uv.count; i++) {
+      uv.setXY(i, uv.getX(i) * rep, flip ? 1 - uv.getY(i) : uv.getY(i));
+    }
+    return g;
+  }
+  /** Flat strip running along Z; dirt collects against the -X edge. */
+  function grimeTread(cx, y, cz, lenZ, depthX) {
+    const g = grimeUV(new THREE.PlaneGeometry(lenZ, depthX), lenZ, true);
+    lot.add(grimeMat, place(g, cx, y, cz, Math.PI * 0.5, -Math.PI * 0.5));
+  }
+  /** Vertical strip on a face looking down +X; dirt collects at its foot. */
+  function grimeRiser(cx, cy, cz, lenZ, height) {
+    const g = grimeUV(new THREE.PlaneGeometry(lenZ, height), lenZ, false);
+    lot.add(grimeMat, place(g, cx, cy, cz, Math.PI * 0.5));
+  }
+
+  /** Hex bolt head + washer, for slat-to-frame fixings. */
+  function bolt(x, y, z, ry = 0, rx = 0, r = 0.011) {
+    lot.add(MAT.galv, place(cyl(r * 1.9, r * 1.9, 0.004, 8), x, y, z, ry, rx));
+    lot.add(MAT.galv, place(cyl(r, r, 0.009, 6), x, y, z, ry, rx));
+  }
+
   {
     const b = BLEACH;
     for (let i = 0; i < b.tiers; i++) {
       const h = (i + 1) * b.rise;
       const x = b.x - i * b.run;
       lot.add(MAT.concrete, place(box(b.run, h, b.len), x, h * 0.5, b.z));
-      // worn nosing on every step edge
-      lot.add(MAT.concretePale, place(box(0.10, 0.05, b.len), x + b.run * 0.5 - 0.05, h - 0.02, b.z));
+
+      // --- precast nosing, chipped ----------------------------------------
+      // One continuous pale strip is what made these read as untouched grey
+      // castings. The nosing is now a run of short precast lengths with a
+      // handful of knocked-off corners and an exposed-aggregate scar behind
+      // each one, which is what a five-year-old concrete stand actually is.
+      const nx = x + b.run * 0.5 - 0.05;
+      const segs = Math.round(b.len / 1.5);
+      const segLen = b.len / segs;
+      for (let s = 0; s < segs; s++) {
+        const z0 = b.z - b.len * 0.5 + (s + 0.5) * segLen;
+        const chipped = rng() < 0.26;
+        const gap = 0.012;
+        if (!chipped) {
+          lot.add(MAT.concretePale,
+            place(box(0.10, 0.05, segLen - gap), nx, h - 0.02, z0));
+        } else {
+          // the corner is gone: the strip steps back and drops, and the break
+          // face is the darker aggregate underneath
+          const bite = rand(0.16, 0.42) * segLen;
+          const front = (segLen - gap - bite) * 0.5;
+          lot.add(MAT.concretePale,
+            place(box(0.10, 0.05, front), nx, h - 0.02, z0 - (segLen - gap) * 0.5 + front * 0.5));
+          lot.add(MAT.concretePale,
+            place(box(0.10, 0.05, front), nx, h - 0.02, z0 + (segLen - gap) * 0.5 - front * 0.5));
+          lot.add(MAT.concrete,
+            place(box(0.075, 0.036, bite), nx - 0.013, h - 0.030, z0, 0, 0, rand(-0.12, 0.12)));
+        }
+      }
+      // precast panel joints across the tread
+      for (let s = 1; s < segs; s++) {
+        const z0 = b.z - b.len * 0.5 + s * segLen;
+        lot.add(MAT.concrete, place(box(b.run * 0.92, 0.012, 0.018), x, h - 0.004, z0));
+      }
+      // dirt where the tread meets the riser behind it, and a wash down the
+      // riser face itself
+      grimeTread(x - b.run * 0.5 + 0.15, h + 0.004, b.z, b.len - 0.05, 0.30);
+      if (i < b.tiers - 1) {
+        grimeRiser(x - b.run * 0.5 + 0.006, h + 0.10, b.z, b.len - 0.05, 0.20);
+      }
+
       deckCollide.push(place(box(b.run, 0.12, b.len), x, h - 0.06, b.z));
-      seatRows.push({ x: x - 0.08, y: h, z: b.z, len: b.len });
+      // Seat line: 0.28 m back from the nosing, so a seated figure's thighs
+      // clear the edge and the feet land on the tread below instead of
+      // floating over the step they are sitting on.
+      seatRows.push({ x: x + 0.12, y: h, z: b.z, len: b.len, run: b.run, tier: i });
     }
     // side cheeks + a back wall so the stand reads as a solid casting
     const backX = b.x - b.tiers * b.run;
@@ -1749,15 +2556,24 @@ export function createProps(ctx) {
     lot.add(MAT.steelDark, place(box(1.7, 0.05, 0.08), x, 0.40, z, ry));
     for (let i = 0; i < 4; i++) {
       const off = -0.20 + i * 0.135;
-      const g = box(1.86, 0.055, 0.115);
+      const g = slat(1.86, 0.055, 0.115);
       place(g, x + Math.sin(ry) * off, 0.455, z + Math.cos(ry) * off, ry);
-      lot.add(MAT.wood, g);
+      lot.add(benchWoodMat, g);
+      // coach bolts through the slat into each end frame
+      for (const s of [-1, 1]) {
+        bolt(x + Math.cos(ry) * s * 0.80 + Math.sin(ry) * off, 0.485,
+          z - Math.sin(ry) * s * 0.80 + Math.cos(ry) * off, ry);
+      }
     }
     // backrest
     for (let i = 0; i < 3; i++) {
-      const g = box(1.86, 0.055, 0.12);
+      const g = slat(1.86, 0.055, 0.12);
       place(g, x + Math.sin(ry) * -0.28, 0.62 + i * 0.145, z + Math.cos(ry) * -0.28, ry, -0.22);
-      lot.add(MAT.wood, g);
+      lot.add(benchWoodMat, g);
+      for (const s of [-1, 1]) {
+        bolt(x + Math.cos(ry) * s * 0.80 + Math.sin(ry) * -0.315, 0.62 + i * 0.145,
+          z - Math.sin(ry) * s * 0.80 + Math.cos(ry) * -0.315, ry, Math.PI * 0.5);
+      }
     }
     lot.add(MAT.steelDark, place(box(0.06, 0.52, 0.06), x + Math.cos(ry) * 0.8 + Math.sin(ry) * -0.28, 0.66, z - Math.sin(ry) * 0.8 + Math.cos(ry) * -0.28, ry, -0.22));
     lot.add(MAT.steelDark, place(box(0.06, 0.52, 0.06), x - Math.cos(ry) * 0.8 + Math.sin(ry) * -0.28, 0.66, z + Math.sin(ry) * 0.8 + Math.cos(ry) * -0.28, ry, -0.22));
@@ -1772,23 +2588,33 @@ export function createProps(ctx) {
     const topY = 0.74, seatY = 0.45;
     for (let i = 0; i < 5; i++) {
       const off = -0.36 + i * 0.18;
-      lot.add(MAT.wood, place(box(1.9, 0.045, 0.17), x + Math.sin(ry) * off, topY, z + Math.cos(ry) * off, ry));
+      lot.add(benchWoodMat, place(slat(1.9, 0.045, 0.17, 0.96),
+        x + Math.sin(ry) * off, topY, z + Math.cos(ry) * off, ry));
+      for (const s of [-1, 1]) {
+        bolt(x + Math.cos(ry) * s * 0.70 + Math.sin(ry) * off, topY + 0.024,
+          z - Math.sin(ry) * s * 0.70 + Math.cos(ry) * off, ry);
+      }
     }
     for (const side of [-1, 1]) {
       for (let i = 0; i < 2; i++) {
         const off = side * (0.72 + i * 0.19);
-        lot.add(MAT.wood, place(box(1.9, 0.045, 0.17), x + Math.sin(ry) * off, seatY, z + Math.cos(ry) * off, ry));
+        lot.add(benchWoodMat, place(slat(1.9, 0.045, 0.17, 0.92),
+          x + Math.sin(ry) * off, seatY, z + Math.cos(ry) * off, ry));
+        for (const s of [-1, 1]) {
+          bolt(x + Math.cos(ry) * s * 0.70 + Math.sin(ry) * off, seatY + 0.024,
+            z - Math.sin(ry) * s * 0.70 + Math.cos(ry) * off, ry);
+        }
       }
     }
     // A-frame legs
     for (const end of [-1, 1]) {
       const ex = x + Math.cos(ry) * end * 0.72, ez = z - Math.sin(ry) * end * 0.72;
       for (const side of [-1, 1]) {
-        lot.add(MAT.wood, place(box(0.08, 0.86, 0.09),
+        lot.add(benchWoodMat, place(slat(0.08, 0.86, 0.09, 0.88),
           ex + Math.sin(ry) * side * 0.42, 0.42, ez + Math.cos(ry) * side * 0.42, ry, 0, side * 0.42));
       }
-      lot.add(MAT.wood, place(box(0.07, 0.07, 1.86), ex, seatY - 0.06, ez, ry));
-      lot.add(MAT.wood, place(box(0.07, 0.5, 0.07), ex, 0.5, ez, ry));
+      lot.add(benchWoodMat, place(slat(0.07, 0.07, 1.86, 0.90), ex, seatY - 0.06, ez, ry));
+      lot.add(benchWoodMat, place(slat(0.07, 0.5, 0.07, 0.90), ex, 0.5, ez, ry));
     }
     deckCollide.push(place(box(1.9, 0.10, 0.95), x, topY, z, ry));
     wallCollide.push(place(box(1.9, 0.5, 1.9), x, 0.25, z, ry));
@@ -2072,57 +2898,125 @@ export function createProps(ctx) {
   emissiveNight.push({ material: tailLampMat, intensity: 1.4, base: 0.15 });
 
   // =========================================================================
-  // 7. spectator crowd — two instanced meshes, idle motion in the vertex shader
+  // 7. spectator crowd — five poses x three builds, all instanced
   // =========================================================================
+  // The crowd used to be flat vertex-colour boxes in a lattice. It now:
+  //   * samples a garment atlas (weave, denim twill, printed tee, face, hair,
+  //     cap) with a normal map baked from the same height field, at ~730 px/m;
+  //   * picks its atlas column per instance, so one geometry dresses a whole
+  //     row differently;
+  //   * runs a desaturated, value-capped palette with per-instance hue jitter
+  //     instead of pure saturated fills;
+  //   * comes in three builds and five poses, scattered with real position and
+  //     facing jitter and real gaps.
+  const crowdAtlas = makeCrowdAtlas();
   const crowdMat = own(new THREE.MeshStandardMaterial({
     name: 'props_crowd',
+    map: ownTex(makeTex(crowdAtlas.color, { aniso })),
+    normalMap: ownTex(makeTex(normalFromHeight(crowdAtlas.height, 1.4), { srgb: false, aniso })),
+    normalScale: new THREE.Vector2(0.55, 0.55),
     vertexColors: true,
-    roughness: 0.86,
+    roughness: 0.88,
     metalness: 0,
-    envMapIntensity: 0.8,
+    envMapIntensity: 0.75,
   }));
-  patchVertex(crowdMat, windU, /* glsl */`
-    uniform float uTime;
-    attribute float aRegion;
-    attribute float aPhase;
-    attribute vec3 aShirt;
-    attribute vec3 aPants;
-    attribute vec3 aSkin;
-    attribute vec3 aHair;
-  `, /* glsl */`
-    {
-      // Idle motion: weight shifts from foot to foot, the chest breathes and the
-      // arms trail it. Everything is scaled by height off the ground so the feet
-      // stay planted.
-      float t = uTime * 1.55 + aPhase;
-      float up = clamp(position.y * 0.62, 0.0, 1.25);
-      float arm = clamp((position.y - 0.9) * 1.4, 0.0, 1.0);
-      float bob = sin(t * 0.85) * 0.013 + sin(t * 0.41 + 1.7) * 0.009;
-      float sway = sin(t * 0.47) * 0.021 + sin(t * 1.31 + 2.2) * 0.006;
-      transformed.y += bob * up;
-      transformed.x += sway * up;
-      transformed.z += cos(t * 0.39 + 1.1) * 0.012 * up;
-      // small independent arm/hand drift
-      transformed.x += sin(t * 1.9 + 0.7) * 0.016 * arm * sign(position.x + 0.001);
-      transformed.z += sin(t * 1.6) * 0.014 * arm;
-    }
-  `, 'props_crowd_idle');
-  crowdMat.onBeforeCompile = ((base) => (shader) => {
-    base(shader);
-    shader.vertexShader = shader.vertexShader.replace('#include <color_vertex>', /* glsl */`
-      #include <color_vertex>
-      {
-        vec3 tint = aSkin;
-        if (aRegion > 3.5) tint = aHair;
-        else if (aRegion > 2.5) tint = vec3(0.045, 0.042, 0.05);
-        else if (aRegion > 1.5) tint = aPants;
-        else if (aRegion > 0.5) tint = aShirt;
-        vColor.rgb *= tint;
-      }
-    `);
-  })(crowdMat.onBeforeCompile);
+  crowdMat.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = time;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', /* glsl */`
+        #include <common>
+        uniform float uTime;
+        attribute float aRegion;
+        attribute float aPhase;
+        attribute float aTop;
+        attribute float aBot;
+        attribute vec3 aShirt;
+        attribute vec3 aPants;
+        attribute vec3 aSkin;
+        attribute vec3 aHair;
+      `)
+      .replace('#include <uv_vertex>', /* glsl */`
+        #include <uv_vertex>
+        {
+          // garment variety without a second mesh: slide the atlas column
+          vec2 cellShift = vec2( 0.0 );
+          if ( aRegion > 0.5 && aRegion < 1.5 ) cellShift.x = aTop * 0.25;
+          else if ( aRegion > 1.5 && aRegion < 2.5 ) cellShift.x = aBot * 0.25;
+          vMapUv += cellShift;
+          vNormalMapUv += cellShift;
+        }
+      `)
+      .replace('#include <color_vertex>', /* glsl */`
+        #include <color_vertex>
+        {
+          vec3 tint = aSkin;
+          if ( aRegion > 6.5 ) tint = aHair;                        // cap / beanie
+          else if ( aRegion > 5.5 ) tint = aSkin;                   // face
+          else if ( aRegion > 4.5 ) tint = aShirt * 0.86;           // sleeve
+          else if ( aRegion > 3.5 ) tint = aHair;                   // hair
+          else if ( aRegion > 2.5 ) tint = vec3( 0.055, 0.05, 0.058 ); // shoes
+          else if ( aRegion > 1.5 ) tint = aPants;
+          else if ( aRegion > 0.5 ) tint = aShirt;
+          vColor.rgb *= tint;
+        }
+      `)
+      .replace('#include <begin_vertex>', /* glsl */`
+        #include <begin_vertex>
+        {
+          // Idle motion: weight shifts from foot to foot, the chest breathes
+          // and the arms trail it. Everything is scaled by height off the
+          // ground so the feet stay planted.
+          float t = uTime * 1.55 + aPhase;
+          float up = clamp( position.y * 0.62, 0.0, 1.25 );
+          float arm = clamp( ( position.y - 0.9 ) * 1.4, 0.0, 1.0 );
+          float bob = sin( t * 0.85 ) * 0.013 + sin( t * 0.41 + 1.7 ) * 0.009;
+          float sway = sin( t * 0.47 ) * 0.021 + sin( t * 1.31 + 2.2 ) * 0.006;
+          transformed.y += bob * up;
+          transformed.x += sway * up;
+          transformed.z += cos( t * 0.39 + 1.1 ) * 0.012 * up;
+          transformed.x += sin( t * 1.9 + 0.7 ) * 0.016 * arm * sign( position.x + 0.001 );
+          transformed.z += sin( t * 1.6 ) * 0.014 * arm;
+        }
+      `);
+  };
+  crowdMat.customProgramCacheKey = () => 'props_crowd_atlas';
 
-  function figurePart(geo, region, shade) {
+  // aRegion drives both the tint and the atlas cell the part was authored into
+  const REG = { skin: 0, top: 1, bottom: 2, dark: 3, hair: 4, sleeve: 5, face: 6, cap: 7 };
+  const CELL = {
+    top: [0, 0], bottom: [0, 1], sleeve: [3, 1], skin: [0, 2], face: [1, 2],
+    hair: [2, 2], cap: [3, 2], shoe: [0, 3], dark: [1, 3], beanie: [2, 3],
+  };
+  const UV_SPAN = 0.55;        // metres of garment mapped across one atlas cell
+  const ATLAS_PAD = 0.012;     // cell inset, so mip bleed stays inside the cell
+
+  /** Rewrite a part's metre UVs into one cell of the crowd atlas. */
+  function atlasUV(geo, cx, cy, span) {
+    const uv = geo.attributes.uv;
+    const c = 1 / CROWD_ATLAS;
+    const u0 = cx * c, v0 = 1 - (cy + 1) * c;
+    let sx = 1 / (span || 1), sy = sx, ox = 0, oy = 0;
+    if (!span) {
+      let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+      for (let i = 0; i < uv.count; i++) {
+        const u = uv.getX(i), v = uv.getY(i);
+        if (u < minU) minU = u; if (u > maxU) maxU = u;
+        if (v < minV) minV = v; if (v > maxV) maxV = v;
+      }
+      sx = 1 / Math.max(1e-4, maxU - minU); sy = 1 / Math.max(1e-4, maxV - minV);
+      ox = -minU * sx; oy = -minV * sy;
+    }
+    const inner = c * (1 - 2 * ATLAS_PAD), pad = c * ATLAS_PAD;
+    for (let i = 0; i < uv.count; i++) {
+      const u = clamp(uv.getX(i) * sx + ox, 0, 1);
+      const v = clamp(uv.getY(i) * sy + oy, 0, 1);
+      uv.setXY(i, u0 + pad + u * inner, v0 + pad + v * inner);
+    }
+    return geo;
+  }
+
+  function figurePart(geo, region, shade, cell, span) {
+    atlasUV(geo, cell[0], cell[1], span);
     tintGeo(geo, 0xffffff);
     const c = geo.attributes.color;
     for (let i = 0; i < c.count; i++) c.setXYZ(i, shade, shade, shade);
@@ -2136,7 +3030,7 @@ export function createProps(ctx) {
    * the chain can start there — that is what gives the crowd real elbows, knees
    * and a head that follows a leaning torso.
    */
-  function bone(out, region, shade, x, y, z, len, w, d, pitch, roll, taper = 0.86) {
+  function bone(out, region, shade, cell, x, y, z, len, w, d, pitch, roll, taper = 0.86) {
     const g = box(w, Math.abs(len), d);
     if (taper !== 1) {
       const h = Math.abs(len) * 0.5;
@@ -2148,70 +3042,112 @@ export function createProps(ctx) {
     _scl.set(1, 1, 1);
     _m4.compose(_pos.set(x, y, z), _quat, _scl);
     g.applyMatrix4(_m4);
-    out.push(figurePart(g, region, shade));
+    out.push(figurePart(g, region, shade, cell, UV_SPAN));
     const cr = Math.cos(roll), sr = Math.sin(roll);
     return [x - len * sr, y + len * cr * Math.cos(pitch), z + len * cr * Math.sin(pitch)];
   }
 
   /**
-   * A spectator in a given pose. Regions: 0 skin, 1 top, 2 trousers, 3 dark
-   * (shoes and headwear), 4 hair. +Z is the direction the figure faces, and
-   * because `bone` rotates about the joint, a hanging bone (arms, legs) swings
-   * forward on NEGATIVE pitch while a rising one (torso, neck) leans forward on
-   * POSITIVE pitch. The pose table below is written with that in mind.
+   * A spectator in a given pose and build. +Z is the direction the figure
+   * faces, and because `bone` rotates about the joint, a hanging bone (arms,
+   * legs) swings forward on NEGATIVE pitch while a rising one (torso, neck)
+   * leans forward on POSITIVE pitch.
    */
-  function figureGeo(o) {
+  function figureGeo(o, v) {
     const p = [];
     const hipY = o.hipY;
+    const G = v.girth, TW = v.torso, SW = v.shoulder;
 
     // --- legs, hips ---------------------------------------------------------
     for (let s = 0; s < 2; s++) {
-      const sx = s ? 0.098 : -0.098;
+      const sx = (s ? 0.098 : -0.098) * TW;
       const sh = s ? 0.88 : 0.95;
-      const knee = bone(p, 2, sh, sx, hipY, 0, -0.44, 0.138, 0.162, o.thigh[s], (s ? 0.035 : -0.035), 0.82);
-      const ank = bone(p, 2, sh * 0.97, knee[0], knee[1], knee[2], -0.43, 0.108, 0.122, o.shin[s], 0, 0.84);
+      const knee = bone(p, REG.bottom, sh, CELL.bottom, sx, hipY, 0, -0.44,
+        0.138 * G, 0.162 * G, o.thigh[s], (s ? 0.035 : -0.035), 0.82);
+      const ank = bone(p, REG.bottom, sh * 0.97, CELL.bottom, knee[0], knee[1], knee[2], -0.43,
+        0.108 * G, 0.122 * G, o.shin[s], 0, 0.84);
       const fy = o.footYaw ? (s ? o.footYaw : -o.footYaw) : 0;
-      p.push(figurePart(place(box(0.102, 0.078, 0.265),
-        ank[0], ank[1] + 0.012, ank[2] + 0.062, fy), 3, 0.98));
+      p.push(figurePart(place(box(0.102 * G, 0.078, 0.265),
+        ank[0], ank[1] + 0.012, ank[2] + 0.062, fy), REG.dark, 0.98, CELL.shoe, UV_SPAN));
       // ankle/sock so the shoe is not a floating slab
-      p.push(figurePart(place(box(0.088, 0.075, 0.10), ank[0], ank[1] + 0.062, ank[2] + 0.005), 0, 0.9));
+      p.push(figurePart(place(box(0.088 * G, 0.075, 0.10),
+        ank[0], ank[1] + 0.062, ank[2] + 0.005), REG.skin, 0.9, CELL.skin, UV_SPAN));
     }
-    p.push(figurePart(place(box(0.305, 0.215, 0.198), 0, hipY + 0.05, 0), 2, 0.97));
+    p.push(figurePart(place(box(0.305 * TW, 0.215, 0.198 * TW), 0, hipY + 0.05, 0),
+      REG.bottom, 0.97, CELL.bottom, UV_SPAN));
 
     // --- torso --------------------------------------------------------------
     const waistY = hipY + 0.145;
     const CHEST = 0.455;
-    const shoulder = bone(p, 1, 1.0, 0, waistY, 0, CHEST, 0.335, 0.212, o.torso, 0, 1.17);
+    const shoulder = bone(p, REG.top, 1.0, CELL.top, 0, waistY, 0, CHEST,
+      0.335 * TW, 0.212 * TW, o.torso, 0, 1.10);
     const sinT = Math.sin(o.torso), cosT = Math.cos(o.torso);
     // shoulder yoke: gives the silhouette its width right where it matters
-    p.push(figurePart(place(taperY(box(0.44, 0.135, 0.235), -0.07, 0.07, 1.0, 0.86),
-      shoulder[0], shoulder[1] - 0.045 * cosT, shoulder[2] - 0.045 * sinT, 0, o.torso), 1, 1.0));
+    p.push(figurePart(place(taperY(box(0.42 * SW, 0.135, 0.235 * TW), -0.07, 0.07, 1.0, 0.86),
+      shoulder[0], shoulder[1] - 0.045 * cosT, shoulder[2] - 0.045 * sinT, 0, o.torso),
+      REG.top, 1.0, CELL.top, UV_SPAN));
 
     // --- arms ---------------------------------------------------------------
+    // Held clear of the torso and shaded a stop darker than the body of the
+    // top, so an arm actually reads as an arm at fence distance.
+    let wx = 0, wy = 0, wz = 0;
     for (let s = 0; s < 2; s++) {
-      const sx = s ? 0.196 : -0.196;
+      const side = s ? 1 : -1;
+      const sx = side * (0.196 * SW + 0.024);
       const sh = s ? 0.9 : 0.97;
       const ay = shoulder[1] - 0.055 * cosT;
       const az = shoulder[2] - 0.055 * sinT;
-      const elbow = bone(p, 1, sh, sx, ay, az, -0.285, 0.104, 0.112, o.upperArm[s], o.armRoll[s], 0.88);
-      const wrist = bone(p, 0, sh, elbow[0], elbow[1], elbow[2], -0.27, 0.088, 0.096,
-        o.upperArm[s] + o.elbow[s], o.foreRoll ? o.foreRoll[s] : o.armRoll[s] * 0.4, 0.9);
-      p.push(figurePart(place(box(0.078, 0.115, 0.072), wrist[0], wrist[1] - 0.05, wrist[2]), 0, 0.95));
+      const elbow = bone(p, REG.sleeve, sh, CELL.sleeve, sx, ay, az, -0.285,
+        0.104 * G, 0.112 * G, o.upperArm[s], o.armRoll[s] + side * 0.11, 0.88);
+      const wrist = bone(p, REG.skin, sh, CELL.skin, elbow[0], elbow[1], elbow[2], -0.27,
+        0.088 * G, 0.096 * G, o.upperArm[s] + o.elbow[s],
+        (o.foreRoll ? o.foreRoll[s] : o.armRoll[s] * 0.4) + side * 0.05, 0.9);
+      // hand
+      p.push(figurePart(place(box(0.078 * G, 0.115, 0.072 * G),
+        wrist[0], wrist[1] - 0.05, wrist[2]), REG.skin, 0.95, CELL.skin, UV_SPAN));
+      wx += wrist[0] * 0.5; wy += (wrist[1] - 0.05) * 0.5; wz += wrist[2] * 0.5;
+    }
+    // a phone held between the hands, for the filming pose
+    if (o.prop === 'phone') {
+      p.push(figurePart(place(box(0.076, 0.142, 0.011), wx, wy + 0.03, wz + 0.035, 0, -0.35),
+        REG.dark, 1.0, CELL.dark, UV_SPAN));
     }
 
-    // --- neck, head, hair ---------------------------------------------------
-    const neck = bone(p, 0, 0.88, shoulder[0], shoulder[1] - 0.03 * cosT, shoulder[2] - 0.03 * sinT,
-      0.085, 0.088, 0.09, o.torso * 0.35, 0, 1);
+    // --- neck, head, hair/headwear ------------------------------------------
+    const neck = bone(p, REG.skin, 0.88, CELL.skin,
+      shoulder[0], shoulder[1] - 0.03 * cosT, shoulder[2] - 0.03 * sinT,
+      0.085, 0.088 * G, 0.09 * G, o.torso * 0.35, 0, 1);
     const hp = o.torso * 0.35 + (o.head || 0);
     const hx = neck[0], hy = neck[1] + 0.098 * Math.cos(hp), hz = neck[2] + 0.098 * Math.sin(hp);
-    const headGeo = new THREE.IcosahedronGeometry(0.103, 1);
+    // A lat-long sphere, not an icosahedron: u = 0.25 lands on +Z, which is
+    // what lets the atlas put eyes, brows and a mouth on the front of the face.
+    const headGeo = new THREE.SphereGeometry(0.103, 14, 10);
     headGeo.scale(0.98, 1.16, 1.04);
-    p.push(figurePart(place(headGeo, hx, hy, hz, 0, hp), 0, 1.0));
-    // hair/headwear: a cap over the crown and down the back, face left clear
-    const hair = new THREE.IcosahedronGeometry(0.108, 1);
-    hair.scale(1.05, 0.72, 1.08);
-    p.push(figurePart(place(hair, hx, hy + 0.052, hz - 0.012, 0, hp), 4, 1.0));
-    p.push(figurePart(place(box(0.185, 0.14, 0.075), hx, hy + 0.01, hz - 0.078, 0, hp), 4, 0.9));
+    p.push(figurePart(place(headGeo, hx, hy, hz, 0, hp), REG.face, 1.0, CELL.face, null));
+
+    if (v.hat === 'cap') {
+      const crown = new THREE.SphereGeometry(0.107, 14, 8, 0, TAU, 0, Math.PI * 0.62);
+      crown.scale(1.02, 1.12, 1.04);
+      p.push(figurePart(place(crown, hx, hy + 0.012, hz, 0, hp), REG.cap, 1.0, CELL.cap, null));
+      p.push(figurePart(place(taperY(box(0.185, 0.016, 0.125), -0.008, 0.008, 1, 1),
+        hx, hy + 0.038 - 0.012 * Math.cos(hp), hz + 0.112 * Math.cos(hp), 0, hp - 0.22),
+        REG.cap, 0.92, CELL.cap, UV_SPAN));
+      // hair still shows at the nape
+      p.push(figurePart(place(box(0.17, 0.075, 0.055),
+        hx, hy - 0.028, hz - 0.086, 0, hp), REG.hair, 0.9, CELL.hair, UV_SPAN));
+    } else if (v.hat === 'beanie') {
+      const crown = new THREE.SphereGeometry(0.111, 14, 9, 0, TAU, 0, Math.PI * 0.66);
+      crown.scale(1.02, 1.14, 1.03);
+      p.push(figurePart(place(crown, hx, hy + 0.016, hz, 0, hp), REG.cap, 1.0, CELL.beanie, null));
+      p.push(figurePart(place(new THREE.TorusGeometry(0.104, 0.019, 5, 14),
+        hx, hy + 0.030, hz, 0, Math.PI * 0.5), REG.cap, 0.88, CELL.beanie, null));
+    } else {
+      const hair = new THREE.SphereGeometry(0.108, 14, 9, 0, TAU, 0, Math.PI * 0.60);
+      hair.scale(1.04, 1.08, 1.06);
+      p.push(figurePart(place(hair, hx, hy + 0.010, hz - 0.006, 0, hp), REG.hair, 1.0, CELL.hair, null));
+      p.push(figurePart(place(box(0.175, 0.135, 0.070),
+        hx, hy - 0.004, hz - 0.080, 0, hp), REG.hair, 0.9, CELL.hair, UV_SPAN));
+    }
 
     const g = mergeGeometries(p, false);
     for (const q of p) q.dispose();
@@ -2227,7 +3163,7 @@ export function createProps(ctx) {
       head: -0.04,
     },
     // arms folded, hunched forward watching the run — the strongest silhouette
-    // of the four at fence distance
+    // of the set at fence distance
     lean: {
       hipY: 0.885, torso: 0.26, footYaw: 0.14,
       thigh: [0.06, -0.05], shin: [-0.08, 0.06],
@@ -2241,7 +3177,14 @@ export function createProps(ctx) {
       upperArm: [2.55, 2.68], armRoll: [-0.34, 0.36], elbow: [0.42, 0.36],
       head: -0.18,
     },
-    // seated on the bleacher nosing, forearms on the knees
+    // filming the run on a phone held out in front
+    film: {
+      hipY: 0.898, torso: 0.10, footYaw: 0.26,
+      thigh: [0.03, -0.04], shin: [-0.05, 0.03],
+      upperArm: [-0.86, -0.83], armRoll: [-0.30, 0.32], elbow: [-0.80, -0.76],
+      foreRoll: [0.34, -0.34], head: 0.06, prop: 'phone',
+    },
+    // seated on the tread with the forearms on the knees
     sit: {
       hipY: 0.080, torso: 0.20, footYaw: 0.18,
       thigh: [-1.42, -1.38], shin: [-0.06, -0.11],
@@ -2250,50 +3193,79 @@ export function createProps(ctx) {
     },
   };
 
+  /** Three silhouettes, each with its own headwear. */
+  const BUILDS = [
+    { girth: 0.90, torso: 0.93, shoulder: 0.97, hat: 'hair' },
+    { girth: 1.00, torso: 1.00, shoulder: 1.00, hat: 'cap' },
+    { girth: 1.15, torso: 1.14, shoulder: 1.06, hat: 'beanie' },
+  ];
+
+  // Raw wardrobe, before the calming pass. Nothing here reaches the frame at
+  // this saturation — `calmSwatch` pulls it back and caps the value.
   const SHIRTS = [0xd8452f, 0x2f6fb8, 0xe8e2d4, 0x2a2d33, 0xe0a52b, 0x4a8f5c, 0x8f4ba0,
     0xd97ea0, 0x3c3f8f, 0xb8b2a4, 0xf0f0ea, 0x1f6f68, 0xc25a1e, 0x6f7480];
   const PANTS = [0x2b3242, 0x4a4438, 0x22242a, 0x5a5f66, 0x38424f, 0x6a5a44, 0x8a8578, 0x2f3b4c];
   const SKINS = [0x9c6b4a, 0x81563a, 0x5f3c26, 0xb08059, 0x4a2f1e, 0x8c6242, 0xc09472];
-  const HAIRS = [0x1c1614, 0x2e2018, 0x4a3423, 0x6a4a2c, 0x8a7050, 0x161616,
-    0x2a2f3a, 0xb03a2a, 0x1b3f6a, 0xd8d4c8];   // last few read as caps/beanies
+  const HAIRS = [0x1c1614, 0x2e2018, 0x4a3423, 0x6a4a2c, 0x8a7050, 0x161616];
+  const CAPS = [0x2a2f3a, 0x7a2f28, 0x1b3f6a, 0x3f4a3a, 0x2a2a2c, 0x6a5c3e, 0x8a8478];
+
+  const _hsl = { h: 0, s: 0, l: 0 };
+  /**
+   * Pull a swatch toward neutral, cap its value and jitter it per instance.
+   * Flat saturated fills are exactly what made the old crowd read as debug
+   * capsules, and a 1.0-albedo white tee blows out under the golden-hour key.
+   */
+  function calmSwatch(hex, satMul, maxL) {
+    _col.setHex(hex, THREE.SRGBColorSpace);
+    _col.getHSL(_hsl, THREE.SRGBColorSpace);
+    const h = (_hsl.h + rand(-0.022, 0.022) + 1) % 1;
+    const s = clamp(_hsl.s * satMul * rand(0.80, 1.16), 0, 1);
+    const l = clamp(Math.min(_hsl.l, maxL) * rand(0.86, 1.08), 0.05, maxL);
+    _col.setHSL(h, s, l, THREE.SRGBColorSpace);
+    return _col;
+  }
 
   function crowdMesh(geo, spots, name, cast) {
     const n = spots.length;
-    if (!n) return null;
+    if (!n) { geo.dispose(); return null; }
     const shirt = new Float32Array(n * 3);
     const pants = new Float32Array(n * 3);
     const skin = new Float32Array(n * 3);
     const hair = new Float32Array(n * 3);
     const phase = new Float32Array(n);
+    const topCell = new Float32Array(n);
+    const botCell = new Float32Array(n);
     const mesh = new THREE.InstancedMesh(geo, crowdMat, n);
     mesh.name = name;
     mesh.castShadow = cast;
     mesh.receiveShadow = false;
-    const put = (arr, i, hex) => {
-      _col.setHex(hex, THREE.SRGBColorSpace);
-      arr[i * 3] = _col.r; arr[i * 3 + 1] = _col.g; arr[i * 3 + 2] = _col.b;
+    const put = (arr, i, col) => {
+      arr[i * 3] = col.r; arr[i * 3 + 1] = col.g; arr[i * 3 + 2] = col.b;
     };
     for (let i = 0; i < n; i++) {
       const s = spots[i];
       _euler.set(0, s.ry, 0, 'YXZ');
       _quat.setFromEuler(_euler);
       _pos.set(s.x, s.y, s.z);
-      // real height spread: 1.55 m to 1.92 m, with matching build
       const h = s.s;
       _scl.set(h * rand(0.94, 1.06), h, h * rand(0.94, 1.06));
       _m4.compose(_pos, _quat, _scl);
       mesh.setMatrixAt(i, _m4);
-      put(shirt, i, pick(SHIRTS));
-      put(pants, i, pick(PANTS));
-      put(skin, i, pick(SKINS));
-      put(hair, i, pick(HAIRS));
+      put(shirt, i, calmSwatch(pick(SHIRTS), 0.60, 0.70));
+      put(pants, i, calmSwatch(pick(PANTS), 0.62, 0.44));
+      put(skin, i, calmSwatch(pick(SKINS), 0.88, 0.74));
+      put(hair, i, calmSwatch(pick(s.hat === 'hair' ? HAIRS : CAPS), 0.78, 0.46));
       phase[i] = rand(0, TAU);
+      topCell[i] = randInt(0, 3);
+      botCell[i] = randInt(0, 3) === 3 ? 2 : randInt(0, 2);
     }
     geo.setAttribute('aShirt', new THREE.InstancedBufferAttribute(shirt, 3));
     geo.setAttribute('aPants', new THREE.InstancedBufferAttribute(pants, 3));
     geo.setAttribute('aSkin', new THREE.InstancedBufferAttribute(skin, 3));
     geo.setAttribute('aHair', new THREE.InstancedBufferAttribute(hair, 3));
     geo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(phase, 1));
+    geo.setAttribute('aTop', new THREE.InstancedBufferAttribute(topCell, 1));
+    geo.setAttribute('aBot', new THREE.InstancedBufferAttribute(botCell, 1));
     mesh.instanceMatrix.needsUpdate = true;
     group.add(mesh);
     owned.geo.push(geo);
@@ -2303,73 +3275,104 @@ export function createProps(ctx) {
   const bikeSpots = [];       // spectators' bikes, parked or held beside them
 
   {
-    // Figures are authored 1 m tall at the hips-and-up scale used above; the
-    // instance scale is the rider's height in metres relative to that build.
-    const height = () => rand(0.855, 1.015);   // ≈ 1.58 m to 1.88 m tall
-    const standSpots = [], leanSpots = [], cheerSpots = [], sitSpots = [];
+    // The figure is authored 1.77 m tall, so the instance scale is the
+    // spectator's height over that. 0.905..1.06 puts the crowd between 1.60 m
+    // and 1.88 m, which is the same range the rider is built to.
+    const height = () => rand(0.905, 1.060);
+    const lists = { stand: [], lean: [], cheer: [], film: [], sit: [] };
 
     /** Push a spectator into whichever pose list suits the spot. */
     const spec = (x, z, ry, opts = {}) => {
       const r = rng();
-      const list = opts.atFence
-        ? (r < 0.60 ? leanSpots : r < 0.86 ? standSpots : cheerSpots)
-        : (r < 0.76 ? standSpots : cheerSpots);
-      list.push({ x, y: opts.y || 0, z, ry, s: height() });
+      const key = opts.atFence
+        ? (r < 0.44 ? 'lean' : r < 0.68 ? 'stand' : r < 0.84 ? 'film' : 'cheer')
+        : (r < 0.58 ? 'stand' : r < 0.76 ? 'lean' : r < 0.90 ? 'cheer' : 'film');
+      const build = randInt(0, BUILDS.length - 1);
+      lists[key].push({
+        x, y: opts.y || 0, z, ry, s: height(), build, hat: BUILDS[build].hat,
+      });
       if (opts.bikes && rng() < 0.32) {
-        bikeSpots.push({ x: x + Math.cos(ry) * rand(0.55, 0.9), z: z - Math.sin(ry) * rand(0.55, 0.9), ry: ry + rand(-0.5, 0.5) });
+        bikeSpots.push({
+          x: x + Math.cos(ry) * rand(0.55, 0.9),
+          z: z - Math.sin(ry) * rand(0.55, 0.9),
+          ry: ry + rand(-0.5, 0.5),
+        });
       }
     };
 
-    // the +Z fence run either side of the gate — the deepest crowd
-    for (let i = 0; i < 22; i++) {
-      const x = lerp(-27, 33, i / 21) + rand(-0.7, 0.7);
+    // The fence lines: a scatter with real gaps in it, not an even spacing.
+    // Yaw jitter is +/-40 deg so no two neighbours face exactly the same way.
+    const YAW = 0.70;
+    for (let i = 0; i < 26; i++) {
+      const x = lerp(-27, 33, i / 25) + rand(-1.1, 1.1);
       if (Math.abs(x - GATE.centre) < GATE.width * 0.5 + 0.7) continue;
+      if (rng() < 0.20) continue;                       // gaps along the rail
       const z = LOT.hz - rand(0.75, 1.35);
-      spec(x, z, Math.atan2(-x, -z) + rand(-0.3, 0.3), { atFence: true, bikes: true });
+      spec(x, z, Math.atan2(-x, -z) + rand(-YAW, YAW), { atFence: true, bikes: true });
     }
-    // a second, looser row behind the first
-    for (let i = 0; i < 11; i++) {
-      const x = lerp(-22, 30, i / 10) + rand(-1.4, 1.4);
+    for (let i = 0; i < 13; i++) {
+      const x = lerp(-22, 30, i / 12) + rand(-1.6, 1.6);
       if (Math.abs(x - GATE.centre) < GATE.width * 0.5 + 1.2) continue;
-      spec(x, LOT.hz - rand(1.9, 3.1), Math.atan2(-x, -LOT.hz) + rand(-0.5, 0.5), { bikes: true });
+      if (rng() < 0.26) continue;
+      spec(x, LOT.hz - rand(1.9, 3.1), Math.atan2(-x, -LOT.hz) + rand(-YAW, YAW), { bikes: true });
     }
-    // the -Z run and the east fence
-    for (let i = 0; i < 12; i++) {
-      const x = lerp(-20, 26, i / 11) + rand(-1, 1);
-      spec(x, -LOT.hz + rand(0.8, 1.6), Math.atan2(-x, LOT.hz) + rand(-0.28, 0.28), { atFence: true });
+    for (let i = 0; i < 14; i++) {
+      const x = lerp(-20, 26, i / 13) + rand(-1.3, 1.3);
+      if (rng() < 0.22) continue;
+      spec(x, -LOT.hz + rand(0.8, 1.6), Math.atan2(-x, LOT.hz) + rand(-YAW, YAW), { atFence: true });
     }
-    for (let i = 0; i < 8; i++) {
-      const z = lerp(-16, 10, i / 7) + rand(-1, 1);
-      spec(LOT.hx - rand(0.9, 2.0), z, Math.atan2(-LOT.hx, -z) + rand(-0.28, 0.28), { atFence: true, bikes: true });
+    for (let i = 0; i < 9; i++) {
+      const z = lerp(-16, 10, i / 8) + rand(-1.3, 1.3);
+      if (rng() < 0.20) continue;
+      spec(LOT.hx - rand(0.9, 2.0), z, Math.atan2(-LOT.hx, -z) + rand(-YAW, YAW),
+        { atFence: true, bikes: true });
     }
     // knots hanging around the gate and the bleacher aisle
     for (let i = 0; i < 7; i++) {
       spec(GATE.centre - 6 + rand(-2.6, 2.6), LOT.hz - 6 + rand(-2.4, 2.4), rand(0, TAU), { bikes: true });
     }
     for (let i = 0; i < 6; i++) {
-      spec(BLEACH.x + rand(1.0, 3.6), rand(-10, 10), Math.PI * 0.5 + rand(-0.5, 0.5), { bikes: true });
+      spec(BLEACH.x + rand(1.0, 3.6), rand(-10, 10), Math.PI * 0.5 + rand(-YAW, YAW), { bikes: true });
     }
 
-    // bleachers: a few clusters per tier rather than an even sprinkle
+    // Bleachers: clusters with real gaps between them, seated on the tread and
+    // scattered along it rather than stamped out on a grid. Roughly a quarter
+    // of the stand is standing rather than sitting, which breaks the row line.
     for (let r = 0; r < seatRows.length; r++) {
       const row = seatRows[r];
       const clusters = randInt(2, 3);
+      let guard = 0;
       for (let c = 0; c < clusters; c++) {
-        const z0 = rand(-row.len * 0.42, row.len * 0.42);
+        const z0 = rand(-row.len * 0.40, row.len * 0.34);
         const n = randInt(1, 4);
         for (let i = 0; i < n; i++) {
-          sitSpots.push({
-            x: row.x + rand(-0.05, 0.05), y: row.y, z: z0 + i * rand(0.62, 0.82),
-            ry: Math.PI * 0.5 + rand(-0.22, 0.22), s: rand(0.855, 1.015),
+          if (guard++ > 12) break;
+          const z = z0 + i * rand(0.68, 0.95) + rand(-0.22, 0.22);
+          if (Math.abs(z) > row.len * 0.47) continue;
+          const build = randInt(0, BUILDS.length - 1);
+          const standing = rng() < 0.24;
+          lists[standing ? (rng() < 0.5 ? 'stand' : 'film') : 'sit'].push({
+            // seated figures sit back on the tread; standing ones stand on it
+            x: row.x + (standing ? rand(-0.16, -0.02) : rand(-0.06, 0.06)),
+            y: row.y,
+            z,
+            ry: Math.PI * 0.5 + rand(-YAW, YAW),
+            s: height(),
+            build,
+            hat: BUILDS[build].hat,
           });
         }
       }
     }
 
-    crowdMesh(figureGeo(POSE.stand), standSpots, 'props_crowd_standing', true);
-    crowdMesh(figureGeo(POSE.lean), leanSpots, 'props_crowd_leaning', true);
-    crowdMesh(figureGeo(POSE.cheer), cheerSpots, 'props_crowd_cheering', true);
-    crowdMesh(figureGeo(POSE.sit), sitSpots, 'props_crowd_seated', true);
+    for (const key of Object.keys(lists)) {
+      const byBuild = BUILDS.map(() => []);
+      for (const s of lists[key]) byBuild[s.build].push(s);
+      for (let b = 0; b < BUILDS.length; b++) {
+        if (!byBuild[b].length) continue;
+        crowdMesh(figureGeo(POSE[key], BUILDS[b]), byBuild[b], `props_crowd_${key}_${b}`, true);
+      }
+    }
   }
 
   // spectators' bikes: one instanced mesh, per-instance frame colour
@@ -2919,8 +3922,11 @@ export function createProps(ctx) {
           x = Math.cos(a) * r;
           z = Math.sin(a) * r;
         }
-        // keep the freeway corridor and the gate approach clear
-        if (Math.abs(z - VIA.z) < 24 && x > VIA.x0 - 24 && x < VIA.x1 + 24) continue;
+        // keep the freeway deck itself clear — but only the deck. The old
+        // 48 m-wide exclusion emptied the entire mid-distance in the primary
+        // view direction, which is what left the downtown blocks reading as
+        // slabs hanging over nothing.
+        if (Math.abs(z - VIA.z) < 14 && x > VIA.x0 - 14 && x < VIA.x1 + 14) continue;
         if (z > LOT.hz && Math.abs(x - GATE.centre) < 13 && bi === 0) continue;
 
         // buildings follow a street grid, and the grid turns between districts
@@ -2991,6 +3997,74 @@ export function createProps(ctx) {
           }
         }
         if (rng() < 0.26) roofSlots.push({ x, z, y: sh + pt, a: ry, w: sw, d: sd, band: bi, haze });
+      }
+    }
+
+    // --- mid-distance street wall ---------------------------------------------
+    // Four concentric rows of low blocks between the fence line and downtown.
+    // Without them the eye jumps straight from the treeline to a 60 m tower
+    // base with nothing but flat horizon colour in between, and the whole
+    // skyline detaches. Each row is a near-continuous wall with occasional
+    // street gaps, and the heights climb from just over the treetops to a bit
+    // over half a downtown tower so the silhouette steps down to the horizon.
+    {
+      const MIDROWS = [
+        { gap: [17, 33], h: [6.5, 12], foot: [12, 26], step: 21, haze: [0.05, 0.09], kinds: ['brick', 'punched'] },
+        { gap: [46, 70], h: [10, 18], foot: [15, 32], step: 24, haze: [0.09, 0.14], kinds: ['punched', 'brick'] },
+        { gap: [88, 122], h: [15, 27], foot: [17, 38], step: 27, haze: [0.14, 0.20], kinds: ['punched', 'curtain', 'brick'] },
+        { gap: [132, 176], h: [21, 42], foot: [19, 42], step: 30, haze: [0.19, 0.27], kinds: ['curtain', 'punched'] },
+      ];
+      const MID = { sat: 0.94, val: 1.04 };
+      for (let ri = 0; ri < MIDROWS.length; ri++) {
+        const R = MIDROWS[ri];
+        const mid = (R.gap[0] + R.gap[1]) * 0.5 + 40;
+        const count = Math.max(16, Math.round(TAU * mid / R.step));
+        for (let i = 0; i < count; i++) {
+          if (rng() < 0.17) continue;                       // a street or a lot
+          const a = ((i + rand(-0.34, 0.34)) / count) * TAU;
+          const gap = rand(R.gap[0], R.gap[1]);
+          const p = outsideLot(a, gap, 4, 4);
+          const x = p.x, z = p.z;
+          if (Math.abs(z - VIA.z) < 13 && x > VIA.x0 - 13 && x < VIA.x1 + 13) continue;
+          if (z > LOT.hz && Math.abs(x - GATE.centre) < 13 && ri === 0) continue;
+
+          const sector = (((a % TAU) + TAU) % TAU) / (TAU / 4) | 0;
+          const ry = [0.10, 0.63, -0.40, 1.19][sector]
+            + (rng() < 0.5 ? 0 : Math.PI * 0.5) + rand(-0.06, 0.06);
+          const w = rand(R.foot[0], R.foot[1]);
+          const d = rand(R.foot[0], R.foot[1]) * rand(0.6, 1.05);
+          const h = lerp(R.h[0], R.h[1], Math.pow(rng(), 1.5));
+          const haze = lerp(R.haze[0], R.haze[1], rng());
+          const tint = bandTint(MID);
+          const tt = trimTint(MID);
+          const co = Math.cos(ry), si = Math.sin(ry);
+          facadeBox(pick(R.kinds), w, h, d, x, h * 0.5, z, ry, tint, haze,
+            rand(0.85, 1.25), [rand(0, FACADE_M), randInt(0, 3) * (FACADE_M * 0.25)]);
+          // parapet, so each roofline reads as an edge and not a soft blur
+          trim(place(box(w + 0.8, Math.max(0.5, h * 0.045), d + 0.8),
+            x, h + Math.max(0.5, h * 0.045) * 0.5, z, ry), tt, haze, 0.02);
+          // a lower wing off to one side keeps the wall from being a fence of
+          // identical extrusions
+          if (rng() < 0.55) {
+            const pw = w * rand(0.45, 0.95), pd = d * rand(0.6, 1.05);
+            const ph = Math.max(3.0, h * rand(0.30, 0.62));
+            const ox = w * 0.5 + pw * 0.5 - rand(0.5, w * 0.25);
+            const px = x + co * ox, pz = z - si * ox;
+            facadeBox(pick(R.kinds), pw, ph, pd, px, ph * 0.5, pz, ry, tint, haze,
+              rand(0.85, 1.25), [rand(0, FACADE_M), randInt(0, 3) * (FACADE_M * 0.25)]);
+            trim(place(box(pw + 0.7, 0.55, pd + 0.7), px, ph + 0.28, pz, ry), tt, haze, 0.02);
+          }
+          // rooftop plant
+          if (rng() < 0.55) {
+            const cw = rand(1.6, 4.2), ch = rand(1.0, 2.6);
+            dark(place(box(cw, ch, cw * rand(0.7, 1.35)),
+              x + rand(-w * 0.32, w * 0.32), h + ch * 0.5, z + rand(-d * 0.32, d * 0.32), ry),
+              pick([0x6a6f75, 0x7b7f83, 0x5c6167]), haze, 0.05);
+          }
+          if (ri >= 2 && rng() < 0.22) {
+            roofSlots.push({ x, z, y: h + 0.6, a: ry, w, d, band: 1, haze });
+          }
+        }
       }
     }
 
@@ -3190,6 +4264,11 @@ export function createProps(ctx) {
       const merged = geos.length === 1 ? geos[0] : mergeGeometries(geos, false);
       if (geos.length > 1) for (const g of geos) g.dispose();
       if (!merged) return;
+      // Every backdrop mass is authored with its base at y = 0; the plane it
+      // stands on is at GROUND_Y. Sinking the whole backdrop onto that plane
+      // is what guarantees a tower footprint is occluded by ground rather
+      // than ending in a hard edge with sky under it.
+      merged.translate(0, GROUND_Y, 0);
       merged.computeBoundingSphere();
       const mesh = new THREE.Mesh(merged, material);
       mesh.name = name;
@@ -3211,17 +4290,29 @@ export function createProps(ctx) {
 
   // --- the ground the city stands on, and the outermost city -----------------
   {
+    // The floor the whole backdrop stands on. It used to be an untextured ring
+    // hazed to 0.88 within 300 m, which made it read as a second patch of sky:
+    // the towers appeared to hang in air because there was no ground signal
+    // under them at all. It now carries an aerial city plan — blocks, roofs,
+    // streets, lots — at a 96 m tile, is tessellated finely enough for the
+    // mottle to survive, runs all the way out to the far clip so no tower
+    // footprint can ever be silhouetted against sky, and its haze ramp tops out
+    // well short of full so the ground/sky boundary stays a readable horizon.
+    const floorTex = ownTex(makeTex(makeCityFloorTexture(), {
+      aniso: Math.max(8, aniso), wrap: THREE.RepeatWrapping,
+    }));
+    const FLOOR_TILE = 96;
     const farGroundMat = own(patchCityHaze(new THREE.MeshStandardMaterial({
-      name: 'props_far_ground', vertexColors: true, roughness: 1, metalness: 0, fog: false,
+      name: 'props_far_ground', map: floorTex, vertexColors: true,
+      roughness: 1, metalness: 0, fog: false, envMapIntensity: 0.55,
     })));
-    // Starts just outside the fence and a little below grade so the park's own
-    // ground always wins, and carries its own haze ramp so it dissolves into the
-    // same air the buildings do rather than ending as a flat grey disc.
-    const ring = new THREE.RingGeometry(44, 940, 84, 10);
+    const FAR_EDGE = 880;                 // inside the 900 m far clip
+    const ring = new THREE.RingGeometry(44, FAR_EDGE, 128, 26);
     ring.rotateX(-Math.PI * 0.5);
-    ring.translate(0, -0.32, 0);
+    ring.translate(0, GROUND_Y, 0);
     {
       const p = ring.attributes.position;
+      const uv = ring.attributes.uv;
       const col = new Float32Array(p.count * 3);
       const hz = new Float32Array(p.count);
       const c0 = new THREE.Color();
@@ -3231,10 +4322,16 @@ export function createProps(ctx) {
         const n = noise01(px * 0.012 + 5.5, pz * 0.012 + 1.7, 4);
         const n2 = noise01(px * 0.06, pz * 0.06, 3);
         // roof/asphalt/lot mottle so the sprawl floor is never one flat value
-        c0.setHex(n > 0.55 ? 0x6f6b62 : n > 0.34 ? 0x5e5b55 : 0x7a7468, THREE.SRGBColorSpace);
+        c0.setHex(n > 0.55 ? 0x8b867b : n > 0.34 ? 0x76726b : 0x9a9384, THREE.SRGBColorSpace);
         c0.multiplyScalar(0.86 + n2 * 0.30);
         col[i * 3] = c0.r; col[i * 3 + 1] = c0.g; col[i * 3 + 2] = c0.b;
-        hz[i] = smoothstep(clamp((r - 48) / 300, 0, 1)) * 0.88;
+        // planar UVs in metres, so the plan reads at a constant scale and does
+        // not smear out along the ring's radial quads
+        uv.setXY(i, px / FLOOR_TILE, pz / FLOOR_TILE);
+        // Gentle enough that the ground still reads as ground at 400 m, and
+        // capped short of 1 so it never matches the sky exactly — that gap is
+        // the horizon line.
+        hz[i] = smoothstep(clamp((r - 55) / 620, 0, 1)) * 0.74;
       }
       ring.setAttribute('color', new THREE.BufferAttribute(col, 3));
       ring.setAttribute('aHaze', new THREE.BufferAttribute(hz, 1));
@@ -3248,9 +4345,14 @@ export function createProps(ctx) {
     skyline.add(rm);
     owned.geo.push(ring);
 
-    // the city that is too far to model: a low-contrast strip that feathers out
-    const band = new THREE.CylinderGeometry(780, 780, 210, 72, 1, true);
-    band.translate(0, 46, 0);
+    // The city too far to model: a low-contrast silhouette strip. Its base is
+    // pinned below the ground plane at the same radius the floor reaches, so
+    // it plants itself on the horizon instead of floating over it.
+    const BAND_R = 770, BAND_H = 240;
+    const band = new THREE.CylinderGeometry(BAND_R, BAND_R, BAND_H, 96, 1, true);
+    // the texture's skyline sits at 97 % of the strip height, so line that up
+    // with grade and let the rest rise above it
+    band.translate(0, GROUND_Y - BAND_H * 0.03 + BAND_H * 0.5, 0);
     const bm = new THREE.Mesh(band, distantMat);
     bm.name = 'props_distant_city';
     bm.matrixAutoUpdate = false;

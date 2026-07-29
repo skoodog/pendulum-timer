@@ -23,8 +23,14 @@
 //   tint(name, colour, opts)                 — cached colourway clone
 //
 // Large surfaces additionally get `applyMacroVariation()`: a world-space
-// low-frequency noise injected into the shader that breaks up tile repetition
-// far beyond the 1024² texture period.
+// three-octave noise injected into the shader that breaks up tile repetition
+// far beyond the texture period, on albedo AND roughness.
+//
+// Anything that stands on the plaza also gets `applyGroundBounce()`: a
+// contact-occlusion + warm-bounce term keyed off world height and how much the
+// face is turned away from up. Horizontal surfaces are untouched; a 3 m ramp
+// transition runs dark at the flat bottom and lifts toward the coping, which is
+// the value gradient that makes a curved surface read as curved.
 
 import * as THREE from 'three';
 import {
@@ -373,57 +379,186 @@ function offs(res) {
   return [(rng() * res) | 0, (rng() * res) | 0];
 }
 
-// --- concrete: smooth power-troweled slab ----------------------------------
+// --- concrete: power-troweled plaza slab, sawn control joints ---------------
+// This is the single largest surface in the game and the one the ground-detail
+// camera sits 30 cm above, so it is authored at 2048² over a 3.0 m tile
+// (≈680 px/m). The layers, in the order a real slab acquires them:
+//
+//   pour       graded aggregate under a cream layer, air voids, trowel arcs
+//   cut        the sawn control-joint grid at 1.5 m centres (= half the tile),
+//              with a kerf, a rounded/chipped arris and patchy sealant
+//   age        a crack network on a *different* period to the joint grid, plus
+//              hairlines spalling off the joint shoulders
+//   use        oil, tyre rubber, grit banked into the joints, damp low spots
+//
+// Nothing except the joint grid is on a frequency that divides the tile, and the
+// aggregate is packed (one stone per ~23 mm cell, radius driven by the cell id)
+// rather than a sparse dot per cell — sparse lattice dots are what produced the
+// marching speckle grid in the first ground-detail pass.
 function genConcrete(res, S, bank) {
   const at = makeSampler(res);
+  const m = res - 1;
   const macro = bank.field(2, 3);
-  const blotch = bank.field(6, 4);
-  const swirl = bank.field(12, 4);
-  const mid = bank.field(24, 4);
-  const fine = bank.field(96, 3);
-  const agg = bank.worley(128);
-  const [ox1, oy1] = offs(res), [ox2, oy2] = offs(res), [ox3, oy3] = offs(res);
+  const blotch = bank.field(5, 4);
+  const swirl = bank.field(11, 3);
+  const mid = bank.field(23, 4);
+  const fine = bank.field(89, 3);
+  const agg = bank.worley(128);          // ≈23 mm cells -> coarse aggregate + voids
+  const net = bank.worley(16);           // ≈19 cm cells -> crack polygons
+  const [ox1, oy1] = offs(res), [ox2, oy2] = offs(res);
+  const [ox3, oy3] = offs(res), [ox4, oy4] = offs(res);
+
+  const half = res >> 1;                            // joint pitch = tile / 2
+  const kerfW = Math.max(1.5, res * 0.0016);        // sawn kerf half-width (~5 mm)
+  const arrisW = Math.max(5, res * 0.0090);         // rounded shoulder (~27 mm)
   const amp = res * 0.055;
 
   for (let y = 0; y < res; y++) {
     for (let x = 0; x < res; x++) {
       const i = y * res + x;
-      // domain-warped, laterally stretched noise = trowel arcs
+
+      const mc = at(macro, x, y);
+      const mc2 = at(macro, (x + ox4) * 2, (y + oy4) * 2);
+      const bl = at(blotch, x + ox1, y + oy1);
+      const bl2 = at(blotch, (x + ox2) * 2, y + oy3);
+      const grain = at(fine, x + ox3, y);
+      const grit = at(fine, (x + oy2) * 3, (y + ox1) * 3);
+
+      // --- power-trowel arcs: domain-warped, laterally stretched ----------
       const wx = ((at(swirl, x + ox1, y + oy1) - 0.5) * amp) | 0;
       const wy = ((at(swirl, x + ox2, y + oy2) - 0.5) * amp) | 0;
-      const trowel = at(mid, (x + wx) * 3, y + wy);
-      const trowel2 = at(mid, x + wy, (y + wx) * 3 + oy3);
-      const sheen = trowel * 0.6 + trowel2 * 0.4;
+      const sheen = at(mid, (x + wx) * 3, y + wy) * 0.6
+        + at(mid, x + wy, (y + wx) * 3 + oy3) * 0.4;
 
-      const grain = at(fine, x + ox3, y);
-      const pore = agg.d1[i] < 0.14 ? 1 - agg.d1[i] / 0.14 : 0;
-      const st = at(blotch, x + ox2, y + oy1);
-      const mc = at(macro, x, y);
+      // --- graded aggregate: packed stones, per-stone size/colour/gloss ----
+      const sid = agg.id[i];
+      const sRad = 0.24 + sid * 0.32;
+      const sd = agg.d1[i];
+      // flat-topped stone body (each cell keeps its own colour across its whole
+      // face) plus a separately rounded dome for the height field
+      const stone = smoothstep(clamp((sRad - sd) * 7.0, 0, 1));
+      const tS = sd < sRad ? sd / sRad : 1;
+      const dome = 1 - tS * tS;
+      // the noise fields sit tight around 0.5, so the wear threshold is set on
+      // their real distribution: ~20% of the slab is worn to open aggregate and
+      // the rest still ghosts the stones through the cream
+      const worn = smoothstep(clamp((mc * 0.6 + mc2 * 0.4 - 0.470) * 9.0, 0, 1));
+      const exposed = stone * (0.36 + worn * 0.64);
 
-      S.H[i] = 0.55 + (sheen - 0.5) * 0.30 + (grain - 0.5) * 0.16 - pore * pore * 0.42;
+      // --- air voids: irregular blobs off a high-frequency field -----------
+      const pv = at(fine, (x + ox4) * 4, (y + oy1) * 4);
+      const pin = smoothstep(clamp((pv - 0.78) * 7.0, 0, 1));
 
-      // warm light grey, cooler and darker where damp
-      const damp = smoothstep(clamp((st - 0.42) * 2.4, 0, 1));
-      const dust = smoothstep(clamp((mc - 0.42) * 2.4, 0, 1));
-      const tone = (mc - 0.5) * 0.09 + (st - 0.5) * 0.05;
-      let r = lerp(0.530, 0.408, damp) + tone + (grain - 0.5) * 0.060 + (sheen - 0.5) * 0.055;
-      let g = lerp(0.522, 0.406, damp) + tone + (grain - 0.5) * 0.057 + (sheen - 0.5) * 0.055;
-      let b = lerp(0.495, 0.404, damp) + tone * 0.85 + (grain - 0.5) * 0.053 + (sheen - 0.5) * 0.055;
-      r = lerp(r, r * 1.06 + 0.030, dust * 0.5);
-      g = lerp(g, g * 1.04 + 0.028, dust * 0.5);
-      b = lerp(b, b * 0.99 + 0.020, dust * 0.5);
-      const pd = pore * 0.55;
-      S.R[i] = r - pd * 0.20; S.G[i] = g - pd * 0.20; S.B[i] = b - pd * 0.19;
+      // --- sawn control joints --------------------------------------------
+      const jitU = (at(mid, x + ox3, (y + oy1) * 2) - 0.5) * res * 0.0030;
+      const jitV = (at(mid, (x + ox1) * 2, y + oy3) - 0.5) * res * 0.0030;
+      const ux = x % half, vy = y % half;
+      const du = Math.abs(Math.min(ux, half - ux) + jitU);
+      const dv = Math.abs(Math.min(vy, half - vy) + jitV);
+      const jd = Math.min(du, dv);
+      const kerf = clamp(1 - jd / kerfW, 0, 1);
+      const shoulder = clamp(1 - jd / arrisW, 0, 1);
+      const shoulder2 = shoulder * shoulder;
+      // chipped arris: the aggregate cells scallop the edge of the cut
+      const chip = shoulder * (1 - kerf) * smoothstep(clamp((sid - 0.56) * 3.2, 0, 1));
+      // elastomeric sealant, present along some runs of joint and not others
+      const seal = kerf * smoothstep(clamp((at(blotch, (x + oy1) * 3, (y + ox2) * 3) - 0.44) * 3.6, 0, 1));
 
-      // troweled sheen = polished streaks; pores and dust stay matte
-      S.Q[i] = clamp(0.60 - smoothstep(clamp((sheen - 0.44) * 2.6, 0, 1)) * 0.19
-        + (grain - 0.5) * 0.10 + pore * 0.22 + damp * 0.06 - dust * 0.04, 0.14, 1);
-      S.O[i] = 1 - pore * 0.25;
+      // --- crack network, decoupled from the joint pitch --------------------
+      const cwx = (x + (((at(swirl, x + ox2, y) - 0.5) * res * 0.020) | 0)) & m;
+      const cwy = (y + (((at(swirl, x, y + oy2) - 0.5) * res * 0.020) | 0)) & m;
+      const ci = cwy * res + cwx;
+      let crack = clamp(1 - (net.d2[ci] - net.d1[ci]) * 26, 0, 1);
+      crack *= smoothstep(clamp((bl2 - 0.56) * 5.0, 0, 1))
+        * smoothstep(clamp((at(swirl, (x + oy3) * 2, y + ox4) - 0.30) * 3.0, 0, 1));
+      crack *= crack;
+      crack = Math.max(crack, shoulder2 * smoothstep(clamp((grit - 0.70) * 6.0, 0, 1)) * 0.75);
+
+      // --- height ----------------------------------------------------------
+      let h = 0.62 + (sheen - 0.5) * 0.15 + (grain - 0.5) * 0.09
+        + dome * (0.09 + worn * 0.17) - pin * 0.40 - crack * 0.42
+        - kerf * 0.66 - shoulder2 * 0.045 - chip * 0.12;
+      h += seal * 0.44;                       // sealant fills the kerf near flush
+
+      // --- albedo -----------------------------------------------------------
+      // cement colour is never uniform: laitance, pour-to-pour tone and dust
+      // give it a broad warm/cool swing on top of the fine grain
+      const tone = (mc - 0.5) * 0.135 + (mc2 - 0.5) * 0.080 + (bl - 0.5) * 0.075;
+      const warmth = (bl2 - 0.5) * 0.055;
+      let r = 0.532 + tone + warmth + (grain - 0.5) * 0.075 + (sheen - 0.5) * 0.065;
+      let g = 0.522 + tone + warmth * 0.55 + (grain - 0.5) * 0.071 + (sheen - 0.5) * 0.065;
+      let b = 0.495 + tone * 0.86 - warmth * 0.35 + (grain - 0.5) * 0.067 + (sheen - 0.5) * 0.065;
+      let q = clamp(0.68 - smoothstep(clamp((sheen - 0.44) * 2.6, 0, 1)) * 0.16
+        + (grain - 0.5) * 0.10, 0.20, 1);
+
+      // exposed stone: granite grey through to warm limestone, and it polishes
+      const stoneR = lerp(0.300, 0.680, sid), stoneG = lerp(0.296, 0.632, sid);
+      const stoneB = lerp(0.290, 0.548, sid);
+      const em = clamp(exposed, 0, 1);
+      r = lerp(r, stoneR, em * 0.80); g = lerp(g, stoneG, em * 0.80); b = lerp(b, stoneB, em * 0.80);
+      q = lerp(q, 0.40 + sid * 0.36, em * 0.7);
+
+      // air voids read as dark pits with a matte, dusty interior
+      r -= pin * 0.135; g -= pin * 0.133; b -= pin * 0.126;
+      q = clamp(q + pin * 0.20, 0, 1);
+
+      // grit and blown leaf litter bank up against the joint shoulders
+      const bank2 = shoulder2 * (1 - kerf) * smoothstep(clamp((bl2 - 0.34) * 2.2, 0, 1));
+      r = lerp(r, 0.305, bank2 * 0.55); g = lerp(g, 0.268, bank2 * 0.55); b = lerp(b, 0.212, bank2 * 0.55);
+      q = clamp(q + bank2 * 0.16, 0, 1);
+
+      // the open kerf is a dark slot; sealed runs are near-black rubber
+      const open = kerf * (1 - seal);
+      r = lerp(r, 0.128, open * 0.86); g = lerp(g, 0.124, open * 0.86); b = lerp(b, 0.118, open * 0.86);
+      r = lerp(r, 0.098, seal * 0.92); g = lerp(g, 0.095, seal * 0.92); b = lerp(b, 0.097, seal * 0.92);
+      q = lerp(q, 0.94, open * 0.7);
+      q = lerp(q, 0.46, seal * 0.85);
+
+      // cracks: dark, with a little rust-brown bleed where water has sat
+      const rust = crack * smoothstep(clamp((bl - 0.58) * 4.0, 0, 1));
+      const cd = crack * 0.72;
+      r = r * (1 - cd) + 0.36 * rust * 0.35;
+      g = g * (1 - cd) + 0.22 * rust * 0.35;
+      b = b * (1 - cd) + 0.13 * rust * 0.35;
+      q = clamp(q + crack * 0.14, 0, 1);
+
+      // oil / gearbox drips: dark, glossy, decoupled blotches
+      const oil = smoothstep(clamp((at(blotch, (x + ox4) * 2 + oy2, y + ox3) - 0.70) * 5.5, 0, 1))
+        * smoothstep(clamp((mc2 - 0.30) * 2.2, 0, 1));
+      r = lerp(r, 0.108, oil * 0.85); g = lerp(g, 0.098, oil * 0.85); b = lerp(b, 0.096, oil * 0.85);
+      q = lerp(q, 0.24, oil * 0.8);
+
+      // tyre rubber: stretched, near-black, burnished smooth
+      const scuff = smoothstep(clamp((at(swirl, x + ox3, (y + oy4) * 5) - 0.62) * 5.0, 0, 1))
+        * smoothstep(clamp((mc - 0.34) * 2.6, 0, 1)) * (1 - open);
+      r = lerp(r, 0.086, scuff * 0.62); g = lerp(g, 0.084, scuff * 0.62); b = lerp(b, 0.086, scuff * 0.62);
+      q = lerp(q, 0.34, scuff * 0.55);
+
+      // damp low spots: the slab dishes between joints and water sits there.
+      // Roughness collapses so those patches mirror the sky, as the reference
+      // frame demands, and the albedo darkens the way wet cement does.
+      const lowF = at(blotch, (x + wx + ox2) * 2, (y + wy + oy1) * 2) * 0.60
+        + at(macro, x + ox4, y) * 0.40;
+      const dampMask = smoothstep(clamp((0.472 - lowF) * 13.0, 0, 1));
+      const wet = clamp(dampMask * 1.2 - clamp((h - 0.58) * 2.4, 0, 1), 0, 1) * (1 - open * 0.5);
+      const wet2 = wet * wet;
+      const wetA = wet2 * 0.85 + wet * 0.15;
+      r = lerp(r, r * 0.68, wetA); g = lerp(g, g * 0.68, wetA); b = lerp(b, b * 0.71, wetA);
+      q = lerp(q, 0.085, wet2);
+
+      S.H[i] = h;
+      S.R[i] = r; S.G[i] = g; S.B[i] = b;
+      S.Q[i] = clamp(q, 0.055, 1);
+      S.O[i] = (1 - open * 0.80) * (1 - crack * 0.55) * (1 - pin * 0.55)
+        * (1 - shoulder2 * 0.14) * (1 - em * 0.10);
     }
   }
 }
 
 // --- concreteWorn: cracked, patched, stained, tyre-marked -------------------
+// Used for the poured transitions and every park ledge, so it carries the same
+// aggregate/void/wear layering as the slab but no sawn joint grid (a transition
+// is screeded in one pour), plus repair patches and a heavier tyre history.
 function genConcreteWorn(res, S, bank) {
   const at = makeSampler(res);
   const m = res - 1;
@@ -446,6 +581,7 @@ function genConcreteWorn(res, S, bank) {
       const sheen = at(mid, (x + wx) * 2, y + wy);
       const grain = at(fine, x + ox3, y + oy3);
       const mc = at(macro, x, y);
+      const mc2 = at(macro, (x + oy1) * 2, (y + ox2) * 2);
       const st = at(blotch, x + ox3, y + oy1);
 
       // repair patches: a handful of cells are a different mix, outlined by the
@@ -466,24 +602,40 @@ function genConcreteWorn(res, S, bank) {
         * smoothstep(clamp((at(streak, (x + oy2) * 2, y + ox1) - 0.30) * 3.0, 0, 1));
       crack = crack * crack;
 
-      // spalling: aggregate exposed where the cream has worn through
-      const spallMask = smoothstep(clamp((mc - 0.62) * 3.2, 0, 1));
-      const stone = agg.d1[i] < 0.40 ? 1 - agg.d1[i] / 0.40 : 0;
-      const spall = spallMask * stone * 0.7;
+      // graded aggregate: packed stones sized by their own cell id, exposed
+      // where the cream has worn or spalled through
+      const sid = agg.id[i];
+      const sRad = 0.26 + sid * 0.30;
+      const sd = agg.d1[i];
+      const stone = smoothstep(clamp((sRad - sd) * 7.0, 0, 1));
+      const tS = sd < sRad ? sd / sRad : 1;
+      const dome = 1 - tS * tS;
+      const spallMask = smoothstep(clamp((mc * 0.65 + mc2 * 0.35 - 0.485) * 8.0, 0, 1));
+      const spall = stone * (0.34 + spallMask * 0.66);
 
-      S.H[i] = 0.58 + (sheen - 0.5) * 0.22 + (grain - 0.5) * 0.18
-        + patchTone * 0.6 + spall * 0.18 - crack * 0.55 - seam * 0.14;
+      // air voids: irregular blobs, never a lattice
+      const pin = smoothstep(clamp((at(fine, (x + oy2) * 4, (y + ox1) * 4) - 0.78) * 7.0, 0, 1));
+
+      S.H[i] = 0.58 + (sheen - 0.5) * 0.20 + (grain - 0.5) * 0.15
+        + patchTone * 0.6 + dome * (0.10 + spallMask * 0.16)
+        - pin * 0.38 - crack * 0.55 - seam * 0.14;
 
       const damp = smoothstep(clamp((st - 0.5) * 3.0, 0, 1));
       let r = 0.455 + patchTone + (mc - 0.5) * 0.105 + (grain - 0.5) * 0.055 - damp * 0.095;
       let g = 0.447 + patchTone + (mc - 0.5) * 0.100 + (grain - 0.5) * 0.053 - damp * 0.092;
       let b = 0.427 + patchTone + (mc - 0.5) * 0.088 + (grain - 0.5) * 0.050 - damp * 0.076;
+      let q = clamp(0.76 + patchRough + (grain - 0.5) * 0.14
+        - smoothstep(clamp((sheen - 0.45) * 2.4, 0, 1)) * 0.16 + damp * 0.05, 0.10, 1);
 
-      // exposed aggregate reads warmer and speckled
-      const sid = agg.id[i];
-      r = lerp(r, 0.50 + sid * 0.22, spall * 0.75);
-      g = lerp(g, 0.48 + sid * 0.20, spall * 0.75);
-      b = lerp(b, 0.45 + sid * 0.18, spall * 0.75);
+      // exposed aggregate reads warmer, speckled and a touch glossier
+      r = lerp(r, lerp(0.285, 0.640, sid), spall * 0.78);
+      g = lerp(g, lerp(0.278, 0.592, sid), spall * 0.78);
+      b = lerp(b, lerp(0.272, 0.512, sid), spall * 0.78);
+      q = lerp(q, 0.42 + sid * 0.34, spall * 0.65);
+
+      // air voids: dark, dusty pits
+      r -= pin * 0.125; g -= pin * 0.122; b -= pin * 0.116;
+      q = clamp(q + pin * 0.18, 0, 1);
 
       // oil / grease blotches — dark, glossy
       const oil = smoothstep(clamp((at(blotch, x + ox2, y + oy3) - 0.66) * 5.0, 0, 1))
@@ -499,13 +651,19 @@ function genConcreteWorn(res, S, bank) {
         * smoothstep(clamp((mc - 0.35) * 3.0, 0, 1));
       r = lerp(r, 0.085, scuff * 0.7); g = lerp(g, 0.082, scuff * 0.7); b = lerp(b, 0.084, scuff * 0.7);
 
+      // damp film in the hollows: dark, and glossy enough to catch the sky
+      const lowF = at(macro, x + ox2, y + oy2) * 0.6 + st * 0.4;
+      const wet = clamp(smoothstep(clamp((0.475 - lowF) * 12.0, 0, 1)) * 1.15
+        - clamp((S.H[i] - 0.58) * 2.4, 0, 1), 0, 1);
+      const wetA = wet * wet * 0.85 + wet * 0.15;
+      r = lerp(r, r * 0.54, wetA); g = lerp(g, g * 0.54, wetA); b = lerp(b, b * 0.57, wetA);
+
       const cd = crack * 0.75;
       S.R[i] = r * (1 - cd); S.G[i] = g * (1 - cd); S.B[i] = b * (1 - cd);
 
-      S.Q[i] = clamp(0.72 + patchRough + (grain - 0.5) * 0.14
-        - smoothstep(clamp((sheen - 0.45) * 2.4, 0, 1)) * 0.16
-        - oil * 0.42 - scuff * 0.30 + crack * 0.12 + spall * 0.10 + damp * 0.05, 0.10, 1);
-      S.O[i] = (1 - crack * 0.55) * (1 - seam * 0.20) * (1 - spall * 0.12);
+      S.Q[i] = clamp(lerp(q - oil * 0.42 - scuff * 0.30 + crack * 0.12, 0.10, wet * wet),
+        0.055, 1);
+      S.O[i] = (1 - crack * 0.55) * (1 - seam * 0.20) * (1 - pin * 0.5) * (1 - spall * 0.10);
     }
   }
 }
@@ -676,6 +834,121 @@ function genSheet(res, S, bank, opts = {}) {
   }
 }
 
+// --- ramp riding surface: phenolic skate-lite panels ------------------------
+// Authored over a 2.44 m tile carrying one 8 ft sheet across U and two 4 ft
+// courses up V, i.e. real 1.22 m x 2.44 m panels. The riding face of a ramp is
+// the biggest single value in the frame after the sky, so it is deliberately a
+// mid-dark grey (sRGB ≈ 0.40, linear ≈ 0.13) rather than the near-black phenolic
+// it would be straight out of the wrapper — at that value the panel seams, screw
+// rows and tyre history all survive the tonemapper instead of clipping to one
+// silhouette.
+function genRampPanel(res, S, bank) {
+  const at = makeSampler(res);
+  const macro = bank.field(2, 3);
+  const stainF = bank.field(6, 4);
+  const bandF = bank.field(12, 4);
+  const midF = bank.field(24, 4);
+  const fine = bank.field(96, 3);
+  const grit = bank.worley(128);
+  const [ox1, oy1] = offs(res), [ox2, oy2] = offs(res), [ox3, oy3] = offs(res);
+
+  const half = res >> 1;                          // 1.22 m course pitch
+  const seamW = Math.max(1.2, res * 0.0014);      // ~3 mm butt joint
+  const wearW = Math.max(4, res * 0.0078);        // ~19 mm abraded arris
+
+  for (let y = 0; y < res; y++) {
+    const vy = y % half;
+    const sheet = y < half ? 0.0 : 1.0;           // per-course tone break
+    // grime and water always bank at the low edge of a course
+    const courseLow = clamp(1 - vy / (half * 0.22), 0, 1);
+    for (let x = 0; x < res; x++) {
+      const i = y * res + x;
+      const mc = at(macro, x, y);
+      const fn = at(fine, x + ox3, y) - 0.5;
+      const mid = at(midF, x + ox1, y + oy1);
+      const stain = at(stainF, x + ox2, y + oy2);
+
+      // --- phenolic face: fine granular grip over a faint fibre undertone --
+      const grip = at(fine, (x + ox1) * 3, (y + oy3) * 3) - 0.5;
+      const fibre = at(midF, (x + oy2) * 6, y + ox3) - 0.5;
+      let h = 0.56 + grip * 0.34 + fn * 0.16 + fibre * 0.06;
+
+      let tone = 0.415 + (mc - 0.5) * 0.075 + (mid - 0.5) * 0.055 + fn * 0.055
+        + grip * 0.045 + (sheet - 0.5) * 0.040;
+      let r = tone * 1.010, g = tone * 0.982, b = tone * 0.948;
+      let q = clamp(0.58 + (mid - 0.5) * 0.16 + fn * 0.12 - grip * 0.10, 0.18, 1);
+      let ao = 1;
+
+      // --- butt joints between sheets --------------------------------------
+      const du = Math.min(x, res - x) + (at(fine, x, y * 2) - 0.5) * 1.6;
+      const dv = Math.min(vy, half - vy) + (at(fine, x * 2, y) - 0.5) * 1.6;
+      const d = Math.min(Math.abs(du), Math.abs(dv));
+      const core = clamp(1 - d / seamW, 0, 1);
+      const arris = clamp(1 - d / wearW, 0, 1);
+      // the exposed edge of a panel abrades pale — that is the line that catches
+      // the sun and makes the sheet layout readable across a whole ramp
+      const edgeWear = arris * (1 - core) * (0.45 + smoothstep(clamp((mc - 0.35) * 2.2, 0, 1)) * 0.55);
+      h += arris * (1 - core) * 0.05 - core * 0.52;
+      r = lerp(r, 0.545, edgeWear * 0.55); g = lerp(g, 0.520, edgeWear * 0.55); b = lerp(b, 0.487, edgeWear * 0.55);
+      q = lerp(q, 0.50, edgeWear * 0.5);
+      r = lerp(r, 0.070, core * 0.92); g = lerp(g, 0.068, core * 0.92); b = lerp(b, 0.070, core * 0.92);
+      q = lerp(q, 0.88, core * 0.8);
+      ao *= 1 - core * 0.62;
+
+      // --- tyre history ------------------------------------------------------
+      // broad wheel-polished ride lines running up the transition (V)
+      const band = at(bandF, x + ox3, (y + oy1) * 3);
+      const polish = smoothstep(clamp((band - 0.46) * 3.2, 0, 1))
+        * smoothstep(clamp((at(bandF, (x + oy2) * 2, y) - 0.34) * 2.4, 0, 1));
+      r = lerp(r, r * 1.30 + 0.030, polish * 0.75);
+      g = lerp(g, g * 1.28 + 0.030, polish * 0.75);
+      b = lerp(b, b * 1.24 + 0.028, polish * 0.75);
+      q = lerp(q, 0.30, polish * 0.8);
+      h += polish * 0.03;
+
+      // hard black rubber laid down where tyres actually bite
+      const skid = smoothstep(clamp((at(bandF, x + ox1, (y + oy3) * 6) - 0.62) * 5.2, 0, 1))
+        * smoothstep(clamp((mc - 0.32) * 2.6, 0, 1));
+      r = lerp(r, 0.088, skid * 0.72); g = lerp(g, 0.086, skid * 0.72); b = lerp(b, 0.090, skid * 0.72);
+      q = lerp(q, 0.36, skid * 0.6);
+
+      // --- weather ------------------------------------------------------------
+      // water stains streak down V, dust and grit collect at the course joints
+      const drip = smoothstep(clamp((at(stainF, (x + oy1) * 3, y + ox2) - 0.55) * 3.6, 0, 1));
+      r = lerp(r, r * 0.74, drip * 0.5); g = lerp(g, g * 0.74, drip * 0.5); b = lerp(b, b * 0.78, drip * 0.5);
+      q = clamp(q + drip * 0.10, 0, 1);
+
+      const dust = clamp(1 - grit.d1[i] / 0.55, 0, 1) * smoothstep(clamp((stain - 0.42) * 2.4, 0, 1));
+      const banked = (courseLow * 0.7 + arris * 0.3) * (1 - core) * (0.35 + dust * 0.65);
+      r = lerp(r, 0.318, banked * 0.42); g = lerp(g, 0.292, banked * 0.42); b = lerp(b, 0.248, banked * 0.42);
+      q = clamp(q + banked * 0.16, 0, 1);
+      ao *= 1 - banked * 0.18;
+
+      S.H[i] = h;
+      S.R[i] = r; S.G[i] = g; S.B[i] = b;
+      S.Q[i] = clamp(q, 0.16, 1);
+      S.O[i] = ao;
+    }
+  }
+
+  // --- deck screws: 200 mm along every joist line, 400 mm between rows ------
+  const r0 = Math.max(2, (res * 0.0034) | 0);
+  const cols = 12, rows = 6;
+  for (let ry = 0; ry < rows; ry++) {
+    const jy = ((ry / rows) * res + (rng() - 0.5) * 3) | 0;
+    const onSeam = (ry % (rows >> 1)) === 0;
+    for (let cx = 0; cx < cols; cx++) {
+      const jx = ((cx / cols) * res + (rng() - 0.5) * 3) | 0;
+      stampScrew(S, res, jx, jy, r0, { tone: onSeam ? 0.30 : 0.34, rough: 0.46, metal: 0.9 });
+    }
+  }
+  // the vertical butt joint gets its own screw line
+  for (let k = 0; k < rows; k++) {
+    const jy = ((k / rows) * res + res / (rows * 2) + (rng() - 0.5) * 3) | 0;
+    stampScrew(S, res, 0, jy, r0, { tone: 0.30, rough: 0.48, metal: 0.9 });
+  }
+}
+
 // --- rough sawn lumber (kicker frames, bleachers, hoardings) ----------------
 function genLumber(res, S, bank) {
   const at = makeSampler(res);
@@ -727,6 +1000,12 @@ function genLumber(res, S, bank) {
 }
 
 // --- coping: polished-worn steel tube ---------------------------------------
+// The lip of every ramp is the readability cue the whole park hangs on, so this
+// is authored as bright galvanised/steel tube: F0 tint ≈ 0.58 (real steel), a
+// low base roughness, and micro-grooves stretched hard along the tube AXIS (U)
+// so the specular smears into one continuous line down the lip rather than
+// breaking into isotropic sparkle. Rust is kept to a few patches well off the
+// ride band — a rusty coping reads as a dark edge, which is the failure case.
 function genCoping(res, S, bank) {
   const at = makeSampler(res);
   const scratchF = bank.field(24, 4);
@@ -741,25 +1020,30 @@ function genCoping(res, S, bank) {
     const wear = 1 - smoothstep(clamp(Math.abs(y / res - 0.5) * 3.1, 0, 1));
     for (let x = 0; x < res; x++) {
       const i = y * res + x;
-      // circumferential scratches: stretched hard along U
-      const s1 = at(scratchF, x + ox1, (y + oy1) * 9);
+      // axial grinding lines: stretched hard along U so they never break the
+      // highlight up across the tube
+      const s1 = at(scratchF, x + ox1, (y + oy1) * 12);
+      const s2 = at(fineF, x + ox2, (y + oy2) * 9);
       const micro = at(microF, x * 2 + ox2, (y + oy2) * 5) - 0.5;
       const line = clamp(1 - Math.abs(s1 - 0.5) * 2 * 5.5, 0, 1);
+      const hair = clamp(1 - Math.abs(s2 - 0.5) * 2 * 8.0, 0, 1);
       const mc = at(macro, x, y);
 
-      // pitting / rust away from the wear band
-      const pit = clamp(1 - pits.d1[i] / 0.22, 0, 1);
-      const rust = pit * smoothstep(clamp((mc - 0.55) * 3.2, 0, 1)) * (1 - wear * 0.85);
+      // pitting / rust away from the wear band, and only in a few patches
+      const pit = clamp(1 - pits.d1[i] / 0.20, 0, 1);
+      const rust = pit * smoothstep(clamp((mc - 0.68) * 4.2, 0, 1)) * (1 - wear * 0.92);
 
-      const base = 0.495 + micro * 0.07 - line * 0.07 + wear * 0.055;
-      let r = base, g = base * 1.005, b = base * 1.03;
-      r = lerp(r, 0.34, rust * 0.85); g = lerp(g, 0.185, rust * 0.85); b = lerp(b, 0.105, rust * 0.85);
+      const base = 0.578 + micro * 0.055 - line * 0.045 + wear * 0.070 - hair * 0.020;
+      let r = base * 0.995, g = base, b = base * 1.035;
+      r = lerp(r, 0.34, rust * 0.75); g = lerp(g, 0.185, rust * 0.75); b = lerp(b, 0.105, rust * 0.75);
 
-      S.H[i] = 0.5 + micro * 0.35 - line * 0.35 - pit * 0.4 * (0.3 + rust);
+      S.H[i] = 0.5 + micro * 0.30 - line * 0.28 - hair * 0.12 - pit * 0.34 * (0.3 + rust);
       S.R[i] = r; S.G[i] = g; S.B[i] = b;
-      S.Q[i] = clamp(0.40 - wear * 0.24 + line * 0.22 + micro * 0.16 + rust * 0.55, 0.06, 1);
-      S.M[i] = 1 - rust * 0.75;
-      S.O[i] = 1 - pit * 0.25;
+      // 0.10 on the ride band up to ~0.30 on the untouched underside
+      S.Q[i] = clamp(0.255 - wear * 0.135 + line * 0.075 + hair * 0.05
+        + micro * 0.10 + rust * 0.55, 0.055, 1);
+      S.M[i] = 1 - rust * 0.72;
+      S.O[i] = 1 - pit * 0.22;
     }
   }
 }
@@ -1680,22 +1964,34 @@ float mvNoise( vec2 p ) {
   float c = mvHash( i + vec2( 0.0, 1.0 ) ), d = mvHash( i + vec2( 1.0, 1.0 ) );
   return mix( mix( a, b, f.x ), mix( c, d, f.x ), f.y );
 }
+// three octaves: the base period plus a 3x and a 9x detail band, so the mask
+// carries structure from ~20 m down to ~2 m and never reads as one soft blob.
 float macroNoise( vec3 p ) {
   vec2 q = p.xz + p.y * 0.37;
-  return mvNoise( q ) * 0.62 + mvNoise( q * 3.17 + 7.3 ) * 0.38;
+  return mvNoise( q ) * 0.54 + mvNoise( q * 3.17 + 7.3 ) * 0.31 + mvNoise( q * 8.93 + 19.1 ) * 0.15;
 }
 `;
 
-/** Compiled macro uniforms per material — kept off userData (see ownTextures). */
+/** Compiled shader uniforms per material — kept off userData (see ownTextures). */
 const macroUniforms = new WeakMap();
 
-/** Shared no-op so macro-free clones keep sharing one program cache key. */
+/** Shared no-op so feature-free clones keep sharing one program cache key. */
 function noMacro() {}
 
+/** Program cache key: one compiled program per *feature set*, not per material. */
+function surfaceCacheKey() {
+  const ud = this.userData || {};
+  return 'bmxSurf|' + (ud.macro ? 'm' : '-') + (ud.bounce ? 'b' : '-');
+}
+
 /** One shared function object => one program cache key => one compiled program. */
-function macroOnBeforeCompile(shader) {
-  const cfg = this.userData.macro;
-  shader.uniforms.uMacro = { value: new THREE.Vector4(cfg.scale, cfg.colour, cfg.rough, cfg.warm) };
+function surfaceOnBeforeCompile(shader) {
+  // props.js chains onBeforeCompile with a bare call, which drops `this`.
+  const self = this && this.userData ? this : null;
+  if (!self) return;
+  const cfg = self.userData.macro || null;
+  const bnc = self.userData.bounce || null;
+  if (!cfg && !bnc) return;
 
   shader.vertexShader = shader.vertexShader
     .replace('#include <common>', '#include <common>\nvarying vec3 vMacroPos;')
@@ -1708,20 +2004,67 @@ function macroOnBeforeCompile(shader) {
       vMacroPos = ( modelMatrix * macroWorld ).xyz;
     `);
 
-  shader.fragmentShader = shader.fragmentShader
-    .replace('#include <common>', '#include <common>\nvarying vec3 vMacroPos;\nuniform vec4 uMacro;\n' + MACRO_GLSL)
-    .replace('#include <map_fragment>', /* glsl */`
-      float macroV = macroNoise( vMacroPos * uMacro.x ) - 0.5;
-      #include <map_fragment>
-      diffuseColor.rgb *= 1.0 + macroV * uMacro.y;
-      diffuseColor.rgb = mix( diffuseColor.rgb, diffuseColor.rgb * vec3( 1.08, 1.0, 0.90 ), macroV * uMacro.w + 0.5 );
-    `)
-    .replace('#include <roughnessmap_fragment>', /* glsl */`
-      #include <roughnessmap_fragment>
-      roughnessFactor = clamp( roughnessFactor * ( 1.0 + macroV * uMacro.z ), 0.035, 1.0 );
-    `);
+  let head = '#include <common>\nvarying vec3 vMacroPos;\n';
+  if (cfg) head += 'uniform vec4 uMacro;\n' + MACRO_GLSL;
+  if (bnc) head += 'uniform vec3 uBounceCol;\nuniform vec3 uBounceP;\n';
+  shader.fragmentShader = shader.fragmentShader.replace('#include <common>', head);
 
-  macroUniforms.set(this, shader.uniforms);
+  if (cfg) {
+    shader.uniforms.uMacro = { value: new THREE.Vector4(cfg.scale, cfg.colour, cfg.rough, cfg.warm) };
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <map_fragment>', /* glsl */`
+        float macroV = macroNoise( vMacroPos * uMacro.x ) - 0.5;
+        #include <map_fragment>
+        diffuseColor.rgb *= 1.0 + macroV * uMacro.y;
+        diffuseColor.rgb = mix( diffuseColor.rgb, diffuseColor.rgb * vec3( 1.08, 1.0, 0.90 ), macroV * uMacro.w + 0.5 );
+      `)
+      .replace('#include <roughnessmap_fragment>', /* glsl */`
+        #include <roughnessmap_fragment>
+        roughnessFactor = clamp( roughnessFactor * ( 1.0 + macroV * uMacro.z ), 0.035, 1.0 );
+      `);
+  }
+
+  if (bnc) {
+    shader.uniforms.uBounceCol = {
+      value: new THREE.Color().setHex(bnc.colour, THREE.SRGBColorSpace).multiplyScalar(bnc.intensity),
+    };
+    shader.uniforms.uBounceP = {
+      value: new THREE.Vector3(bnc.occlusion, Math.max(0.05, bnc.contactHeight), bnc.falloff),
+    };
+    // Indirect light on a *non-horizontal* face near the ground: darkened where
+    // the geometry closes in on the slab (contact AO the shadow map cannot give
+    // us), then lifted by a warm bounce term proportional to how much of the lit
+    // plaza that face can see. A 3 m transition therefore runs from a dark
+    // flat-bottom to a sunlit lip instead of reading as one flat value.
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <lights_fragment_end>', /* glsl */`
+        #if defined( RE_IndirectDiffuse )
+        {
+          vec3 nWS = normalize( ( vec4( geometryNormal, 0.0 ) * viewMatrix ).xyz );
+          float faceUp = clamp( 1.0 - abs( nWS.y ), 0.0, 1.0 );
+          float hN = clamp( vMacroPos.y / uBounceP.y, 0.0, 1.0 );
+          float contact = mix( uBounceP.x, 1.0, hN * hN * ( 3.0 - 2.0 * hN ) );
+          float occ = mix( 1.0, contact, faceUp );
+          irradiance *= occ;
+          iblIrradiance *= occ;
+          irradiance += ( irradiance + iblIrradiance ) * uBounceCol
+            * ( faceUp * exp( -max( vMacroPos.y, 0.0 ) * uBounceP.z ) );
+        }
+        #endif
+        #include <lights_fragment_end>
+      `);
+  }
+
+  macroUniforms.set(self, shader.uniforms);
+}
+
+/** (Re)binds the shared hook according to whatever features userData declares. */
+function installSurfaceShader(material) {
+  const ud = material.userData;
+  material.onBeforeCompile = (ud.macro || ud.bounce) ? surfaceOnBeforeCompile : noMacro;
+  material.customProgramCacheKey = surfaceCacheKey;
+  material.needsUpdate = true;
+  return material;
 }
 
 /**
@@ -1730,9 +2073,23 @@ function macroOnBeforeCompile(shader) {
  */
 export function applyMacroVariation(material, { scale = 0.03, colour = 0.16, rough = 0.22, warm = 0.10 } = {}) {
   material.userData.macro = { scale, colour, rough, warm };
-  material.onBeforeCompile = macroOnBeforeCompile;
-  material.needsUpdate = true;
-  return material;
+  return installSurfaceShader(material);
+}
+
+/**
+ * Ground-bounce + contact-occlusion term for anything standing on the plaza.
+ * Horizontal surfaces are untouched (faceUp == 0), so this never dims the slab
+ * itself; vertical and transition faces get darker into the ground contact and
+ * pick up warm irradiance reflected off the lit lot.
+ *   occlusion    — indirect multiplier at ground level (1 = off)
+ *   contactHeight— metres over which that darkening releases
+ *   falloff      — 1/m decay of the bounce with height
+ */
+export function applyGroundBounce(material, {
+  colour = 0xffd2a6, intensity = 0.34, occlusion = 0.46, contactHeight = 1.5, falloff = 0.40,
+} = {}) {
+  material.userData.bounce = { colour, intensity, occlusion, contactHeight, falloff };
+  return installSurfaceShader(material);
 }
 
 // ---------------------------------------------------------------------------
@@ -1836,13 +2193,21 @@ function ownTextures(material, sink) {
 //          it scales the sobel so every normal map has a real-world slope.
 
 const RECIPES = [
-  { key: 'concrete', res: 1024, tile: 4.0, height: 0.0045, gen: genConcrete,
-    base: { roughness: 1, metalness: 0 }, normalScale: 0.9,
-    macro: { scale: 0.028, colour: 0.14, rough: 0.20, warm: 0.10 } },
+  // The plaza slab: 2048² over a 3.0 m tile is ≈680 px/m, so the ground-detail
+  // camera at 30 cm still has real texels under it, and the sawn joint grid
+  // lands on 1.5 m centres. Macro period is ~16 m, three octaves, on albedo and
+  // roughness both, which is what actually kills the visible tile march.
+  { key: 'concrete', res: 2048, tile: 3.0, height: 0.008, gen: genConcrete,
+    base: { roughness: 1, metalness: 0, envMapIntensity: 1.05 }, normalScale: 1.0,
+    aoStrength: 6.5,
+    macro: { scale: 0.062, colour: 0.20, rough: 0.26, warm: 0.12 },
+    bounce: { intensity: 0.28, occlusion: 0.62, contactHeight: 1.1, falloff: 0.50 } },
 
-  { key: 'concreteWorn', res: 1024, tile: 5.0, height: 0.013, gen: genConcreteWorn,
-    base: { roughness: 1, metalness: 0 }, normalScale: 1.0,
-    macro: { scale: 0.022, colour: 0.18, rough: 0.24, warm: 0.12 } },
+  { key: 'concreteWorn', res: 1024, tile: 4.0, height: 0.014, gen: genConcreteWorn,
+    base: { roughness: 1, metalness: 0, envMapIntensity: 1.05 }, normalScale: 1.0,
+    aoStrength: 6.0,
+    macro: { scale: 0.058, colour: 0.20, rough: 0.26, warm: 0.12 },
+    bounce: { intensity: 0.34, occlusion: 0.52, contactHeight: 1.5, falloff: 0.40 } },
 
   { key: 'asphalt', res: 1024, tile: 5.0, height: 0.010, gen: genAsphalt,
     base: { roughness: 1, metalness: 0 }, normalScale: 1.0,
@@ -1855,19 +2220,24 @@ const RECIPES = [
 
   { key: 'plywood', res: 1024, tile: 2.44, height: 0.006, gen: genSheet,
     base: { roughness: 1, metalness: 0 }, normalScale: 0.85,
-    macro: { scale: 0.035, colour: 0.13, rough: 0.16, warm: 0.14 } },
+    macro: { scale: 0.035, colour: 0.13, rough: 0.16, warm: 0.14 },
+    bounce: { intensity: 0.30, occlusion: 0.60, contactHeight: 1.1, falloff: 0.48 } },
 
-  { key: 'skatelite', res: 512, tile: 2.44, height: 0.004,
-    gen: (r, S, b) => genSheet(r, S, b, { skatelite: true }),
-    base: { roughness: 1, metalness: 0 }, normalScale: 0.7,
-    macro: { scale: 0.035, colour: 0.10, rough: 0.18, warm: 0.06 } },
+  // The ramp riding face. Full 1024² over one 8 ft sheet (≈420 px/m), lifted out
+  // of the black clip point, with the panel seams and screw rows that make a
+  // transition legible in silhouette. `rampSheet` is the same material.
+  { key: 'skatelite', res: 1024, tile: 2.44, height: 0.0075, gen: genRampPanel,
+    base: { roughness: 1, metalness: 0, envMapIntensity: 1.1 }, normalScale: 1.0,
+    aoStrength: 6.0,
+    macro: { scale: 0.048, colour: 0.14, rough: 0.20, warm: 0.10 },
+    bounce: { intensity: 0.42, occlusion: 0.40, contactHeight: 1.8, falloff: 0.32 } },
 
   { key: 'wood', res: 512, tile: 1.6, height: 0.009, gen: genLumber,
     base: { roughness: 1, metalness: 0 }, normalScale: 1.0,
     macro: { scale: 0.060, colour: 0.12, rough: 0.12, warm: 0.12 } },
 
   { key: 'metalCoping', res: 512, tile: 0.55, height: 0.0011, gen: genCoping,
-    base: { roughness: 1, metalness: 1, envMapIntensity: 1.15 }, metalMap: true, normalScale: 0.6 },
+    base: { roughness: 1, metalness: 1, envMapIntensity: 1.45 }, metalMap: true, normalScale: 0.45 },
 
   { key: 'railSteel', res: 512, tile: 0.8, height: 0.0010, gen: genRailSteel,
     base: { roughness: 1, metalness: 1, envMapIntensity: 1.1 }, metalMap: true, normalScale: 0.6 },
@@ -1887,7 +2257,8 @@ const RECIPES = [
 
   { key: 'brick', res: 512, tile: 2.0, height: 0.014, gen: genBrick,
     base: { roughness: 1, metalness: 0 }, normalScale: 1.0,
-    macro: { scale: 0.030, colour: 0.16, rough: 0.14, warm: 0.10 } },
+    macro: { scale: 0.030, colour: 0.16, rough: 0.14, warm: 0.10 },
+    bounce: { intensity: 0.30, occlusion: 0.62, contactHeight: 1.0, falloff: 0.52 } },
 
   { key: 'corrugatedMetal', res: 512, tile: 1.0, height: 0.022, gen: genCorrugated,
     base: { roughness: 1, metalness: 1, envMapIntensity: 1.0 }, metalMap: true, normalScale: 1.0,
@@ -1952,6 +2323,9 @@ export async function createMaterials(ctx) {
   const maxAniso = renderer?.capabilities?.getMaxAnisotropy?.() ?? 8;
   const aniso = Math.max(1, Math.min(maxAniso, tier?.anisotropy ?? 8));
   const resScale = tier?.name === 'low' ? 0.5 : 1;
+  // The 2048² detail tier (the plaza slab) is ~3 s of generation and ~50 MB of
+  // VRAM; the two lower tiers take it at 1024² (still 341 px/m over its 3 m tile).
+  const detailCap = (tier?.name === 'low' || tier?.name === 'medium') ? 1024 : 4096;
 
   // deterministic regardless of what ran before; main.js' seed is restored after
   reseed(0x4d41544c);
@@ -1971,10 +2345,21 @@ export async function createMaterials(ctx) {
   let texCount = 0;
   let lastYield = t0;
 
+  let prevRes = 0;
   for (const rec of RECIPES) {
-    const res = Math.max(128, (rec.res * resScale) | 0);
+    const res = Math.max(128, Math.min((rec.res * resScale) | 0, detailCap));
     const tileU = Array.isArray(rec.tile) ? rec.tile[0] : rec.tile;
     const tileV = Array.isArray(rec.tile) ? rec.tile[1] : rec.tile;
+
+    // The 2048² tier costs ~180 MB of scratch and ~100 MB of noise fields, so
+    // release the previous resolution's working set as soon as the recipe list
+    // moves off it instead of holding every tier until dispose().
+    if (prevRes && prevRes !== res) {
+      banks.get(prevRes)?.clear();
+      banks.delete(prevRes);
+      if (prevRes > 1024) scratchPool.delete(prevRes);
+    }
+    prevRes = res;
 
     const S = getScratch(res);
     rec.gen(res, S, getBank(res));
@@ -2004,6 +2389,7 @@ export async function createMaterials(ctx) {
     mat.userData.tileMeters = { x: tileU, y: tileV };
     mat.userData.libName = rec.key;
     if (rec.macro) applyMacroVariation(mat, rec.macro);
+    if (rec.bounce) applyGroundBounce(mat, rec.bounce);
 
     lib[rec.key] = mat;
     materials.set(rec.key, mat);
@@ -2013,6 +2399,10 @@ export async function createMaterials(ctx) {
     // keep the main thread responsive without paying a timer per material
     if (now() - lastYield > 60) { await nextTick(); lastYield = now(); }
   }
+
+  // The ramp riding face under the name park.js actually asks for.
+  lib.rampSheet = lib.skatelite;
+  materials.set('rampSheet', lib.skatelite);
 
   // --- decal / graffiti atlas ----------------------------------------------
   const decalAtlas = buildDecalAtlas(resScale < 1 ? 512 : 1024, aniso);
@@ -2111,8 +2501,18 @@ export async function createMaterials(ctx) {
     if (opts.opacity !== undefined) m.opacity = opts.opacity;
     if (opts.emissive !== undefined) m.emissive = new THREE.Color(opts.emissive);
     if (opts.emissiveIntensity !== undefined) m.emissiveIntensity = opts.emissiveIntensity;
-    if (opts.macro === false) { m.onBeforeCompile = noMacro; m.userData.macro = null; }
-    else if (opts.macro) applyMacroVariation(m, opts.macro);
+    // Material.copy() does not carry onBeforeCompile across, so every clone has
+    // to have the shared hook re-bound or it silently loses its macro/bounce.
+    if (opts.macro === false) m.userData.macro = null;
+    else if (opts.macro) m.userData.macro = { scale: 0.03, colour: 0.16, rough: 0.22, warm: 0.10, ...opts.macro };
+    if (opts.bounce === false) m.userData.bounce = null;
+    else if (opts.bounce) {
+      m.userData.bounce = {
+        colour: 0xffd2a6, intensity: 0.34, occlusion: 0.46, contactHeight: 1.5, falloff: 0.40,
+        ...opts.bounce,
+      };
+    }
+    installSurfaceShader(m);
     m.name = opts.name || `${name}_v${variants.size}`;
 
     variants.set(key, m);

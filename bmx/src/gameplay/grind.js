@@ -52,6 +52,7 @@ export const GRIND_TUNING = {
   // --- contact geometry ----------------------------------------------------
   pegDrop: 0.2385,          // m from the contact origin up to the underside of a peg (tyreR - pegR)
   pegSide: 0.115,           // m from the centreline out to the middle of a peg
+  pegSpan: 0.52,            // m fore/aft from mid-wheelbase to a peg (= half wheelbase)
   ledgeLift: 0.005,         // m of lift on a ledge — its curve already runs along the ride edge
   minRailLift: 0.02,        // m minimum lift so a hairline rail radius still reads as "on top"
   wheelRadius: 0.26,        // m — matches bikePhysics TUNING.wheelRadius, drives the wheel spin readout
@@ -99,9 +100,43 @@ export const GRIND_TUNING = {
   transferPoints: 250,      // base for a rail-to-rail transfer
   revertPoints: 150,        // base for a 180 revert out
 
+  // --- rider weighting -----------------------------------------------------
+  // A grind is ridden with the rider's mass stacked over the line: the chassis
+  // rolls TOWARD the rail so the loaded peg stays under the centre of gravity.
+  // Without this every grind sits bolt upright and reads as a bike parked in the
+  // air next to a tube. It is a pose term only — the contact solve rotates the
+  // peg offset by the final orientation, so the metal still touches exactly.
+  railLean: 0.155,          // rad of weight-over-the-rail roll at riding speed
+  railLeanSpeed: 6.0,       // m/s at which that weighting is fully developed
+  railLeanFloor: 0.35,      // fraction of it that survives down at walking pace
+
   // --- presentation --------------------------------------------------------
   sparkInterval: 0.085,     // s between the supplementary spark bursts we fire ourselves
   audioInterval: 1 / 30,    // s between audio parameter pushes
+
+  // Contact rig (sparks / flare / contact shadow). This module owns the contact
+  // presentation because it is the only one that knows where the peg actually
+  // meets the line — particles.js runs a second, gameplay-only stream that stops
+  // dead whenever the simulation is paused or frozen.
+  // Swarf off a peg travels tens of centimetres, not metres. Shed speed × life ×
+  // the shader's drag has to keep the whole fan inside ~0.9 m of the contact, or
+  // the shower spreads so thin that the one place it must read — the metal — has
+  // nothing on it at all.
+  showerBase: 34,           // sparks alive at the contact at walking pace
+  showerPerSpeed: 6.0,      // extra alive sparks per m/s
+  showerMax: 120,           // hard cap on the live shower
+  sparkLifeMin: 0.10,       // s
+  sparkLifeMax: 0.30,       // s
+  sparkSizeMin: 0.007,      // m half-width of a fresh spark quad (a streak is thin)
+  sparkSizeMax: 0.018,      // m
+  sparkSpeed: 1.6,          // m/s of shed velocity at the low end
+  sparkSpeedPerSpeed: 0.30, // extra shed velocity per m/s of grind speed
+  sparkSmear: 0.020,        // metres of streak per m/s of view-space velocity
+  flareSize: 0.055,         // m half-width of the additive contact bloom sprite
+  contactLight: 1.4,        // point-light intensity at the contact on a hot grind
+  shadowStrength: 0.80,     // darkness of the tight contact blob on the ground
+  shadowSpread: 1.35,       // how much the blob grows per metre of drop
+  shadowFade: 2.6,          // m of drop at which the blob has faded out entirely
 };
 
 /**
@@ -127,6 +162,10 @@ export const GRIND_TYPES = {
   doublePeg: {
     id: 'doublePeg', label: 'Double Peg', pose: 'grind_doublepeg',
     z: 0.00, roll: 0.00, pitch: 0.00, yaw: 0.00,
+    // Both pegs are loaded, so the contact origin sits mid-wheelbase but the
+    // metal-on-metal contact — and everything that sheds off it — happens at the
+    // two pegs, ±pegSpan along the line. `dual` says so.
+    dual: true,
     axis: 'steer', leanSign: 1, diff: 0.78, base: 100,
   },
   feeble: {
@@ -199,6 +238,390 @@ const _exitDir = new THREE.Vector3();
 const _basis = new THREE.Matrix4();
 const _qTarget = new THREE.Quaternion();
 const _qStep = new THREE.Quaternion();
+
+const _fxA = new THREE.Vector3();
+const _fxB = new THREE.Vector3();
+const _fxC = new THREE.Vector3();
+const _fxT = new THREE.Vector3();
+const _fxN = new THREE.Vector3(0, 1, 0);
+const _fxR = new THREE.Vector3();
+const _fxG = new THREE.Vector3(0, 1, 0);
+
+// ---------------------------------------------------------------------------
+// contact presentation rig
+//
+// Sparks, the additive contact bloom and the contact shadow all hang off ONE
+// piece of information — where the loaded peg meets the line — so they live
+// here rather than in particles.js. Two draw calls, two fixed pools, nothing
+// allocated after construction.
+//
+// The rig is driven from `onBeforeRender`, not from the fixed step, for one
+// concrete reason: the fixed step does not run when the game is paused or
+// frozen (menus, the results screen, the screenshot harness), and a grind that
+// loses its sparks and its contact shadow the instant the clock stops reads as
+// a bike pasted over the level. The tick is idempotent per frame — whichever of
+// the two meshes the renderer reaches first runs it, the other is a no-op.
+// ---------------------------------------------------------------------------
+
+const SPARK_SLOTS = 160;      // slots 0..1 are the persistent contact flares
+const FLARES = 2;             // one per loaded peg (a double peg loads two)
+const BLOB_SLOTS = 4;         // 0 ground shadow, 1 ground core, 2..3 rail smudges
+
+const SPARK_VERT = `
+attribute vec3 aOrigin;
+attribute vec3 aVel;
+attribute vec4 aParam;      // x birth, y life, z half-size, w smear
+attribute vec3 aTint;
+uniform float uTime;
+uniform float uGravity;
+varying vec2 vUv;
+varying vec3 vTint;
+varying float vFade;
+varying float vStretch;
+void main() {
+  vUv = uv;
+  vTint = aTint;
+  float life = max(aParam.y, 1e-4);
+  float age = uTime - aParam.x;
+  float k = age / life;
+  if (k < 0.0 || k > 1.0 || aParam.z <= 0.0) {
+    vFade = 0.0;
+    vStretch = 1.0;
+    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);   // behind the far plane: never shaded
+    return;
+  }
+  vFade = 1.0 - k * k;
+  // Ballistic path with linear drag, integrated in closed form so a spark can be
+  // born mid-flight (the shower is seeded with staggered birth times, which is
+  // what makes it look established on the very first frame it is rendered).
+  const float drag = 3.1;
+  float d = exp(-drag * age);
+  vec3 p = aOrigin + aVel * ((1.0 - d) / drag);
+  p.y -= 0.5 * uGravity * age * age;
+  vec3 v = aVel * d;
+  v.y -= uGravity * age;
+
+  vec4 mv = modelViewMatrix * vec4(p, 1.0);
+  vec3 vv = (modelViewMatrix * vec4(v, 0.0)).xyz;
+  float size = aParam.z * (0.30 + 0.70 * vFade);
+  float dl = length(vv.xy);
+  vec2 u = dl > 1e-4 ? vv.xy / dl : vec2(0.0, 1.0);
+  vec2 w = vec2(-u.y, u.x);
+  // Sub-frame velocity smear: the quad stretches along its own screen-space
+  // motion, so a fast spark is a streak and a dying one is a dot.
+  float len = size + aParam.w * dl;
+  vStretch = len / max(size, 1e-5);
+  mv.xy += w * (position.x * size * 2.0) + u * (position.y * len * 2.0);
+  gl_Position = projectionMatrix * mv;
+}`;
+
+// The profile is computed, not sampled. A stretched sprite would put its bright
+// core in one small spot in the middle of a 60 px streak and leave the rest as
+// dim halo — which is exactly why a texture-mapped spark vanishes the moment the
+// smear is long enough to be worth having.
+const SPARK_FRAG = `
+varying vec2 vUv;
+varying vec3 vTint;
+varying float vFade;
+varying float vStretch;
+void main() {
+  vec2 q = vUv * 2.0 - 1.0;
+  float across = q.x;
+  float along = q.y;
+  // round hot core with a warm halo — used for the contact flare and for a
+  // spark that has slowed to a dot
+  float r2 = across * across + along * along;
+  float radial = exp(-r2 * 4.5) + 0.85 * exp(-r2 * 22.0);
+  // a thin bright line, full brightness down its whole length, tapered at the
+  // trailing end and softened at the tip
+  float streak = exp(-across * across * 7.0)
+    * smoothstep(-1.0, -0.15, along) * (1.0 - smoothstep(0.65, 1.0, along));
+  float a = mix(radial, streak, clamp((vStretch - 1.0) / 3.0, 0.0, 1.0));
+  a *= vFade;
+  if (a < 0.003) discard;
+  gl_FragColor = vec4(vTint * a, a);
+}`;
+
+const BLOB_VERT = `
+attribute vec3 aCenter;
+attribute vec3 aAxisU;
+attribute vec3 aAxisV;
+attribute vec2 aShape;      // x strength, y softness
+varying vec2 vUv;
+varying vec2 vShape;
+void main() {
+  vUv = uv;
+  vShape = aShape;
+  vec3 p = aCenter + aAxisU * (position.x * 2.0) + aAxisV * (position.y * 2.0);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+}`;
+
+const BLOB_FRAG = `
+varying vec2 vUv;
+varying vec2 vShape;
+void main() {
+  vec2 q = vUv * 2.0 - 1.0;
+  float r = length(q);
+  if (r > 1.0 || vShape.x <= 0.0) discard;
+  float m = 1.0 - smoothstep(1.0 - vShape.y, 1.0, r);
+  m *= m;
+  float k = 1.0 - clamp(vShape.x, 0.0, 0.95) * m;
+  gl_FragColor = vec4(k, k, k, 1.0);
+}`;
+
+function instQuad(slots) {
+  const g = new THREE.InstancedBufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(
+    [-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0], 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
+  g.setIndex([0, 1, 2, 0, 2, 3]);
+  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e6);
+  g.instanceCount = 0;
+  g.userData.slots = slots;
+  return g;
+}
+
+function instAttr(slots, size) {
+  return new THREE.InstancedBufferAttribute(new Float32Array(slots * size), size);
+}
+
+/**
+ * `onFrame` is invoked exactly once per rendered frame, before either mesh is
+ * drawn. The mesh callbacks double as the override-pass guard: GTAO and the
+ * depth prepass swap in their own material, and neither pool has anything
+ * meaningful to say about depth or normals, so they draw nothing there.
+ */
+function createContactRig(ctx, onFrame) {
+  const group = new THREE.Group();
+  group.name = 'GrindContact';
+  group.matrixAutoUpdate = false;
+  group.frustumCulled = false;
+
+  // --- hot pool: sparks + the persistent contact flare ----------------------
+  const hotGeo = instQuad(SPARK_SLOTS);
+  const aOrigin = instAttr(SPARK_SLOTS, 3);
+  const aVel = instAttr(SPARK_SLOTS, 3);
+  const aParam = instAttr(SPARK_SLOTS, 4);
+  const aTint = instAttr(SPARK_SLOTS, 3);
+  hotGeo.setAttribute('aOrigin', aOrigin);
+  hotGeo.setAttribute('aVel', aVel);
+  hotGeo.setAttribute('aParam', aParam);
+  hotGeo.setAttribute('aTint', aTint);
+  const org = aOrigin.array, vel = aVel.array, par = aParam.array, tnt = aTint.array;
+  for (let i = 0; i < SPARK_SLOTS; i++) { par[i * 4 + 1] = 1e-4; par[i * 4 + 2] = 0; }
+
+  const hotUniforms = { uTime: { value: 0 }, uGravity: { value: 9.0 } };
+  const hotMat = new THREE.ShaderMaterial({
+    uniforms: hotUniforms,
+    vertexShader: SPARK_VERT,
+    fragmentShader: SPARK_FRAG,
+    transparent: true,
+    depthTest: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
+    // A transparent DoubleSide material is otherwise drawn twice per frame with
+    // `needsUpdate` flipped between the two passes — every spark blended twice
+    // and the program marked dirty every frame.
+    forceSinglePass: true,
+    toneMapped: false,
+  });
+  const hotMesh = new THREE.Mesh(hotGeo, hotMat);
+  hotMesh.name = 'GrindSparks';
+  hotMesh.frustumCulled = false;
+  hotMesh.matrixAutoUpdate = false;
+  hotMesh.castShadow = false;
+  hotMesh.receiveShadow = false;
+  hotMesh.renderOrder = 6;
+
+  // --- dark pool: contact shadow + the smudge where metal meets metal -------
+  const blobGeo = instQuad(BLOB_SLOTS);
+  const aCenter = instAttr(BLOB_SLOTS, 3);
+  const aAxisU = instAttr(BLOB_SLOTS, 3);
+  const aAxisV = instAttr(BLOB_SLOTS, 3);
+  const aShape = instAttr(BLOB_SLOTS, 2);
+  blobGeo.setAttribute('aCenter', aCenter);
+  blobGeo.setAttribute('aAxisU', aAxisU);
+  blobGeo.setAttribute('aAxisV', aAxisV);
+  blobGeo.setAttribute('aShape', aShape);
+  const cen = aCenter.array, axU = aAxisU.array, axV = aAxisV.array, shp = aShape.array;
+
+  const blobMat = new THREE.ShaderMaterial({
+    uniforms: {},
+    vertexShader: BLOB_VERT,
+    fragmentShader: BLOB_FRAG,
+    transparent: true,
+    depthTest: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    forceSinglePass: true,
+    // multiply against what is already there: a real darkening, not a grey card
+    blending: THREE.CustomBlending,
+    blendSrc: THREE.DstColorFactor,
+    blendDst: THREE.ZeroFactor,
+    blendEquation: THREE.AddEquation,
+    polygonOffset: true,
+    polygonOffsetFactor: -3,
+    polygonOffsetUnits: -6,
+    toneMapped: false,
+  });
+  const blobMesh = new THREE.Mesh(blobGeo, blobMat);
+  blobMesh.name = 'GrindContactShadow';
+  blobMesh.frustumCulled = false;
+  blobMesh.matrixAutoUpdate = false;
+  blobMesh.castShadow = false;
+  blobMesh.receiveShadow = false;
+  blobMesh.renderOrder = 4;
+
+  const light = new THREE.PointLight(0xffb166, 0, 3.6, 2);
+  light.castShadow = false;
+  light.visible = false;
+
+  group.add(hotMesh);
+  group.add(blobMesh);
+  group.add(light);
+  ctx?.scene?.add?.(group);
+
+  // The rig is pumped on a wall-clock timer, NOT once per rendered frame. On a
+  // software renderer a frame can take more than a second, and a grind staged
+  // between two frames would then be captured with the chassis still on its
+  // free-body transform and an empty spark pool — the presentation would be
+  // hostage to the frame rate. The timer keeps the contact solved and the shower
+  // populated so that whenever a frame IS produced, it is already correct. The
+  // render callbacks pump it once more for freshness and carry the
+  // override-pass guard (GTAO and the puddle mirror swap the material out, and
+  // neither pool has anything to say about depth or normals).
+  const timer = setInterval(onFrame, 40);
+
+  let savedHot = 0;
+  hotMesh.onBeforeRender = (r, s, cam, geo, mat) => {
+    if (mat !== hotMat) { savedHot = hotGeo.instanceCount; hotGeo.instanceCount = 0; return; }
+    onFrame();
+  };
+  hotMesh.onAfterRender = (r, s, cam, geo, mat) => {
+    if (mat !== hotMat) hotGeo.instanceCount = savedHot;
+  };
+  let savedBlob = 0;
+  blobMesh.onBeforeRender = (r, s, cam, geo, mat) => {
+    if (mat !== blobMat) { savedBlob = blobGeo.instanceCount; blobGeo.instanceCount = 0; return; }
+    onFrame();
+  };
+  blobMesh.onAfterRender = (r, s, cam, geo, mat) => {
+    if (mat !== blobMat) blobGeo.instanceCount = savedBlob;
+  };
+
+  let cursor = FLARES;          // the flare slots are never recycled
+  let time = 0;
+
+  const rig = {
+    group,
+
+    setTime(t) { time = t; hotUniforms.uTime.value = t; },
+
+    /** How many more live sparks the shower wants this frame. */
+    deficit(target) {
+      let alive = 0;
+      for (let i = FLARES; i < SPARK_SLOTS; i++) {
+        if (par[i * 4 + 2] > 0 && time - par[i * 4] < par[i * 4 + 1]) alive++;
+      }
+      const want = Math.min(target, SPARK_SLOTS - FLARES);
+      return want > alive ? want - alive : 0;
+    },
+
+    /** `back` (0..1) ages the spark at birth so a fresh shower is never a burst. */
+    spark(p, v, life, size, smear, r, g, b, back) {
+      const i = cursor;
+      cursor = cursor + 1 >= SPARK_SLOTS ? FLARES : cursor + 1;
+      let o = i * 3;
+      org[o] = p.x; org[o + 1] = p.y; org[o + 2] = p.z;
+      vel[o] = v.x; vel[o + 1] = v.y; vel[o + 2] = v.z;
+      tnt[o] = r; tnt[o + 1] = g; tnt[o + 2] = b;
+      o = i * 4;
+      par[o] = time - life * back;
+      par[o + 1] = life;
+      par[o + 2] = size;
+      par[o + 3] = smear;
+      hotGeo.instanceCount = SPARK_SLOTS;
+      aOrigin.needsUpdate = true; aVel.needsUpdate = true;
+      aParam.needsUpdate = true; aTint.needsUpdate = true;
+    },
+
+    /** The always-on additive bloom sprite sitting on a loaded peg. */
+    flare(i, p, size, r, g, b) {
+      let o = i * 3;
+      org[o] = p.x; org[o + 1] = p.y; org[o + 2] = p.z;
+      vel[o] = 0; vel[o + 1] = 0; vel[o + 2] = 0;
+      tnt[o] = r; tnt[o + 1] = g; tnt[o + 2] = b;
+      o = i * 4;
+      par[o] = time; par[o + 1] = 1e6; par[o + 2] = size; par[o + 3] = 0;
+      if (size > 0) hotGeo.instanceCount = SPARK_SLOTS;
+      aOrigin.needsUpdate = true; aVel.needsUpdate = true;
+      aParam.needsUpdate = true; aTint.needsUpdate = true;
+    },
+
+    /** Any live spark keeps the pool drawing; an empty pool costs nothing. */
+    idleHot() {
+      let any = false;
+      for (let i = 0; !any && i < SPARK_SLOTS; i++) {
+        if (par[i * 4 + 2] > 0 && time - par[i * 4] < par[i * 4 + 1]) any = true;
+      }
+      hotGeo.instanceCount = any ? SPARK_SLOTS : 0;
+    },
+
+    /**
+     * @param {number} i     blob slot
+     * @param {THREE.Vector3} c   centre, already lifted off the surface
+     * @param {THREE.Vector3} n   surface normal (unit)
+     * @param {THREE.Vector3} along  long axis hint (unit-ish)
+     */
+    blob(i, c, n, along, halfLen, halfWide, strength, soft) {
+      _fxB.copy(along).addScaledVector(n, -along.dot(n));
+      if (_fxB.lengthSq() < 1e-8) {
+        _fxB.set(1, 0, 0).addScaledVector(n, -n.x);
+        if (_fxB.lengthSq() < 1e-8) _fxB.set(0, 0, 1);
+      }
+      _fxB.normalize();
+      _fxC.crossVectors(_fxB, n).normalize();
+      let o = i * 3;
+      cen[o] = c.x; cen[o + 1] = c.y; cen[o + 2] = c.z;
+      axU[o] = _fxC.x * halfWide; axU[o + 1] = _fxC.y * halfWide; axU[o + 2] = _fxC.z * halfWide;
+      axV[o] = _fxB.x * halfLen; axV[o + 1] = _fxB.y * halfLen; axV[o + 2] = _fxB.z * halfLen;
+      o = i * 2;
+      shp[o] = strength; shp[o + 1] = soft;
+      blobGeo.instanceCount = BLOB_SLOTS;
+      aCenter.needsUpdate = true; aAxisU.needsUpdate = true;
+      aAxisV.needsUpdate = true; aShape.needsUpdate = true;
+    },
+
+    hideBlobs() {
+      if (blobGeo.instanceCount === 0) return;
+      for (let i = 0; i < BLOB_SLOTS; i++) shp[i * 2] = 0;
+      aShape.needsUpdate = true;
+      blobGeo.instanceCount = 0;
+    },
+
+    /** Manual pump. Safe to call any number of times: it is time-based. */
+    tick() { onFrame(); },
+
+    setLight(p, intensity) {
+      if (intensity <= 0.001) { light.visible = false; light.intensity = 0; return; }
+      light.position.copy(p);
+      light.intensity = intensity;
+      light.visible = true;
+    },
+
+    dispose() {
+      clearInterval(timer);
+      const noop = () => {};
+      hotMesh.onBeforeRender = noop; hotMesh.onAfterRender = noop;
+      blobMesh.onBeforeRender = noop; blobMesh.onAfterRender = noop;
+      group.parent?.remove(group);
+      hotGeo.dispose(); hotMat.dispose();
+      blobGeo.dispose(); blobMat.dispose();
+    },
+  };
+  return rig;
+}
 
 /** Per-rail personality, assigned the first time a rail is ever grinded. */
 const railCharacter = new WeakMap();
@@ -891,7 +1314,13 @@ export function createGrind(ctx) {
       _qStep.setFromAxisAngle(AXIS_X, -noseUp);
       _qTarget.multiply(_qStep);
     }
+    // Weight over the line: the chassis rolls toward the rail so the loaded peg
+    // carries the rider's mass. Rolling the chassis rotates the peg offset below,
+    // so the contact stays exact — this only changes how the pose reads.
+    const weightLean = side * GT.railLean
+      * clamp(speed / GT.railLeanSpeed, GT.railLeanFloor, 1);
     const leanRight = type.roll * side
+      + weightLean
       + (type.axis === 'lean' ? 0 : balance * GT.balanceRoll * side)
       + bankAmount;
     if (Math.abs(leanRight) > 1e-4) {
@@ -1050,6 +1479,249 @@ export function createGrind(ctx) {
     if (!input.held('grind') && grindTime > GT.minHoldTime) exit('release', false);
   }
 
+  // ------------------------------------------------- adopting a foreign grind
+
+  /**
+   * Reusable nearestRail-shaped payload for a grind that arrived from outside
+   * this module (a scripted sequence, a replay, the screenshot harness) — those
+   * callers set `physics.state.mode = 'grind'` and hand physics a rail, but
+   * nothing solves the chassis onto the line, so the bike keeps whatever
+   * free-body transform it happened to have: hanging above and behind the rail
+   * with daylight under both wheels. Adopting the rail routes it through the
+   * exact same contact solve a player-initiated grind uses.
+   */
+  const _adopt = {
+    rail: null,
+    t: 0.5,
+    point: new THREE.Vector3(),
+    tangent: new THREE.Vector3(0, 0, 1),
+    type: 'rail',
+    radius: 0.03,
+  };
+  let adoptFailed = null;      // rail we already refused: never retry it every frame
+
+  function adoptExternalGrind(st) {
+    const c = col();
+    if (disposed || active || !c?.railPointAt || !c?.railTangentAt) return false;
+    const hint = st.rail;
+    if (!hint || hint === info) return false;
+    // The hand-off is either a rail record ({ curve, radius, type }) or a hit
+    // payload wrapping one.
+    const rail = hint.curve ? hint : (hint.rail && hint.rail.curve ? hint.rail : null);
+    if (!rail || rail === adoptFailed) return false;
+
+    let at = Number.isFinite(hint.t) ? clamp(hint.t, 0, 1) : NaN;
+    if (!Number.isFinite(at)) {
+      const near = c.nearestRail?.(st.position, 4.0, null);
+      at = near && near.rail === rail ? clamp(near.t, 0, 1) : 0.5;
+    }
+    _adopt.rail = rail;
+    _adopt.t = at;
+    c.railPointAt(rail, at, _adopt.point);
+    c.railTangentAt(rail, at, _adopt.tangent);
+    _adopt.type = typeof hint.type === 'string' ? hint.type : (rail.type || 'rail');
+    _adopt.radius = Number.isFinite(rail.radius) ? rail.radius
+      : (Number.isFinite(hint.radius) ? hint.radius : 0.03);
+
+    // A staged grind can arrive stationary; give it a rideable speed rather than
+    // stalling out on the first step.
+    const along = Math.abs(st.velocity.dot(_adopt.tangent));
+    const held = cooldown;
+    cooldown = 0;
+    const ok = enter(_adopt, {
+      speed: Math.max(along, st.speed || 0, GT.minEnterSpeed + 3.4),
+      type: GRIND_TYPES[hint.grindType] || undefined,
+    });
+    if (!ok) { cooldown = held; adoptFailed = rail; return false; }
+    adoptFailed = null;
+    return true;
+  }
+
+  // ------------------------------------------------- contact presentation
+
+  const contactPoint = new THREE.Vector3();
+  const groundPoint = new THREE.Vector3();
+  const groundNormal = new THREE.Vector3(0, 1, 0);
+  const groundFrom = new THREE.Vector3();
+  let groundValid = false;
+  let groundProbe = 0;
+  let fxLevel = 0;             // 0..1 eased presence so the rig never pops off
+  // The rig owns its clock. `ctx.time.elapsed` is a shared accumulator that other
+  // systems write to and that can run backwards or stall; a particle whose age
+  // goes negative is simply never drawn, so the shower must not depend on it.
+  let fxClock = 0;
+  let fxStamp = 0;             // last wall-clock sample, ms
+
+  /** Peg `i` (0 rear, 1 front) as a world point on the rail. */
+  function pegContact(i, out) {
+    out.copy(contactPoint);
+    if (type.dual) out.addScaledVector(info.tangent, (i ? 1 : -1) * GT.pegSpan);
+    return out;
+  }
+
+  /** One spark: shed backwards along the line, fanned off the tube, then up. */
+  function spawnSpark() {
+    _fxT.copy(info.tangent);
+    _fxN.copy(info.normal);
+    _fxR.crossVectors(_fxN, _fxT);
+    if (_fxR.lengthSq() < 1e-8) _fxR.set(1, 0, 0); else _fxR.normalize();
+
+    const shed = (GT.sparkSpeed + speed * GT.sparkSpeedPerSpeed) * (0.35 + rng() * 1.45);
+    pegContact(rng() < 0.5 ? 0 : 1, _fxA)
+      .addScaledVector(_fxT, (rng() * 2 - 1) * 0.05)
+      .addScaledVector(_fxR, side * (0.15 + rng() * 0.7) * 0.10);
+    // Friction throws the swarf back down the line first, fans it off the tube,
+    // and only then does buoyancy carry it up — a cone, not a ball.
+    _fxB.copy(_fxT).multiplyScalar(-shed)
+      .addScaledVector(_fxR, ((rng() * 2 - 1) * 0.62 + side * 0.30) * shed * 0.55)
+      .addScaledVector(_fxN, (0.05 + rng() * 0.48) * shed);
+
+    const life = GT.sparkLifeMin + rng() * (GT.sparkLifeMax - GT.sparkLifeMin);
+    const hot = 0.45 + rng() * 0.55;
+    const size = GT.sparkSizeMin + rng() * (GT.sparkSizeMax - GT.sparkSizeMin);
+    // Born with a random amount of flight already behind it, so the shower reads
+    // as established on the very first frame it is rendered.
+    // Emitted in linear HDR well above 1.0: the shot is golden-hour daylight, so
+    // anything at scene brightness simply disappears into it, and the bloom pass
+    // only picks up what is over threshold.
+    rig.spark(_fxA, _fxB, life, size, GT.sparkSmear,
+      1.9 + 5.4 * hot, 0.55 + 2.1 * hot, 0.10 + 0.30 * hot * hot, rng());
+  }
+
+  /** No contact this frame: fade the rig out and let live sparks finish. */
+  function retireFX(dt) {
+    fxLevel = fxLevel > 0.001 ? damp(fxLevel, 0, 9, dt) : 0;
+    _fxA.set(0, -1e5, 0);
+    for (let i = 0; i < FLARES; i++) rig.flare(i, _fxA, 0, 0, 0, 0);
+    rig.setLight(_fxA, 0);
+    rig.hideBlobs();
+    rig.idleHot();
+    groundValid = false;
+  }
+
+  /**
+   * Runs once per rendered frame, from the rig's meshes. Deliberately NOT in the
+   * fixed step: the fixed step stops when the game is paused or frozen, and a
+   * grind that loses its sparks and its contact shadow the moment the clock
+   * stops is exactly what makes a rider read as pasted over the level.
+   */
+  function frameTick() {
+    if (disposed) return;
+    const st = phys()?.state;
+    const c = col();
+    // Wall clock, not `ctx.time.dt`: that only advances once per rendered frame,
+    // and the rig has to keep time between frames as well as across them.
+    const stamp = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    if (fxStamp === 0) fxStamp = stamp - 16;
+    let dt = (stamp - fxStamp) / 1000;
+    fxStamp = stamp;
+    if (!(dt > 0)) dt = 1 / 60;
+    else if (dt > 0.05) dt = 0.05;
+    fxClock += dt;
+    const now = fxClock;
+    rig.setTime(now);
+
+    if (!st) { retireFX(dt); return; }
+    if (!active && st.mode === 'grind' && st.rail) adoptExternalGrind(st);
+    if (active && st.mode !== 'grind') exit('abort', false);
+    if (!active || !info.rail) { retireFX(dt); return; }
+
+    // Re-solve the contact from the spline when the fixed step is not advancing,
+    // so a paused or staged grind is welded to the rail rather than frozen
+    // wherever the last free-body transform left it.
+    const stalled = ctx.flags?.paused === true || ctx.flags?.freeze === true;
+    if (stalled && c?.railTangentAt) {
+      railFrame(t);
+      info.tangent.copy(_travel);
+      info.normal.copy(_up);
+      publishState(st, applyTransform(st, 0, true));
+    }
+
+    contactPoint.copy(info.point).addScaledVector(info.normal, railLift);
+    // Contact is binary: the peg is either loading the rail or it is not, so the
+    // rig comes up on the frame the grind starts and only ever eases OUT (see
+    // retireFX). Fading it IN would mean the first frames of every grind — and
+    // every staged frame, which is all a paused capture ever gets — show a bike
+    // on a rail with no sparks and no contact shadow.
+    fxLevel = 1;
+
+    // --- shower ------------------------------------------------------------
+    const heat = material.spark * clamp(speed / 9, 0.35, 1.5);
+    if (heat > 0.22) {
+      const want = Math.min(GT.showerMax,
+        Math.round((GT.showerBase + speed * GT.showerPerSpeed) * clamp(heat, 0, 1.4) * fxLevel));
+      const n = rig.deficit(want);
+      for (let i = 0; i < n; i++) spawnSpark();
+    }
+
+    // --- contact bloom + its light ------------------------------------------
+    // One small sprite per loaded peg, plus a single shared light: the point of
+    // the sprite is a bloom seed on the metal, not a lamp.
+    const phase = character ? character.phaseA : 0;
+    const lit = heat > 0.18;
+    const loaded = type.dual ? 2 : 1;
+    for (let i = 0; i < FLARES; i++) {
+      if (!lit || i >= loaded) { rig.flare(i, contactPoint, 0, 0, 0, 0); continue; }
+      const flick = 0.62 + 0.38 * Math.sin(now * (43.0 + i * 11.0) + phase + i * 2.1);
+      const s = GT.flareSize * (0.62 + 0.58 * clamp(heat, 0, 1.3)) * fxLevel;
+      pegContact(i, _fxA);
+      rig.flare(i, _fxA, s, 5.2 * flick, 2.1 * flick, 0.55 * flick);
+    }
+    if (lit) {
+      const flick = 0.72 + 0.28 * Math.sin(now * 47.0 + phase);
+      rig.setLight(contactPoint, GT.contactLight * clamp(heat, 0, 1.2) * flick * fxLevel);
+    } else {
+      rig.setLight(contactPoint, 0);
+    }
+    rig.idleHot();
+
+    // --- contact shadow ------------------------------------------------------
+    // Metal-on-metal darkening exactly where each loaded peg sits on the tube.
+    const smudge = 0.16 + clamp(speed, 0, 14) * 0.022;
+    for (let i = 0; i < 2; i++) {
+      if (i >= loaded) { rig.blob(2 + i, contactPoint, info.normal, info.tangent, 0.1, 0.1, 0, 0.9); continue; }
+      pegContact(i, _fxA);
+      rig.blob(2 + i, _fxA, info.normal, info.tangent,
+        smudge, Math.max(0.030, railLift * 1.15), 0.52 * fxLevel, 0.92);
+    }
+
+    groundProbe -= dt;
+    if (!groundValid || groundProbe <= 0) {
+      groundProbe = 0.08;
+      groundValid = false;
+      if (c?.raycastDown) {
+        groundFrom.copy(st.position).addScaledVector(WORLD_UP, 0.35);
+        const h = c.raycastDown(groundFrom, 9.0);
+        if (h && h.hit !== false && h.point) {
+          groundPoint.copy(h.point);
+          if (h.normal && h.normal.y > 0.2) groundNormal.copy(h.normal).normalize();
+          else groundNormal.set(0, 1, 0);
+          groundValid = true;
+        }
+      }
+    }
+    if (groundValid) {
+      const drop = clamp(st.position.y - groundPoint.y, 0, GT.shadowFade);
+      const fade = 1 - drop / GT.shadowFade;
+      const grow = 1 + drop * GT.shadowSpread;
+      _fxG.copy(groundPoint).addScaledVector(groundNormal, 0.018);
+      _fxA.set(0, 0, 1).applyQuaternion(st.quaternion);
+      // Wide soft occlusion of the whole rig, then a tight dark core under the
+      // bike — the core is what actually anchors it to the ground plane.
+      rig.blob(0, _fxG, groundNormal, _fxA,
+        0.72 * grow, 0.36 * grow, GT.shadowStrength * 0.5 * fade * fxLevel, 0.95);
+      rig.blob(1, _fxG, groundNormal, _fxA,
+        0.34 * (1 + drop * 0.35), 0.16 * (1 + drop * 0.35),
+        GT.shadowStrength * fade * fxLevel, 0.72);
+    } else {
+      _fxA.set(0, 0, 1);
+      rig.blob(0, contactPoint, WORLD_UP, _fxA, 0.1, 0.1, 0, 0.9);
+      rig.blob(1, contactPoint, WORLD_UP, _fxA, 0.1, 0.1, 0, 0.9);
+    }
+  }
+
+  const rig = createContactRig(ctx, frameTick);
+
   // ------------------------------------------------------------------- api
 
   const api = {
@@ -1097,6 +1769,11 @@ export function createGrind(ctx) {
       if (cooldown > 0) cooldown -= fdt;
       sinceExit += fdt;
 
+      // Someone else parked the chassis on a rail without coming through here
+      // (a scripted sequence, a replay, the shot harness). Take ownership so the
+      // transform is solved from the spline instead of left as a free-body pose.
+      if (!active && st.mode === 'grind' && st.rail) adoptExternalGrind(st);
+
       if (active) {
         // Anything else (a bail, a respawn, the reset key) taking the chassis away
         // ends the grind cleanly rather than leaving us fighting for the transform.
@@ -1136,8 +1813,14 @@ export function createGrind(ctx) {
       api.balanceAxis = type.axis;
     },
 
-    /** Frame hook: main.js does not call it, but the lifecycle stays complete. */
-    update() {},
+    /**
+     * Frame hook. main.js does not call it — the contact rig drives itself off
+     * the render — but calling it is safe and idempotent within a frame.
+     */
+    update() { if (!disposed) rig.tick(); },
+
+    /** The world-space point where the loaded peg meets the line. */
+    get contact() { return contactPoint; },
 
     /** Force the rider off the rail (session end, pause, results screen). */
     release(reason = 'abort') { if (active) exit(reason, false); },
@@ -1154,6 +1837,7 @@ export function createGrind(ctx) {
       api.rail = null;
       info.rail = null;
       pushAudio(true);
+      rig.dispose();
     },
   };
 

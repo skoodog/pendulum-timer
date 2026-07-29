@@ -332,13 +332,36 @@ function createBuild(ctx) {
   // 3.2 m per tile so the aggregate is the right size on a 3.6 m radius. The
   // structure behind it stays raw ply, so sheet / cheek / frame still read as
   // three different materials.
+  //
+  // envMapIntensity is set EXPLICITLY and above 1: a troweled transition is a
+  // near-Lambertian dielectric whose only light on the shadowed side is the sky
+  // dome, and a ramp that takes no indirect term collapses to a black cut-out
+  // silhouette no matter how light its albedo is. aoMapIntensity is pulled back
+  // for the same reason — the baked cavity AO must not eat the sky bounce on a
+  // surface that is one continuous curve with no cavities.
   const rampSheet = M.variant('concreteWorn', {
     tile: 3.2, color: 0xc3c7c9, roughness: 0.86, normalScale: 0.85,
+    envMapIntensity: 1.25, aoMapIntensity: 0.62,
     macro: { scale: 0.055, colour: 0.20, rough: 0.20, warm: 0.10 }, name: 'park_rampSheet',
   });
   const rampStruct = M.variant('plywood', {
-    color: 0xb2a289, roughness: 0.95,
+    color: 0xb2a289, roughness: 0.95, envMapIntensity: 1.1,
     macro: { scale: 0.085, colour: 0.22, rough: 0.14, warm: 0.18 }, name: 'park_rampStruct',
+  });
+
+  // The bowl is a separate pour from the plaza and has to read as one: a wetter,
+  // harder-troweled mix that went down in one go, so it is darker, smoother and
+  // finer-grained than the slab it is cut into. Without this the bowl floor is
+  // the same value as the flat outside it and the pool stops reading as a pool.
+  const bowlFloorMat = M.variant('concreteWorn', {
+    tile: 2.4, color: 0x9aa0a2, roughness: 0.70, normalScale: 0.55,
+    envMapIntensity: 1.3, aoMapIntensity: 0.7,
+    macro: { scale: 0.075, colour: 0.16, rough: 0.24, warm: 0.06 }, name: 'park_bowlFloor',
+  });
+  const bowlWallMat = M.variant('concreteWorn', {
+    tile: 2.8, color: 0xb4b6b2, roughness: 0.80, normalScale: 0.70,
+    envMapIntensity: 1.25, aoMapIntensity: 0.7,
+    macro: { scale: 0.060, colour: 0.18, rough: 0.22, warm: 0.08 }, name: 'park_bowlWall',
   });
 
   // Patch repairs: a second, greyer concrete pour laid over the slab. Cloned
@@ -372,6 +395,8 @@ function createBuild(ctx) {
     ['ramp_ride', rampSheet, true, true, { type: 'ramp', friction: 1.00 }],
     ['ramp_struct', rampStruct, true, true, { type: 'wall', friction: 0.72 }],
     ['park_concrete', M.get('concreteWorn'), true, true, { type: 'ramp', friction: 0.97 }],
+    ['bowl_wall', bowlWallMat, true, true, { type: 'ramp', friction: 0.98 }],
+    ['bowl_floor', bowlFloorMat, false, true, { type: 'ground', friction: 0.99 }],
     ['patch_slab', patchMat, false, true, null],
     ['pool_tile', tileMat, true, true, { type: 'ramp', friction: 0.92 }],
     ['brick_wall', M.get('brick'), true, true, { type: 'wall', friction: 0.55 }],
@@ -803,19 +828,31 @@ function rollIn(build, opts) {
     corner(W * 0.5 - 0.14, zTop + 0.3),
   ], H);
 
-  return { m, W, H, zTop, rows, deck };
+  // `R` is the station where the deck starts, so the generic transition dressing
+  // (cheek/back paint, joints, scrub band) treats a roll-in like any other ramp.
+  return { m, W, H, zTop, rows, deck, R: zTop };
 }
 
 // ---------------------------------------------------------------------------
 // feature: spine (two transitions back to back)
 // ---------------------------------------------------------------------------
 
+/**
+ * Two transitions back to back along an arbitrary ridge line `a` -> `b` (world
+ * XZ). Orientation-free so a spine can be dropped anywhere a line needs a link,
+ * not only across the park's axes.
+ */
 function spine(build, opts) {
-  const { x0, x1, z, radius: R, split = 0.09 } = opts;
+  const { a, b, radius: R, split = 0.09 } = opts;
   const H = R + RAMP_LIFT;
+  const dx = b[0] - a[0], dz = b[1] - a[1];
+  const L = Math.hypot(dx, dz) || 1;
+  const ux = dx / L, uz = dz / L;
+  const kx = uz, kz = -ux;                    // deck direction of the a->b face
+  const off = (p, s) => [p[0] + kx * s, p[1] + kz * s];
   const faces = [
-    { p1: [x1, z - split], p2: [x0, z - split] },   // deck side +Z: rider from the north
-    { p1: [x0, z + split], p2: [x1, z + split] },   // deck side -Z: rider from the south
+    { p1: off(a, -split), p2: off(b, -split) },   // rides toward -k
+    { p1: off(b, split), p2: off(a, split) },     // rides toward +k
   ];
   const out = [];
   for (const fc of faces) {
@@ -829,24 +866,66 @@ function spine(build, opts) {
     out.push({ m, rows, W: f.len, R, H });
   }
   // narrow flat cap between the two copings + the two end slivers
+  const c0 = off(a, -split), c1 = off(b, -split), c2 = off(b, split), c3 = off(a, split);
   const cap = new Surf();
   cap.quad(
-    V(x0, H, z - split, 0, 1, 0, x0, z - split),
-    V(x1, H, z - split, 0, 1, 0, x1, z - split),
-    V(x1, H, z + split, 0, 1, 0, x1, z + split),
-    V(x0, H, z + split, 0, 1, 0, x0, z + split));
+    V(c0[0], H, c0[1], 0, 1, 0, c0[0], c0[1]),
+    V(c1[0], H, c1[1], 0, 1, 0, c1[0], c1[1]),
+    V(c2[0], H, c2[1], 0, 1, 0, c2[0], c2[1]),
+    V(c3[0], H, c3[1], 0, 1, 0, c3[0], c3[1]));
   build.add('ramp_ride', cap.geometry());
 
   const ends = new Surf();
-  for (const [x, sgn] of [[x0, -1], [x1, 1]]) {
+  for (const [p, q, sgn] of [[c0, c3, -1], [c1, c2, 1]]) {
+    const nx = ux * sgn, nz = uz * sgn;
     ends.quad(
-      V(x, 0, z - split, sgn, 0, 0, z - split, 0),
-      V(x, 0, z + split, sgn, 0, 0, z + split, 0),
-      V(x, H, z + split, sgn, 0, 0, z + split, H),
-      V(x, H, z - split, sgn, 0, 0, z - split, H));
+      V(p[0], 0, p[1], nx, 0, nz, 0, 0),
+      V(q[0], 0, q[1], nx, 0, nz, split * 2, 0),
+      V(q[0], H, q[1], nx, 0, nz, split * 2, H),
+      V(p[0], H, p[1], nx, 0, nz, 0, H));
   }
   build.add('ramp_struct', ends.geometry());
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// feature: pyramid (four banks to a flat top — the centrepiece of a plaza)
+// ---------------------------------------------------------------------------
+
+/**
+ * Axis-aligned pyramid: `x0..x1 / z0..z1` footprint, `inset` metres of bank on
+ * every side up to a flat top at `height`. Every top edge is a grind edge, so
+ * the thing can be approached, hipped over and ledged in any direction — which
+ * is the whole point of putting one in the middle of an empty slab.
+ */
+function pyramid(build, opts) {
+  const { x0, z0, x1, z1, height: H, inset = 2.6, rails = true } = opts;
+  const ax0 = x0 + inset, ax1 = x1 - inset, az0 = z0 + inset, az1 = z1 - inset;
+  const banks = [];
+  // north face (rider comes from -Z), south, west, east
+  banks.push(bankRamp(build, {
+    a0: [x1, 0, z0], a1: [x0, 0, z0], b0: [ax1, H, az0], b1: [ax0, H, az0], cheeks: false,
+  }));
+  banks.push(bankRamp(build, {
+    a0: [x0, 0, z1], a1: [x1, 0, z1], b0: [ax0, H, az1], b1: [ax1, H, az1], cheeks: false,
+  }));
+  banks.push(bankRamp(build, {
+    a0: [x0, 0, z0], a1: [x0, 0, z1], b0: [ax0, H, az0], b1: [ax0, H, az1], cheeks: false,
+  }));
+  banks.push(bankRamp(build, {
+    a0: [x1, 0, z1], a1: [x1, 0, z0], b0: [ax1, H, az1], b1: [ax1, H, az0], cheeks: false,
+  }));
+  polygonSlab(build, {
+    pts: [[ax0, az0], [ax1, az0], [ax1, az1], [ax0, az1]], yTop: H, skirt: [false, false, false, false],
+  });
+  if (rails) {
+    const c = [
+      new THREE.Vector3(ax0, H, az0), new THREE.Vector3(ax1, H, az0),
+      new THREE.Vector3(ax1, H, az1), new THREE.Vector3(ax0, H, az1),
+    ];
+    for (let i = 0; i < 4; i++) build.rail([c[i], c[(i + 1) % 4]], 0.055, 'ledge');
+  }
+  return { banks, top: { x0: ax0, z0: az0, x1: ax1, z1: az1, y: H } };
 }
 
 // ---------------------------------------------------------------------------
@@ -942,10 +1021,19 @@ function roundedRectRing(cx, cz, hx, hz, corner) {
   return pts;
 }
 
+/**
+ * A real pool, not a dish. The profile is: a vertical section straight off the
+ * coping, then ONE circular arc of a fixed 2.4 m radius into the flat bottom.
+ * Fixing the radius and floating the depth is how pools are actually shot — the
+ * transition feels identical everywhere and the shallow end simply has less
+ * vert — where scaling the radius with the depth (the old behaviour) turned the
+ * shallow half into a conical dish with no tangent arc and nothing to carve.
+ */
 function buildBowl(build, opts) {
   const {
     cx, cz, hx, hz, corner = 5.5, samples = 128,
-    shallow = 1.8, deep = 3.2, deepDir = [-0.72, -0.7], tileBand = 0.36,
+    shallow = 2.6, deep = 3.0, deepDir = [-0.72, -0.7], tileBand = 0.30,
+    radius: TRANS_R = 2.4, minVert = 0.15,
   } = opts;
 
   const ctrl = roundedRectRing(cx, cz, hx, hz, corner);
@@ -964,26 +1052,34 @@ function buildBowl(build, opts) {
     if ((cx - p.x) * inw.x + (cz - p.z) * inw.y < 0) inw.negate();
     const rad = new THREE.Vector2(p.x - cx, p.z - cz).normalize();
     const w = smoothstep(clamp(0.5 + 0.5 * rad.dot(dd), 0, 1));
-    const D = lerp(shallow, deep, w);
-    const R = Math.min(D, 2.25);
+    // depth floats, radius does not; the vertical section under the coping is
+    // whatever is left over, and is never allowed below `minVert` so the coping
+    // bullnose always sits proud of a genuinely vertical lip
+    const D = Math.max(lerp(shallow, deep, w), TRANS_R + minVert);
+    const R = TRANS_R;
     if (i > 0) run += p.distanceTo(rim[i - 1].p);
     rim.push({ p, inw, D, R, u: run });
   }
 
   // per-sample profile rows: rim, tile-band bottom, then the wall down to the floor
-  const ROWS = 12;
+  const ROWS = 16;
   const rowsFor = (D, R) => {
-    const total = (D - R) + R * HALF_PI;
+    const vert = D - R;                          // straight run below the coping
+    const total = vert + R * HALF_PI;
+    // a constant 0.3 m band all the way round (two 150 mm courses), which at the
+    // shallow end wraps past the vertical on to the top of the arc, exactly as a
+    // real tiled pool does
+    const band = Math.min(tileBand, total * 0.4);
     const out = [];
     for (let j = 0; j <= ROWS; j++) {
-      const s = j === 0 ? 0 : j === 1 ? Math.min(tileBand, total * 0.5)
-        : Math.min(tileBand, total * 0.5) + ((j - 1) / (ROWS - 1)) * (total - Math.min(tileBand, total * 0.5));
+      const s = j === 0 ? 0 : j === 1 ? band
+        : band + ((j - 1) / (ROWS - 1)) * (total - band);
       let h, y, nh, ny;
-      if (s <= D - R) { h = 0; y = -s; nh = 1; ny = 0; }
+      if (s <= vert) { h = 0; y = -s; nh = 1; ny = 0; }
       else {
-        const phi = clamp((s - (D - R)) / R, 0, HALF_PI);
+        const phi = clamp((s - vert) / R, 0, HALF_PI);
         h = R * (1 - Math.cos(phi));
-        y = -(D - R) - R * Math.sin(phi);
+        y = -vert - R * Math.sin(phi);
         nh = Math.cos(phi); ny = Math.sin(phi);
       }
       out.push({ s, h, y, nh, ny });
@@ -1006,9 +1102,9 @@ function buildBowl(build, opts) {
 
   const wall = new Surf();
   wall.grid(samples, ROWS - 1, (i, j) => vert(i, j + 1));
-  build.add('park_concrete', wall.geometry());
+  build.add('bowl_wall', wall.geometry());
 
-  // floor: rings from the centroid out to the foot of the transition
+  // floor: rings from the sump rim out to the foot of the transition
   const foot = [];
   let deepest = { y: 0, x: cx, z: cz };
   for (let i = 0; i <= samples; i++) {
@@ -1023,41 +1119,74 @@ function buildBowl(build, opts) {
   const centre = new THREE.Vector3(
     lerp(cx, deepest.x, 0.55), Math.min(sy, deepest.y + 0.02) - 0.06, lerp(cz, deepest.z, 0.55));
 
-  const RINGS = 4;
+  // The floor is laid to a fall of its own into a recessed sump, so the deep end
+  // has somewhere for water to go and the drain is a hole in the pour rather
+  // than a plate sitting on top of it.
+  const SUMP_R = 0.62, SUMP_D = 0.055;
+  const RINGS = 6;
   const floor = new Surf();
+  const _fn = new THREE.Vector3();
   floor.grid(samples, RINGS, (i, j) => {
     const t = smoothstep(j / RINGS);
     const p = foot[i];
-    const x = lerp(centre.x, p.x, t), z = lerp(centre.z, p.z, t);
-    const y = lerp(centre.y, p.y, smoothstep(j / RINGS));
-    return V(x, y, z, 0, 1, 0, x, z);
+    const dx = p.x - centre.x, dz = p.z - centre.z;
+    const l = Math.hypot(dx, dz) || 1;
+    const ix = centre.x + (dx / l) * SUMP_R, iz = centre.z + (dz / l) * SUMP_R;
+    const x = lerp(ix, p.x, t), z = lerp(iz, p.z, t);
+    const y = lerp(centre.y, p.y, t);
+    // slope of the fall, so the floor takes a raking highlight instead of a flat one
+    _fn.set(-(p.x - ix) * (p.y - centre.y), (p.x - ix) * (p.x - ix) + (p.z - iz) * (p.z - iz),
+      -(p.z - iz) * (p.y - centre.y)).normalize();
+    return V(x, y, z, _fn.x, _fn.y, _fn.z, x, z);
   });
-  build.add('park_concrete', floor.geometry());
+  build.add('bowl_floor', floor.geometry());
 
-  // pool coping bullnose over the rim seam
+  // the sump itself: a shallow cone into the grate seat
+  const sump = new Surf();
+  const SEG = 24;
+  const sumpRing = [];
+  for (let k = 0; k <= SEG; k++) {
+    const a = (k / SEG) * TAU;
+    sumpRing.push([centre.x + Math.cos(a) * SUMP_R, centre.z + Math.sin(a) * SUMP_R]);
+  }
+  const grateR = 0.30;
+  sump.grid(SEG, 1, (i, j) => {
+    const a = (i / SEG) * TAU;
+    const rr = j === 0 ? SUMP_R : grateR;
+    const y = j === 0 ? centre.y : centre.y - SUMP_D;
+    const nl = Math.hypot(SUMP_D, SUMP_R - grateR) || 1;
+    return V(centre.x + Math.cos(a) * rr, y, centre.z + Math.sin(a) * rr,
+      Math.cos(a) * (SUMP_D / nl), (SUMP_R - grateR) / nl, Math.sin(a) * (SUMP_D / nl),
+      centre.x + Math.cos(a) * rr, centre.z + Math.sin(a) * rr);
+  });
+  build.add('bowl_floor', sump.geometry());
+
+  // Pool coping bullnose over the rim seam. It sits PROUD of the deck — the
+  // whole point of pool coping is the lip you can hang up on — with its own
+  // near-white precast tone against the grey of the pour.
   const copPts = [];
   for (let i = 0; i < samples; i++) {
     const r = rim[i];
-    copPts.push(new THREE.Vector3(r.p.x - r.inw.x * 0.012, 0.016, r.p.z - r.inw.y * 0.012));
+    copPts.push(new THREE.Vector3(r.p.x - r.inw.x * 0.014, 0.030, r.p.z - r.inw.y * 0.014));
   }
-  build.add('pool_coping', tubeGeometry(copPts, POOL_R, 12, true, new THREE.Vector3(0, 1, 0)));
+  build.add('pool_coping', tubeGeometry(copPts, POOL_R, 14, true, new THREE.Vector3(0, 1, 0)));
   build.ring(copPts.filter((_, i) => i % 2 === 0), POOL_R, 'coping');
 
-  // cast-iron drain grate at the low point
-  const grateR = 0.34;
+  // cast-iron drain grate, recessed into the sump
   const disc = new Surf();
   const ring = [];
-  for (let k = 0; k < 16; k++) {
-    const a = (k / 16) * TAU;
-    ring.push(V(centre.x + Math.cos(a) * grateR, centre.y + 0.034, centre.z + Math.sin(a) * grateR,
+  for (let k = 0; k < 18; k++) {
+    const a = (k / 18) * TAU;
+    ring.push(V(centre.x + Math.cos(a) * grateR, centre.y - SUMP_D + 0.004, centre.z + Math.sin(a) * grateR,
       0, 1, 0, Math.cos(a) * grateR, Math.sin(a) * grateR));
   }
   disc.fan(ring);
   build.add('frame_steel', disc.geometry());
   for (let k = 0; k < 5; k++) {
-    const off = (k - 2) * 0.115;
-    build.add('frame_steel', boxGeo(0.05, 0.05, grateR * 1.5,
-      new THREE.Matrix4().makeTranslation(centre.x + off, centre.y + 0.046, centre.z)));
+    const off = (k - 2) * 0.105;
+    const halfSpan = Math.sqrt(Math.max(0, grateR * grateR - off * off));
+    build.add('frame_steel', boxGeo(0.045, 0.026, halfSpan * 2,
+      new THREE.Matrix4().makeTranslation(centre.x + off, centre.y - SUMP_D + 0.017, centre.z)));
   }
 
   // Surface sampler for the surfacing pass. `u` is metres travelled around the
@@ -1090,11 +1219,29 @@ function buildBowl(build, opts) {
     };
   };
 
+  /** Height of the bowl floor at a world point — for laying wear on the flat. */
+  const floorY = (x, z) => {
+    const dx = x - centre.x, dz = z - centre.z;
+    const l = Math.hypot(dx, dz);
+    if (l <= SUMP_R) return centre.y - SUMP_D * (1 - clamp((l - grateR) / (SUMP_R - grateR), 0, 1));
+    let bi = 0, bd = Infinity;
+    for (let i = 0; i < samples; i++) {
+      const ex = foot[i].x - centre.x, ez = foot[i].z - centre.z;
+      if (ex * dx + ez * dz <= 0) continue;
+      const el = Math.hypot(ex, ez) || 1;
+      const ang = Math.abs(ex * dz - ez * dx) / (el * l);
+      if (ang < bd) { bd = ang; bi = i; }
+    }
+    const p = foot[bi];
+    const fl = Math.hypot(p.x - centre.x, p.z - centre.z);
+    return lerp(centre.y, p.y, clamp((l - SUMP_R) / Math.max(0.001, fl - SUMP_R), 0, 1));
+  };
+
   return {
     rim: rim.slice(0, samples).map((r) => r.p),
     inward: rim.slice(0, samples).map((r) => r.inw),
     us: rim.slice(0, samples).map((r) => r.u),
-    centre, sample, perimeter: total,
+    centre, sample, perimeter: total, floorY, tileBand,
     depthAt: (u) => {
       const uu = ((u % total) + total) % total;
       let lo = 0, hi = samples;
@@ -1310,11 +1457,132 @@ function buildDirt(build, field) {
 }
 
 // ---------------------------------------------------------------------------
+// slab drainage — the geometry the wet look is built on
+// ---------------------------------------------------------------------------
+// A poured plaza is never a plane. It is laid to falls so rain leaves it, and
+// after the rain the falls are exactly where the water stands. Without them the
+// puddle system (puddles.js) has no low points to bias toward and degenerates
+// into round noise blobs sprinkled at random, which is the single thing that
+// stopped the reference frame's soaked-slab read from ever appearing.
+//
+// Each entry is a shallow dish — 3.4 to 4.6 cm of fall over 5 to 8 m, i.e. under
+// two degrees, so it is invisible as a slope, holds water like a real one, and
+// stays inside the flatness test the puddle survey uses (normal.y > 0.994).
+// The silhouettes are ellipses at a rotation, never circles, so the water that
+// collects in them follows drainage rather than reading as a stamped disc.
+const PAD_DISHES = [
+  { x: -3.0, z: 12.8, rx: 7.5, rz: 4.2, d: 0.054, rot: 0.16 },     // centre run-out
+  { x: -27.0, z: -30.0, rx: 8.0, rz: 3.6, d: 0.056, rot: -0.28 },  // north-west flat
+  { x: 19.5, z: 15.0, rx: 5.8, rz: 6.5, d: 0.052, rot: 0.40 },     // south-east flat
+  { x: 15.0, z: -12.0, rx: 6.0, rz: 5.0, d: 0.050, rot: -0.20 },   // east of the plaza deck
+  { x: -20.5, z: 21.0, rx: 5.5, rz: 6.0, d: 0.048, rot: 0.50 },    // south-west centre
+  { x: 4.0, z: 25.5, rx: 6.0, rz: 4.2, d: 0.046, rot: -0.15 },     // south flat
+  { x: -2.0, z: -28.6, rx: 8.0, rz: 2.6, d: 0.050, rot: 0.05 },    // the pump channel
+];
+
+// Anything that STANDS on the slab has to stand on a level piece of it, or a
+// ramp toe lifts off and a ledge floats. These rects are levelled out of the
+// drainage field with a 2.2 m smooth blend, which keeps the introduced slope
+// under two degrees everywhere.
+const PAD_LEVEL = [
+  [-43, -25, -17, -3],       // bowl rim surround
+  [-23, -43, 14, -31.2],     // north wall of transitions
+  [-13.5, -26.5, 9.5, -17],  // facing quarterpipe + its deck
+  [12.6, -34, 19.4, -23],    // channel spine
+  [18.8, -35, 25, -17],      // wallride bank + wall
+  [-14, -14.5, -8, -3],      // bowl-line spine
+  [-6, -12, 6, 0],           // funbox
+  [6.6, -9, 23, 7],          // plaza deck, stairs, hubba
+  [-29.5, -1.5, -19, 9],     // centre pyramid
+  [-21, 3.0, 12, 9.0],       // street line: ledge, flat rail, manual pad
+  [8, 9.4, 18.6, 12.6],      // stair run-out flat bar
+  [8.6, 13.8, 19.4, 21],     // south quarterpipe
+  [-41, 8.5, -23, 23],       // mini ramp
+  [-5.5, 16.5, 5.5, 30],     // roll-in
+  [-39.5, -11, -29.5, 11],   // spectator concrete / bleachers
+];
+
+/** 0 inside a levelled footprint, 1 more than 2.2 m clear of every one. */
+function padLevelMask(x, z) {
+  let m = 1;
+  for (let i = 0; i < PAD_LEVEL.length; i++) {
+    const k = PAD_LEVEL[i];
+    const dx = Math.max(k[0] - x, 0, x - k[2]);
+    const dz = Math.max(k[1] - z, 0, z - k[3]);
+    const d = Math.hypot(dx, dz);
+    if (d >= 2.2) continue;
+    const v = smoothstep(d / 2.2);
+    if (v < m) m = v;
+    if (m <= 0) return 0;
+  }
+  return m;
+}
+
+/** Angular wobble of a dish rim — shared by the field and the cut-out ring. */
+function dishWobble(p, a) {
+  return 1 + 0.10 * Math.sin(a * 3 + p.x) + 0.06 * Math.sin(a * 5 - p.z * 0.7);
+}
+
+/** Normalised radius in a dish: 0 at the low point, exactly 1 on its rim. */
+function dishT(p, x, z) {
+  const c = Math.cos(p.rot), s = Math.sin(p.rot);
+  const dx = x - p.x, dz = z - p.z;
+  const u = (dx * c + dz * s) / p.rx;
+  const v = (-dx * s + dz * c) / p.rz;
+  const r = Math.hypot(u, v);
+  if (r < 1e-6) return 0;
+  return r / dishWobble(p, Math.atan2(v, u));
+}
+
+/** Depth of the dish field at (x, z), in metres (>= 0), before levelling. */
+function dishDepth(x, z) {
+  let best = 0;
+  for (let i = 0; i < PAD_DISHES.length; i++) {
+    const p = PAD_DISHES[i];
+    const t = dishT(p, x, z);
+    if (t >= 1) continue;
+    const q = p.d * (1 - smoothstep(t));       // tangent to the flat at the rim
+    if (q > best) best = q;
+  }
+  return best;
+}
+
+/** Surface height of the concrete slab at (x, z). Zero off the slab. */
+function padDrain(x, z) {
+  if (x < PAD.minX || x > PAD.maxX || z < PAD.minZ || z > PAD.maxZ) return 0;
+  const d = dishDepth(x, z);
+  return d > 0 ? -d * padLevelMask(x, z) : 0;
+}
+
+/** Unit normal of the drained slab — never more than ~2 degrees off vertical. */
+function padNormal(x, z, out) {
+  const e = 0.35;
+  const gx = (padDrain(x + e, z) - padDrain(x - e, z)) / (2 * e);
+  const gz = (padDrain(x, z + e) - padDrain(x, z - e)) / (2 * e);
+  const inv = 1 / Math.sqrt(gx * gx + gz * gz + 1);
+  return (out || new THREE.Vector3()).set(-gx * inv, inv, -gz * inv);
+}
+
+// ---------------------------------------------------------------------------
 // ground slabs
 // ---------------------------------------------------------------------------
 
+/** Plan ring of one drainage dish, in world XZ, with an irregular silhouette. */
+function dishRing(p, steps = 40) {
+  const pts = [];
+  const c = Math.cos(p.rot), s = Math.sin(p.rot);
+  for (let i = 0; i < steps; i++) {
+    const a = (i / steps) * TAU;
+    // low-frequency wobble on the rim: rain does not pond in ellipses either
+    const k = dishWobble(p, a);
+    const lx = Math.cos(a) * p.rx * k, lz = Math.sin(a) * p.rz * k;
+    pts.push([p.x + lx * c - lz * s, p.z + lx * s + lz * c]);
+  }
+  return pts;
+}
+
 function buildGround(build, bowlRim) {
-  // concrete pad, with the bowl cut out of it
+  // concrete pad, with the bowl and every drainage dish cut out of it
   const shape = new THREE.Shape();
   shape.moveTo(PAD.minX, -PAD.maxZ);
   shape.lineTo(PAD.maxX, -PAD.maxZ);
@@ -1328,10 +1596,40 @@ function buildGround(build, bowlRim) {
     hole.closePath();
     shape.holes.push(hole);
   }
+
+  // The dishes are cut out and re-laid as their own tessellated pans sharing the
+  // exact boundary vertices, so the falls are real geometry with no T-junction
+  // and no crack at the joint — the slab is one watertight surface.
+  const rings = PAD_DISHES.map((p) => dishRing(p));
+  for (const ring of rings) {
+    const hole = new THREE.Path();
+    hole.moveTo(ring[0][0], -ring[0][1]);
+    for (let i = 1; i < ring.length; i++) hole.lineTo(ring[i][0], -ring[i][1]);
+    hole.closePath();
+    shape.holes.push(hole);
+  }
+
   const pad = mergeable(new THREE.ShapeGeometry(shape, 1));
   pad.applyMatrix4(new THREE.Matrix4().makeRotationX(-HALF_PI));
   orientUp(pad);
   build.add('ground_pad', pad);
+
+  const _pn = new THREE.Vector3();
+  for (let k = 0; k < rings.length; k++) {
+    const ring = rings[k], p = PAD_DISHES[k];
+    const cx = p.x, cz = p.z;
+    const RINGS = 7;
+    const s = new Surf();
+    s.grid(ring.length, RINGS, (i, j) => {
+      const t = 1 - j / RINGS;                     // j = 0 is the rim
+      const e = ring[i % ring.length];
+      const x = lerp(cx, e[0], t), z = lerp(cz, e[1], t);
+      const y = padDrain(x, z);
+      padNormal(x, z, _pn);
+      return V(x, y, z, _pn.x, _pn.y, _pn.z, x, z);
+    });
+    build.add('ground_pad', s.geometry());
+  }
 
   // asphalt lot framing the pad and the dirt zone
   const rects = [
@@ -1612,6 +1910,92 @@ function rampPaint(build, face, opts) {
 }
 
 /**
+ * The surfacing a poured concrete transition actually carries, applied from the
+ * ramp's own frame so it lands identically on every ramp in the park:
+ *
+ *   * sawn control joints running up the sheet every ~2.4 m across the width —
+ *     no slab this size is poured in one bay, and the joints are the single
+ *     strongest cue that the surface is concrete and not a painted panel;
+ *   * the cold joint where the sheet meets the flat;
+ *   * a 150 mm band of laid-down rubber where the wheels load the steepest part
+ *     of the arc, and the polish line right under the coping above it;
+ *   * scattered peg and tyre streaks through both.
+ */
+function dressRampSheet(build, face, streaks = 5) {
+  const { W, R, rows } = face;
+  const sMax = rows[rows.length - 1].s;
+  if (sMax < 0.6 || W < 0.8) return;
+
+  const nj = Math.max(0, Math.round(W / 2.4) - 1);
+  for (let i = 1; i <= nj; i++) {
+    const x = -W * 0.5 + (i / (nj + 1)) * W;
+    rampPaint(build, face, {
+      cell: 'laneLine', x, s: sMax * 0.5, size: sMax, sx: 0.11 / sMax,
+      layer: 'wear', tint: 0x2b2823, alpha: 0.5, off: 0.010,
+    });
+  }
+  rampPaint(build, face, {                       // cold joint at the foot
+    cell: 'laneLine', x: 0, s: 0.09, size: 0.20, sx: (W * 0.99) / 0.20, uvRot: 1,
+    layer: 'wear', tint: 0x2f2c27, alpha: 0.42, off: 0.010,
+  });
+  // the rubber band: black, hard-edged, and exactly where a wheel loads up
+  const sBand = clamp(sMax - R * 0.46, 0.30, sMax - 0.14);
+  rampPaint(build, face, {
+    cell: 'skid', x: 0, s: sBand, size: 0.15, sx: (W * 0.96) / 0.15,
+    layer: 'wear', tint: 0x17150f, alpha: 0.66,
+  });
+  rampPaint(build, face, {                       // wider carve smudge around it
+    cell: 'splatter', x: 0, s: sBand, size: 0.62, sx: (W * 0.94) / 0.62,
+    layer: 'wear', tint: 0x3a352c, alpha: 0.26,
+  });
+  rampPaint(build, face, {                       // polish line under the coping
+    cell: 'skid', x: 0, s: sMax - 0.16, size: 0.22, sx: (W * 0.92) / 0.22,
+    layer: 'wear', tint: 0x2b2824, alpha: 0.40,
+  });
+  for (let i = 0; i < streaks; i++) {
+    const h = rand(0.45, 1.25);
+    rampPaint(build, face, {
+      cell: 'skid', x: rand(-W * 0.44, W * 0.44),
+      s: clamp(sMax - rand(0.2, 1.0) - h * 0.5, h * 0.5, sMax - h * 0.5),
+      size: h, sx: rand(0.12, 0.36), uvRot: 1,
+      layer: 'wear', tint: 0x272420, alpha: rand(0.22, 0.5),
+    });
+  }
+}
+
+/**
+ * Graffiti on the two cheeks and the back wall of a transition, derived from the
+ * ramp's own frame. Doing it generically rather than by hand is what guarantees
+ * that no ramp anywhere in the park ends up with a bare vertical face.
+ * Only the part of a cheek behind the lip station is painted, because in front
+ * of it the arc has cut the panel away and paint would hang in the air.
+ */
+function dressRampFaces(build, face, opts = {}) {
+  const { m, W, H, R, deck = 0 } = face;
+  const UP = new THREE.Vector3(0, 1, 0);
+  const len = deck - 0.5;
+  if (len >= 1.2 && H >= 0.9) {
+    const cz = R + 0.25 + len * 0.5;
+    for (const sgn of [-1, 1]) {
+      paintWall(build, {
+        o: new THREE.Vector3(sgn * (W * 0.5 + 0.004), 0, cz).applyMatrix4(m),
+        right: new THREE.Vector3(0, 0, -sgn).transformDirection(m),
+        up: UP.clone(), len, hgt: H * 0.94,
+        density: opts.density ?? 1.3, streaks: opts.streaks ?? 1, pieces: opts.pieces,
+      });
+    }
+  }
+  if (deck > 0.5 && W >= 2.2 && H >= 0.9) {
+    paintWall(build, {
+      o: new THREE.Vector3(0, 0, R + deck + 0.004).applyMatrix4(m),
+      right: new THREE.Vector3(1, 0, 0).transformDirection(m),
+      up: UP.clone(), len: W - 0.3, hgt: H * 0.94,
+      density: opts.backDensity ?? 1.0, streaks: opts.backStreaks ?? 2,
+    });
+  }
+}
+
+/**
  * Paints a rectangular face. `o` is the centre of its bottom edge ON the
  * surface; `right` and `up` are unit vectors in the face with `right x up`
  * pointing out of it, so one routine covers a wall, a deck fascia and a bank.
@@ -1775,9 +2159,26 @@ export async function createPark(ctx) {
   const group = new THREE.Group();
   group.name = 'park';
 
-  // === north wall of transitions ==========================================
+  // =========================================================================
+  // LAYOUT — a flow graph, not a sprinkle of islands
+  // =========================================================================
+  // Every feature below belongs to a named LINE, and inside a line the gap
+  // between two obstacles is 4-8 m: one pump, or one push. Lines cross at the
+  // funbox and at the plaza deck, so a run can switch between them without ever
+  // rolling across dead ground.
+  //
+  //   LINE A  "the channel"   north wall of transitions  <->  facing quarterpipe
+  //                           (7 m of flat between two facing lips)
+  //                           -> channel spine -> wallride bank -> wallride wall
+  //   LINE B  "the bowl line"  bowl shallow-end roll-out -> bowl-line spine
+  //                           -> funbox + rail -> facing quarterpipe deck
+  //   LINE C  "the street"     plaza deck -> stair set / handrail / hubba
+  //                           -> flat bar -> south quarterpipe
+  //   LINE D  "the west run"   bowl -> centre pyramid -> mini ramp
+  //   and the street ledge/rail/manual-pad run at z = 6 ties C back into B.
+
+  // === LINE A: north wall of transitions ===================================
   const LIP_Z = -35.6;
-  const BACK_Z = -42.6;
 
   const qpBig = quarterPipe(build, {                     // 3.6 m quarterpipe
     p1: [-21, LIP_Z], p2: [-13, LIP_Z], radius: 3.6, deck: 7, guard: true,
@@ -1793,18 +2194,36 @@ export async function createPark(ctx) {
     west: [-6, LIP_Z], corner: [-1.75, -32.6], east: [2.5, LIP_Z], radius: 2.4, backZ: -41.6,
   });
 
-  // === bowl ================================================================
-  const bowl = buildBowl(build, {
-    cx: -30, cz: -14, hx: 12, hz: 10, corner: 5.5,
-    shallow: 1.8, deep: 3.2, deepDir: [-0.75, -0.66],
+  // === LINE A: the facing wall =============================================
+  // Points back at the north wall across 7 m of flat, which is exactly one pump.
+  // This is the single change that turns the north end from a row of isolated
+  // ramps into a run you can go back and forth in without pedalling.
+  const FACE_LIP = -22.6;
+  const qpFace = quarterPipe(build, {
+    p1: [8, FACE_LIP], p2: [-12, FACE_LIP], radius: 2.4, deck: 5.0, guard: true,
   });
 
-  // === spine ===============================================================
-  const spineFaces = spine(build, { x0: 6, x1: 18, z: -16, radius: 1.8 });
+  // === LINE A: the channel spine, feeding the wallride ====================
+  const spineCh = spine(build, { a: [16, -32.5], b: [16, -24.0], radius: 1.8 });
 
-  // === mini ramp (two facing transitions, 12.4 m of flat between) ==========
+  // === bowl (head of LINE B and LINE D) ====================================
+  const bowl = buildBowl(build, {
+    cx: -30, cz: -14, hx: 12, hz: 10, corner: 5.5,
+    shallow: 2.6, deep: 3.0, deepDir: [-0.75, -0.66], radius: 2.4,
+  });
+
+  // === LINE B: the spine off the bowl roll-out =============================
+  const spineBowl = spine(build, { a: [-11, -13], b: [-11, -4], radius: 1.6 });
+  const spineFaces = [...spineCh, ...spineBowl];
+
+  // === LINE D: mini ramp (two facing transitions, 12.4 m of flat between) ==
   const miniW = quarterPipe(build, { p1: [-40, 22], p2: [-40, 10], radius: 1.8, deck: 3.0, guard: true });
   const miniE = quarterPipe(build, { p1: [-24, 10], p2: [-24, 22], radius: 1.8, deck: 3.0, guard: true });
+
+  // === LINE D: the centre pyramid ==========================================
+  // The old layout left twenty metres of bare slab here. A pyramid fills it with
+  // something that works from all four sides and links the bowl to the mini ramp.
+  const pyr = pyramid(build, { x0: -28.5, z0: -0.5, x1: -20.0, z1: 8.0, height: 1.15, inset: 2.7 });
 
   // === roll-in =============================================================
   const roll = rollIn(build, { p1: [3.5, 18], p2: [-3.5, 18], height: 3.0, deck: 6.2 });
@@ -1896,15 +2315,30 @@ export async function createPark(ctx) {
   build.rail([new THREE.Vector3(WALL.x, WALL.h, WALL.z0 + 0.3), new THREE.Vector3(WALL.x, WALL.h, WALL.z1 - 0.3)],
     0.06, 'ledge');
 
-  // === street furniture: flat ledges and a flat rail =======================
-  ledges.push(flatLedge(build, { x0: -16, z0: -2, x1: -16, z1: 6, width: 0.6, height: 0.42 }));
-  ledges.push(flatLedge(build, { x0: -11.5, z0: 12, x1: -5.5, z1: 12, width: 0.6, height: 0.36 }));
+  // === LINE C: stair run-out — flat bar, then the south quarterpipe ========
+  // The stairs land at z = 5.6; the bar is 5.4 m past that and the transition
+  // 4 m past the bar, so the whole thing rides as one sentence.
+  const flatBar = flatLedge(build, {
+    x0: 10, z0: 11, x1: 16, z1: 11, width: 0.55, height: 0.42,
+  });
+  ledges.push(flatBar);
+  const qpSouth = quarterPipe(build, {
+    p1: [18, 16.5], p2: [10, 16.5], radius: 1.5, deck: 3.5, guard: true,
+  });
+
+  // === the street run at z = 6 — ledge, rail, manual pad ==================
+  // Ties LINE C back into LINE B across the middle of the plaza: three obstacles
+  // in a straight west-east row, 3-4 m apart, all rideable in either direction.
+  ledges.push(flatLedge(build, { x0: -19, z0: 6, x1: -11, z1: 6, width: 0.7, height: 0.45 }));
+  // The gap between the rail and the manual pad is deliberately 5 m wide and
+  // centred on x = 0: that is the park's main north-south run-up, and nothing is
+  // allowed to sit across it.
   roundRail(build, [
-    new THREE.Vector3(-9, 0.44, 2), new THREE.Vector3(-9, 0.44, 10),
+    new THREE.Vector3(-8, 0.44, 6), new THREE.Vector3(-2, 0.44, 6),
   ], { postEvery: 2.6 });
-  // manual pad by the roll-in run-out
-  const manualPad = flatLedge(build, { x0: 8.5, z0: 14, x1: 14.5, z1: 14, width: 2.6, height: 0.22, rails: false });
-  build.rail([new THREE.Vector3(8.5, 0.22, 15.3), new THREE.Vector3(14.5, 0.22, 15.3)], 0.05, 'ledge');
+  const manualPad = flatLedge(build, { x0: 3, z0: 6, x1: 9, z1: 6, width: 2.6, height: 0.22, rails: false });
+  build.rail([new THREE.Vector3(3, 0.22, 4.7), new THREE.Vector3(9, 0.22, 4.7)], 0.05, 'ledge');
+  build.rail([new THREE.Vector3(3, 0.22, 7.3), new THREE.Vector3(9, 0.22, 7.3)], 0.05, 'ledge');
 
   // === dirt jump line ======================================================
   const JUMP_X = 47;
@@ -1934,14 +2368,35 @@ export async function createPark(ctx) {
   // first, then the walls get painted, then wear goes over the top of both.
   const UPV = new THREE.Vector3(0, 1, 0);
 
-  /** Decal lying on a horizontal surface; `w` x `h` metres, `rot` about +Y. */
-  const flatDecal = (cell, x, z, w, h, rot = 0, opts = {}) => build.decal(cell,
-    decalMatrix(new THREE.Vector3(x, opts.y ?? 0, z), UPV,
-      new THREE.Vector3(Math.sin(rot), 0, Math.cos(rot)), w, h, opts.off ?? 0.011),
-    {
+  /**
+   * Decal lying on a horizontal surface; `w` x `h` metres, `rot` about +Y.
+   * On the plaza slab it is built as a patch that FOLLOWS the drainage falls,
+   * so a 5 m stain laid across a dish hugs the dip instead of bridging it and
+   * lifting off at the rim. Everywhere else it stays a two-triangle quad.
+   */
+  const flatDecal = (cell, x, z, w, h, rot = 0, opts = {}) => {
+    const off = opts.off ?? 0.012;
+    const meta = {
       layer: opts.layer || 'paint', tint: opts.tint ?? 0xffffff,
       alpha: opts.alpha ?? 1, uvRot: opts.uvRot || 0,
+    };
+    const onSlab = opts.y === undefined
+      && x > PAD.minX && x < PAD.maxX && z > PAD.minZ && z < PAD.maxZ;
+    if (!onSlab) {
+      return build.decal(cell, decalMatrix(new THREE.Vector3(x, opts.y ?? 0, z), UPV,
+        new THREE.Vector3(Math.sin(rot), 0, Math.cos(rot)), w, h, off), meta);
+    }
+    const c = Math.cos(rot), s = Math.sin(rot);
+    return patchDecal(build, cell, (u, v) => {
+      const ax = (u - 0.5) * w, ay = (v - 0.5) * h;
+      const wx = x - c * ax + s * ay;
+      const wz = z + s * ax + c * ay;
+      return { p: new THREE.Vector3(wx, padDrain(wx, wz), wz), n: padNormal(wx, wz) };
+    }, {
+      nu: clamp(Math.round(w / 2.2), 1, 6), nv: clamp(Math.round(h / 2.2), 1, 6),
+      off, ...meta,
     });
+  };
 
   /** One mark on an axis-aligned vertical face; `yaw` points along the normal. */
   const mark = (cell, x, y, z, yaw, w, h, opts = {}) => build.decal(cell,
@@ -1990,23 +2445,11 @@ export async function createPark(ctx) {
     return bowl.us[best];
   };
 
-  /** Tyre and peg wear on a transition: rub line under the lip, streaks below it. */
-  const rampWear = (fc, n = 5) => {
-    const sMax = fc.rows[fc.rows.length - 1].s;
-    rampPaint(build, fc, {
-      cell: 'skid', x: 0, s: sMax - 0.20, size: 0.30, sx: (fc.W * 0.92) / 0.30,
-      layer: 'wear', tint: 0x2b2824, alpha: 0.42,
-    });
-    for (let i = 0; i < n; i++) {
-      const h = rand(0.45, 1.25);
-      rampPaint(build, fc, {
-        cell: 'skid', x: rand(-fc.W * 0.44, fc.W * 0.44),
-        s: clamp(sMax - rand(0.2, 1.0) - h * 0.5, h * 0.5, sMax - h * 0.5),
-        size: h, sx: rand(0.12, 0.36), uvRot: 1,
-        layer: 'wear', tint: 0x272420, alpha: rand(0.22, 0.5),
-      });
-    }
-  };
+  // Every transition in the park, for the passes that must never be skipped.
+  const allRamps = [
+    qpBig, qpVert, qpEast, qpFace, qpSouth, miniW, miniE, roll,
+    ...spineFaces, ...hipFaces,
+  ];
 
   // --- road paint out on the asphalt ---------------------------------------
   for (let i = 0; i < 11; i++) flatDecal('laneLine', -52 + i * 2.7, 41, 0.20, 5.2, 0);
@@ -2023,13 +2466,13 @@ export async function createPark(ctx) {
   flatDecal('arrow', 33, 26, 2.6, 4.2, -0.5);
   flatDecal('noSkating', -20.5, 28.5, 3.4, 3.4, 0.12);
   flatDecal('number540', 21, 20, 4.4, 4.4, 0.2);
-  flatDecal('stencilDiy', -13, -25, 3.6, 3.6, -0.35);
+  flatDecal('stencilDiy', -15.5, -21, 3.6, 3.6, -0.35);
   flatDecal('splatter', -30, -27.5, 5, 5, 0.4);
   // ground paint is old paint: half worn through, and never in a saturated colour
-  flatDecal('stencilDiy', -1.0, 7.5, 5.0, 5.0, 0.06, { alpha: 0.34 });
-  flatDecal('number540', -1.5, -22.5, 4.6, 4.6, 0.1, { alpha: 0.30 });
+  flatDecal('stencilDiy', -2.0, 14.0, 5.0, 5.0, 0.06, { alpha: 0.34 });
+  flatDecal('number540', -2.0, -29.5, 4.6, 4.6, 0.1, { alpha: 0.30 });
   flatDecal('stencilStar', 14.5, 8.0, 2.4, 2.4, 0.3, { alpha: 0.32 });
-  flatDecal('tagMirra', -29, 6.5, 5.0, 5.0, -0.22, { alpha: 0.16 });
+  flatDecal('tagMirra', -34, 20.5, 5.0, 5.0, -0.22, { alpha: 0.16 });
   // the wheel line scrubbing the flat paint back off again
   for (let i = 0; i < 26; i++) {
     const t = i / 25;
@@ -2037,15 +2480,99 @@ export async function createPark(ctx) {
       rand(-0.25, 0.25), { layer: 'wear', tint: 0x37332d, alpha: rand(0.12, 0.30) });
   }
 
+  // Footprints that are NOT open slab: anything raised, cut away or ridden over
+  // sits here, and nothing laid flat on the ground is allowed inside one — a
+  // decal dropped on the bowl's plan would hang in mid-air over the pool, and
+  // one under the plaza deck is just wasted geometry.
+  const KEEP_CLEAR = [
+    [-43, -25, -17, -3], [-23, -43, 14, -31.2], [-13.5, -26.5, 9.5, -17],
+    [12.6, -34, 19.4, -23], [18.8, -35, 25, -17], [-14, -14.5, -8, -3],
+    [-6, -12, 6, 0], [6.6, -9, 23, 7], [-29.5, -1.5, -19, 9],
+    [-21, 3, 12, 9], [8, 9.4, 18.6, 12.6], [8.6, 13.8, 19.4, 21],
+    [-41, 8.5, -23, 23], [-5.5, 16.5, 5.5, 30],
+  ];
+  const openSlab = (x, z) => {
+    for (const k of KEEP_CLEAR) if (x > k[0] && x < k[2] && z > k[1] && z < k[3]) return false;
+    return true;
+  };
+
+  // --- the wet plaza --------------------------------------------------------
+  // The reference frame's defining property is a rained-on slab. The geometry
+  // already falls into the dishes (see PAD_DISHES); this is the albedo half of
+  // it — a dark ring where the water feathers out, and a broad damp sheen in
+  // and around every low point, on the low-roughness `damp` layer so those
+  // areas actually return a specular instead of staying uniformly matte.
+  for (const p of PAD_DISHES) {
+    const rr = (p.rx + p.rz) * 0.5;
+    // the wet edge: a ring of darker, softer concrete just outside the water
+    const nRing = Math.max(8, Math.round(rr * 2.2));
+    for (let i = 0; i < nRing; i++) {
+      const a = (i / nRing) * TAU + rand(-0.08, 0.08);
+      const k = dishWobble(p, a) * rand(0.76, 1.02);
+      const c = Math.cos(p.rot), s = Math.sin(p.rot);
+      const lx = Math.cos(a) * p.rx * k, lz = Math.sin(a) * p.rz * k;
+      const x = p.x + lx * c - lz * s, z = p.z + lx * s + lz * c;
+      const w = rand(2.0, 4.4);
+      flatDecal(pick(GRIME_CELLS), x, z, w, w * rand(0.6, 1.0), rand(0, 3),
+        { layer: 'damp', tint: 0x4c5157, alpha: rand(0.30, 0.55), off: 0.009 });
+    }
+    // the standing water's own footprint, damp right through
+    for (let i = 0; i < Math.max(5, Math.round(rr * 1.4)); i++) {
+      const a = rng() * TAU, t = Math.sqrt(rng()) * 0.82;
+      const c = Math.cos(p.rot), s = Math.sin(p.rot);
+      const lx = Math.cos(a) * p.rx * t, lz = Math.sin(a) * p.rz * t;
+      const x = p.x + lx * c - lz * s, z = p.z + lx * s + lz * c;
+      const w = rand(2.6, 5.6);
+      flatDecal('waterStain', x, z, w, w * rand(0.55, 1.0), rand(0, 3),
+        { layer: 'damp', tint: 0x3f464b, alpha: rand(0.34, 0.6), off: 0.008 });
+    }
+    // silt and leaf litter collect on the rim, which is what dates a puddle
+    for (let i = 0; i < 4; i++) {
+      const a = rng() * TAU;
+      const c = Math.cos(p.rot), s = Math.sin(p.rot);
+      const k = dishWobble(p, a) * rand(0.7, 0.95);
+      const lx = Math.cos(a) * p.rx * k, lz = Math.sin(a) * p.rz * k;
+      flatDecal('splatter', p.x + lx * c - lz * s, p.z + lx * s + lz * c,
+        rand(1.0, 2.4), rand(1.0, 2.4), rng() * 3,
+        { layer: 'paint', tint: 0x6a5f45, alpha: rand(0.16, 0.34) });
+    }
+  }
+  // Saw-cut drainage joints running between the low points. Real slabs are cut
+  // on a grid and the water tracks the cuts, so this is also where the thin
+  // wet lines in the reference come from.
+  const JOINT_LINES = [
+    [[-44, -20], [-27, -30], [-6, -28.6], [12, -26]],
+    [[-40, 10], [-20.5, 21], [-3, 12.8], [12, 9], [25, 14]],
+    [[-3, 12.8], [4, 25.5], [20, 28]],
+    [[19.5, 15], [15, -12], [10, -30]],
+    [[-27, -30], [-16, -16], [-15, -2], [-22, 12], [-30, 26]],
+  ];
+  for (const line of JOINT_LINES) {
+    for (let i = 0; i + 1 < line.length; i++) {
+      const [ax, az] = line[i], [bx, bz] = line[i + 1];
+      const len = Math.hypot(bx - ax, bz - az);
+      const n = Math.max(2, Math.round(len / 3.0));
+      const yaw = Math.atan2(bx - ax, bz - az);
+      for (let k = 0; k < n; k++) {
+        const t = (k + 0.5) / n;
+        const x = lerp(ax, bx, t), z = lerp(az, bz, t);
+        if (!openSlab(x, z)) continue;
+        flatDecal('laneLine', x, z, 0.09, len / n + 0.4, yaw,
+          { layer: 'wear', tint: 0x35322b, alpha: 0.45, off: 0.010 });
+        flatDecal('skid', x, z, 0.62, len / n + 0.4, yaw,
+          { layer: 'damp', tint: 0x4a4f54, alpha: 0.26, uvRot: 1, off: 0.008 });
+      }
+    }
+  }
+
   // --- scattered wear on the slab ------------------------------------------
   const openSpot = () => {
-    for (let i = 0; i < 24; i++) {
+    for (let i = 0; i < 32; i++) {
       const x = rand(PAD.minX + 3, PAD.maxX - 3);
       const z = rand(PAD.minZ + 3, PAD.maxZ - 3);
-      if (x > -43 && x < -17 && z > -25 && z < -3) continue;      // bowl
-      return [x, z];
+      if (openSlab(x, z)) return [x, z];
     }
-    return [0, 20];
+    return [-36, 26];
   };
   for (let i = 0; i < 14; i++) {
     const [x, z] = openSpot();
@@ -2124,7 +2651,7 @@ export async function createPark(ctx) {
     patchAt(x, z, rand(0.7, 2.2), rand(0.6, 1.9));
   }
   patchAt(0, -12.6, 3.0, 1.3);                                 // funbox run-out
-  patchAt(0, 20.0, 2.6, 1.6);                                  // roll-in landing
+  patchAt(0, 15.4, 2.6, 1.6);                                  // roll-in run-out
 
   // --- the wallride wall: the lot's production wall -------------------------
   // The one wall in the park that carries an event banner, painted over by the
@@ -2144,46 +2671,68 @@ export async function createPark(ctx) {
   face(15.0, 0, PLZ.z0, Math.PI, 13.2, 1.54, { density: 1.2, streaks: 2 });
   face(10.0, 0, PLZ.z1, 0, 3.5, 1.54, { pieces: 1, density: 1.2 });
   face(19.7, 0, PLZ.z1, 0, 4.4, 1.54, { pieces: 1, density: 1.2 });
-  // stair cheek + hubba flank: tags only, they are too broken up for a piece
-  mark('sprayX', 12 - 0.01, 0.72, 2.9, -HALF_PI, 0.9, 0.9, { roll: 0.2, tint: 0xc6d9ff });
-  mark('stencilDiy', 12 - 0.01, 0.42, 4.1, -HALF_PI, 1.1, 1.1, { roll: -0.15 });
-  mark('throwBmx', 17.4, 1.30, 2.6, HALF_PI, 1.9, 1.9, { tint: 0xffd0ac, alpha: 0.9 });
-  mark('sprayX', 17.4, 0.70, 4.6, HALF_PI, 0.85, 0.85, { roll: -0.3 });
+  // Stair cheeks and the hubba flank. Both taper away down the run, so the paint
+  // is kept to the top of the flight where the mass is still full height —
+  // exactly where it goes in life, because that is what you can reach standing
+  // on the deck.
+  face(12 - 0.01, 0, 3.05, -HALF_PI, 1.9, 0.60, { density: 2.2, pieces: 2, streaks: 1 });
+  face(17.4, 0, 3.05, HALF_PI, 1.9, 0.66, { density: 2.0, pieces: 2 });
+  mark('throwBmx', 17.4, 0.62, 2.7, HALF_PI, 1.1, 1.1, { tint: 0xffd0ac, alpha: 0.9 });
+  mark('sprayX', 12 - 0.01, 0.55, 2.6, -HALF_PI, 0.8, 0.8, { roll: 0.2, tint: 0xc6d9ff });
+  // stair risers: the one face on a stair set that is always tagged. Only the
+  // four above the landing — below it the run steps sideways.
+  for (let n = 1; n <= 4; n++) {
+    mark(pick(TAG_CELLS), 12.5 + (n - 1) * 1.05, PLZ.h - n * 0.2 + 0.10, PLZ.z1 + n * 0.32 - 0.004,
+      0, 0.24, 0.24, { tint: pick(PAINT_TINTS), alpha: rand(0.5, 0.85), roll: rand(-0.3, 0.3), off: 0.008 });
+  }
+
+  // hip deck: its back and side skirts are 2.3 m of bare wall otherwise
+  face(-1.75, 0, -41.6, Math.PI, 8.0, 2.32, { density: 1.0, streaks: 2 });
+  face(-6, 0, -38.6, -HALF_PI, 5.6, 2.32, { density: 1.2 });
+  face(2.5, 0, -38.6, HALF_PI, 5.6, 2.32, { density: 1.2 });
 
   // --- funbox skirts --------------------------------------------------------
   face(FB.x1, 0, -6, HALF_PI, 5.6, 0.86, { density: 1.3 });
   face(FB.x0, 0, -6, -HALF_PI, 5.6, 0.86, { density: 1.3 });
 
-  // --- north wall of transitions: cheeks and backs --------------------------
-  face(-21, 0, -39.1, -HALF_PI, 6.4, 3.45, { density: 1.4, streaks: 1 });
-  face(-7.5, 0, -39.1, HALF_PI, 6.4, 3.45, { density: 1.4 });
-  face(4, 0, -38.6, -HALF_PI, 5.6, 2.3, { density: 1.3 });
-  face(12, 0, -38.6, HALF_PI, 5.6, 2.3, { density: 1.3 });
-  face(-14.25, 0, BACK_Z, Math.PI, 13.0, 3.4, { density: 0.8, streaks: 2 });
-  face(8, 0, -41.6, Math.PI, 7.4, 2.3, { density: 0.7 });
-  face(-1.75, 0, -41.6, Math.PI, 8.0, 2.3, { density: 0.7 });
-
-  // --- mini ramp ------------------------------------------------------------
-  face(-41.5, 0, 22, 0, 2.6, 1.72, { pieces: 1, density: 1.2 });
-  face(-41.5, 0, 10, Math.PI, 2.6, 1.72, { pieces: 1, density: 1.2 });
-  face(-43, 0, 16, -HALF_PI, 11.4, 1.74, { density: 1.0 });
-  face(-22.5, 0, 10, Math.PI, 2.6, 1.72, { pieces: 1, density: 1.2 });
-  face(-22.5, 0, 22, 0, 2.6, 1.72, { pieces: 1, density: 1.2 });
-  face(-21, 0, 16, HALF_PI, 11.4, 1.74, { density: 1.4, streaks: 1 });
-
-  // --- roll-in --------------------------------------------------------------
+  // --- every transition's cheeks and back wall -----------------------------
+  // Driven off each ramp's own frame rather than typed out per feature, so a
+  // ramp cannot be moved, resized or added without its paint coming with it —
+  // which is how the park ended up with bare cheeks in the first place.
+  for (const fc of allRamps) dressRampFaces(build, fc);
   const rollBackZ = 18 + roll.zTop + roll.deck;
-  face(0, 0, rollBackZ, 0, 6.6, 2.9, { density: 1.6, streaks: 2 });
-  mark('sponsor', 0, 2.28, rollBackZ, 0, 6.4, 6.4, { alpha: 0.8, off: 0.010 });
-  face(3.5, 0, rollBackZ - roll.deck * 0.5, HALF_PI, 5.6, 2.9, { density: 1.2 });
-  face(-3.5, 0, rollBackZ - roll.deck * 0.5, -HALF_PI, 5.6, 2.9, { density: 1.2 });
+  mark('sponsor', 0, 1.72, rollBackZ, 0, 6.4, 6.4, { alpha: 0.8, off: 0.010 });
+  mark('sponsor', 0, 1.32, -17.6, 0, 4.6, 4.6, { alpha: 0.85, off: 0.010 });   // facing-wall back
+
+  // --- ledge faces ----------------------------------------------------------
+  // A grind ledge is a vertical face at eye level from a low camera: leaving it
+  // bare is the single most obvious "council-clean" tell in the set.
+  const dressLedgeFace = (L, density = 1.2) => {
+    const hgt = L.height - L.base;
+    if (hgt < 0.28 || L.len < 1.2) return;
+    for (const s of [-1, 1]) {
+      paintWall(build, {
+        o: new THREE.Vector3((L.x0 + L.x1) * 0.5 + s * L.px, L.base, (L.z0 + L.z1) * 0.5 + s * L.pz),
+        right: new THREE.Vector3(-s * L.ux, 0, -s * L.uz),
+        up: UPV.clone(), len: L.len * 0.94, hgt: hgt * 0.96,
+        density, pieces: 1, grime: true, off: 0.011,
+      });
+    }
+  };
 
   // --- banks: big painted marks, then the wheel line through them -----------
   bankMark(fbBankN, 'sponsor', { alpha: 0.88 });
   bankMark(fbBankS, 'number540', { alpha: 0.8, fit: 0.66 });
   bankMark(plzBank, 'throwBmx', { alpha: 0.85, fit: 0.62 });
   bankMark(wallBank, 'tagMirra', { alpha: 0.85, fit: 0.6 });
-  for (const b of [fbBankN, fbBankS, plzBank, wallBank]) {
+  // The pyramid's banks are short (2.9 m of run), so a mark sized to fill one
+  // reads as a sticker laid over the ramp. Half-height and knocked back, offset
+  // off centre, they read as paint someone put down and everyone has ridden.
+  bankMark(pyr.banks[0], 'tagMirra', { alpha: 0.58, fit: 0.40, t: 0.42, s: -1.8, roll: 0.06 });
+  bankMark(pyr.banks[1], 'stencilDiy', { alpha: 0.52, fit: 0.38, t: 0.46, s: 2.1, tint: 0xffcc3d });
+  bankMark(pyr.banks[2], 'throwBmx', { alpha: 0.55, fit: 0.38, t: 0.44, s: 1.4, tint: 0x74b0ff });
+  bankMark(pyr.banks[3], 'number540', { alpha: 0.5, fit: 0.36, t: 0.48, s: -1.6, tint: 0xff5f5f });
+  for (const b of [fbBankN, fbBankS, plzBank, wallBank, ...pyr.banks]) {
     for (let i = 0; i < 5; i++) {
       const p = b.o.clone()
         .addScaledVector(b.up, rand(0.12, 0.92) * b.run)
@@ -2210,11 +2759,24 @@ export async function createPark(ctx) {
   rampPaint(build, miniE, { cell: 'tagMirra', x: -2.6, s: 1.3, size: 2.4, alpha: 0.8, tint: 0x4fd2d2 });
   rampPaint(build, roll, { cell: 'number540', x: 0.4, s: 2.2, size: 3.2, alpha: 0.8 });
   rampPaint(build, roll, { cell: 'throwBmx', x: -1.8, s: 1.5, size: 2.6, alpha: 0.82, tint: 0xff8f4e });
-  for (const fc of [qpBig, qpVert, qpEast, miniW, miniE, roll, ...spineFaces, ...hipFaces]) rampWear(fc, 5);
+  rampPaint(build, qpFace, { cell: 'throwBmx', x: -5.4, s: 2.1, size: 3.8, alpha: 0.88, tint: 0x74b0ff });
+  rampPaint(build, qpFace, { cell: 'tagMirra', x: 1.2, s: 2.4, size: 4.2, alpha: 0.9, tint: 0xff8f4e });
+  rampPaint(build, qpFace, { cell: 'stencilDiy', x: 6.6, s: 1.2, size: 2.0, alpha: 0.85, tint: 0x6fdc84 });
+  rampPaint(build, qpFace, { cell: 'sprayX', x: -8.8, s: 1.4, size: 1.5, alpha: 0.85, tint: 0xffcc3d });
+  rampPaint(build, qpSouth, { cell: 'stencilDiy', x: -1.4, s: 1.1, size: 2.0, alpha: 0.85, tint: 0xd07dff });
+  rampPaint(build, qpSouth, { cell: 'sprayX', x: 2.2, s: 0.9, size: 1.2, alpha: 0.85, tint: 0x4fd2d2 });
+
+  // sawn joints, the rubber scrub band and the tyre streaks, on EVERY ramp
+  for (const fc of allRamps) dressRampSheet(build, fc, 5);
+
   rampPaint(build, hipFaces[0], { cell: 'sprayX', x: 0.4, s: 1.5, size: 1.6, alpha: 0.9, tint: 0xff5f5f });
   rampPaint(build, hipFaces[1], { cell: 'stencilDiy', x: -0.6, s: 1.2, size: 2.0, alpha: 0.8, tint: 0x6fdc84 });
-  rampPaint(build, spineFaces[1], { cell: 'stencilDiy', x: -2.0, s: 1.3, size: 2.2, alpha: 0.85 });
-  rampPaint(build, spineFaces[0], { cell: 'sprayX', x: 3.0, s: 1.2, size: 1.4, alpha: 0.85, tint: 0x4fd2d2 });
+  for (let i = 0; i < spineFaces.length; i++) {
+    rampPaint(build, spineFaces[i], {
+      cell: pick(PIECE_CELLS), x: rand(-2.4, 2.4), s: rand(1.0, 1.4), size: rand(1.8, 2.4),
+      alpha: rand(0.72, 0.9), tint: pick(PAINT_TINTS),
+    });
+  }
 
   // --- coping and rail wear -------------------------------------------------
   for (const c of build.copings) {
@@ -2240,9 +2802,24 @@ export async function createPark(ctx) {
         new THREE.Vector3(s * L.px, 0, s * L.pz));
     }
   };
-  for (const L of ledges) ledgeEdges(L);
+  for (const L of ledges) { ledgeEdges(L); dressLedgeFace(L); }
   ledgeEdges(manualPad);
-  flatDecal('stencilStar', 11.5, 14, 2.0, 2.0, 0, { y: manualPad.height, alpha: 0.55 });
+  dressLedgeFace(manualPad, 0.8);
+  flatDecal('stencilStar', 6.0, 6.0, 2.0, 2.0, 0, { y: manualPad.height, alpha: 0.55 });
+  // pyramid top edges are grind edges, and its four bank faces are the biggest
+  // painted surfaces in the middle of the plaza
+  {
+    const t = pyr.top;
+    const c = [
+      new THREE.Vector3(t.x0, t.y, t.z0), new THREE.Vector3(t.x1, t.y, t.z0),
+      new THREE.Vector3(t.x1, t.y, t.z1), new THREE.Vector3(t.x0, t.y, t.z1),
+    ];
+    const outs = [
+      new THREE.Vector3(0, 0, -1), new THREE.Vector3(1, 0, 0),
+      new THREE.Vector3(0, 0, 1), new THREE.Vector3(-1, 0, 0),
+    ];
+    for (let i = 0; i < 4; i++) dressLedgeEdge(build, c[i], c[(i + 1) % 4], outs[i]);
+  }
   // plaza deck edges and the wallride cap are grind edges too
   dressLedgeEdge(build, new THREE.Vector3(PLZ.x0, PLZ.h, PLZ.z0 + 0.3),
     new THREE.Vector3(PLZ.x0, PLZ.h, PLZ.z1 - 0.3), new THREE.Vector3(-1, 0, 0));
@@ -2253,11 +2830,19 @@ export async function createPark(ctx) {
   dressLedgeEdge(build,                                   // hubba, sloped
     new THREE.Vector3(17.4, PLZ.h + 0.30, PLZ.z1 - 0.55),
     new THREE.Vector3(17.4, stairs.yEnd + 0.30, stairs.zEnd + 0.40), new THREE.Vector3(1, 0, 0));
-  // handrail: the ground under a rail is always scrubbed black at both ends
-  for (const [x, z0, z1] of [[11.6, 1.2, 6.4], [-9, 1.6, 10.6], [2.2, -11.2, -0.8]]) {
+  // rails and bars: the ground under one is always scrubbed black at both ends
+  for (const [ax, az, bx, bz] of [
+    [11.6, 5.2, 11.6, 8.6],       // handrail run-out
+    [-8, 6, -2, 6],               // street flat rail
+    [2.2, -11.2, 2.2, -0.8],      // funbox rail
+    [10, 11, 16, 11],             // stair run-out flat bar
+    [3, 6, 9, 6],                 // manual pad
+  ]) {
+    const yaw = Math.atan2(bx - ax, bz - az) + HALF_PI;
     for (let i = 0; i < 4; i++) {
-      const z = lerp(z0, z1, i / 3);
-      flatDecal('skid', x + rand(-0.3, 0.3), z, rand(1.0, 2.0), rand(0.5, 1.0), HALF_PI,
+      const t = i / 3;
+      flatDecal('skid', lerp(ax, bx, t) + rand(-0.3, 0.3), lerp(az, bz, t) + rand(-0.3, 0.3),
+        rand(1.0, 2.0), rand(0.5, 1.0), yaw,
         { layer: 'wear', tint: 0x2e2b26, alpha: rand(0.2, 0.45) });
     }
   }
@@ -2309,13 +2894,41 @@ export async function createPark(ctx) {
       bowlPaint(pick(GRIME_CELLS), P * rng(), rand(0.5, 1.6), rand(0.8, 1.8),
         { sx: rand(1.2, 2.4), layer: 'paint', tint: 0x5b564d, alpha: rand(0.18, 0.36) });
     }
-    // deep-end floor: a painted mark, half scrubbed off by the wheels
-    flatDecal('number540', bowl.centre.x, bowl.centre.z, 4.6, 4.6, 0.35,
-      { y: bowl.centre.y, alpha: 0.55 });
-    for (let i = 0; i < 6; i++) {
-      flatDecal('skid', bowl.centre.x + rand(-2.6, 2.6), bowl.centre.z + rand(-2.6, 2.6),
-        rand(1.4, 2.8), rand(0.6, 1.2), rand(0, 3),
-        { y: bowl.centre.y, layer: 'wear', tint: 0x2d2a25, alpha: rand(0.25, 0.5) });
+    // --- the pool edge: tile band, waterline, carve ring -------------------
+    // Two courses of 150 mm ceramic under the coping, chipped where wheels have
+    // caught it, with the waterline stain the tile always carries below.
+    const TB = bowl.tileBand;
+    for (let i = 0; i < 26; i++) {                       // chipped and missing tiles
+      const u = P * rng();
+      bowlPaint('crack', u, rand(0.05, TB - 0.04), rand(0.10, 0.19),
+        { sx: rand(0.8, 1.5), layer: 'wear', tint: 0x2b2622, alpha: rand(0.35, 0.7), off: 0.006 });
+    }
+    for (let i = 0; i < 30; i++) {                       // the waterline, just under the tile
+      bowlPaint(pick(GRIME_CELLS), P * rng(), TB + rand(0.02, 0.16), rand(0.24, 0.5),
+        { sx: rand(2.6, 5.0), layer: 'paint', tint: 0x4e5a52, alpha: rand(0.22, 0.42), off: 0.008 });
+    }
+    // the carve band: everybody's tyres load the same 60 cm of the arc
+    for (let i = 0; i < 44; i++) {
+      const u = P * rng();
+      bowlPaint('skid', u, rand(1.5, 2.3), rand(0.30, 0.55),
+        { sx: rand(3.0, 6.0), layer: 'wear', tint: 0x1c1a16, alpha: rand(0.24, 0.5), off: 0.012 });
+    }
+
+    // --- flat bottom: carve arcs, not a uniform pour -----------------------
+    const bx = bowl.centre.x, bz = bowl.centre.z;
+    flatDecal('number540', bx + 1.4, bz + 1.2, 4.6, 4.6, 0.35,
+      { y: bowl.floorY(bx + 1.4, bz + 1.2) + 0.004, alpha: 0.5 });
+    for (let i = 0; i < 26; i++) {                       // skid arcs sweeping the flat
+      const a = rng() * TAU, r = rand(1.1, 5.2);
+      const x = bx + Math.cos(a) * r, z = bz + Math.sin(a) * r;
+      flatDecal('skid', x, z, rand(1.8, 3.6), rand(0.4, 0.9), a + HALF_PI + rand(-0.3, 0.3),
+        { y: bowl.floorY(x, z) + 0.006, layer: 'wear', tint: 0x272420, alpha: rand(0.22, 0.48) });
+    }
+    for (let i = 0; i < 12; i++) {                       // damp shadow round the drain
+      const a = rng() * TAU, r = rand(0.7, 2.6);
+      const x = bx + Math.cos(a) * r, z = bz + Math.sin(a) * r;
+      flatDecal(pick(GRIME_CELLS), x, z, rand(1.4, 3.0), rand(1.4, 3.0), rng() * 3,
+        { y: bowl.floorY(x, z) + 0.005, layer: 'damp', tint: 0x4a5250, alpha: rand(0.22, 0.45) });
     }
   }
 
@@ -2380,6 +2993,11 @@ export async function createPark(ctx) {
   // colour, so the whole lot merges down to ONE mesh per wear layer — four draw
   // calls for several hundred pieces of paint, rather than one per atlas cell.
   const DECAL_LAYERS = [
+    // Damp concrete is not just darker, it is SMOOTHER: the film fills the pores
+    // and the surface starts returning a specular. This layer goes down first,
+    // under everything, so the drainage low points read as still-wet slab even
+    // outside the standing water that puddles.js floats on top of them.
+    { id: 'damp', order: 1, roughness: 0.30, env: 1.35 },
     { id: 'paint', order: 2, roughness: 0.93 },   // road paint, stains, grime
     { id: 'graf', order: 3, roughness: 0.62 },    // spray paint sits over stains
     { id: 'wear', order: 4, roughness: 0.97 },    // tyre and peg marks over paint
@@ -2434,7 +3052,7 @@ export async function createPark(ctx) {
     mat.name = `park_decal_${L.id}`;
     mat.vertexColors = true;
     mat.roughness = L.roughness;
-    mat.envMapIntensity = L.id === 'wax' ? 1.15 : 0.85;
+    mat.envMapIntensity = L.env ?? (L.id === 'wax' ? 1.15 : 0.85);
     build.ownMats.push(mat);
     const mesh = new THREE.Mesh(geo, mat);
     mesh.name = `decal_${L.id}`;
@@ -2478,11 +3096,12 @@ export async function createPark(ctx) {
   const spawnPoints = [
     { name: 'roll-in', position: new THREE.Vector3(0, 3.05, 25.4), yaw: S },
     { name: 'main run', position: new THREE.Vector3(0, 0.05, 13.5), yaw: S },
-    { name: 'bowl deck', position: new THREE.Vector3(-30, 0.05, 1.5), yaw: S },
+    { name: 'bowl deck', position: new THREE.Vector3(-33, 0.05, 2.0), yaw: S },
     { name: 'dirt line', position: new THREE.Vector3(JUMP_X, 0.05, 28.5), yaw: S },
     { name: 'mini ramp deck', position: new THREE.Vector3(-41.8, 1.85, 16), yaw: HALF_PI },
-    { name: 'north flat', position: new THREE.Vector3(-2, 0.05, -26), yaw: S },
+    { name: 'north flat', position: new THREE.Vector3(-2, 0.05, -28.5), yaw: S },
     { name: 'plaza', position: new THREE.Vector3(15, 1.65, -5), yaw: S },
+    { name: 'street', position: new THREE.Vector3(2.5, 0.05, 9.5), yaw: -HALF_PI },
   ];
 
   // === bounds =============================================================

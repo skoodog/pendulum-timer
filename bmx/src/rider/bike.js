@@ -301,6 +301,159 @@ function capsule2(len, ra, rb, opts = {}) {
 const bulge = (t, at, width, amt) => 1 + amt * Math.exp(-(((t - at) / width) ** 2));
 
 /**
+ * ONE CONTINUOUS LIMB.
+ *
+ * The rider used to be a stack of separate closed capsules — deltoid, upper arm,
+ * forearm, hand — butted end to end. Every junction was two hemispherical caps
+ * meeting, which left either a dark void or a hard 2–3 px lit rim where the
+ * garment caught light on a tube edge: a segmented, crash-test-dummy silhouette
+ * you could count the parts of.
+ *
+ * This lofts the WHOLE chain as a single tube: one surface, one normal field, no
+ * internal caps, so there is nothing at the elbow or the knee to catch a rim.
+ * Garments are not separate shells either — the radius STEPS UP by the cloth
+ * thickness wherever a garment covers, so the hem is a real edge loop with real
+ * fabric thickness, and the atlas region switches at the same station, giving a
+ * crisp cuff line with no geometric seam behind it.
+ *
+ * `sections` (in chain-fraction space) declare which atlas region owns which run
+ * of the limb; each section is indexed separately and its v is normalised over
+ * its own arc, so a short cuff band gets the whole cuff row of the atlas.
+ *
+ * u follows the same convention as `capsule2`: with zDir = the rider's left,
+ * u = 0 is the outer flank, 0.25 the front, 0.5 the inner flank, 0.75 the back.
+ */
+function limbTube(atlas, chain, opts) {
+  const {
+    radial = 14, zDir = LEFT, tension = 0.5, radius, shape = null,
+    sections, capStart = 0.85, capEnd = 0.85, capSegs = 4, stepsPer = 10,
+  } = opts;
+  const curve = new THREE.CatmullRomCurve3(chain.map((p) => p.clone()), false, 'catmullrom', tension);
+  const total = curve.getLength() || 1e-4;
+
+  const P = new THREE.Vector3(), T = new THREE.Vector3();
+  const zAx = new THREE.Vector3(), xAx = new THREE.Vector3(), nv = new THREE.Vector3();
+
+  const frameAt = (t) => {
+    const tc = clamp(t, 0, 1);
+    curve.getPointAt(tc, P);
+    curve.getTangentAt(tc, T).normalize();
+    zAx.copy(zDir).addScaledVector(T, -zDir.dot(T));
+    if (zAx.lengthSq() < 1e-9) {
+      zAx.set(0, 0, 1).addScaledVector(T, -T.z);
+      if (zAx.lengthSq() < 1e-9) zAx.set(1, 0, 0).addScaledVector(T, -T.x);
+    }
+    zAx.normalize();
+    xAx.crossVectors(T, zAx).normalize();
+  };
+  const rAt = (t) => radius(clamp(t, 0, 1));
+  const scAt = (t) => (shape ? shape(clamp(t, 0, 1)) : [1, 1]);
+
+  // --- ring plan: start cap, then one run per section, then end cap -----------
+  const live = sections.filter((s) => s.t1 - s.t0 > 1e-4);
+  const rings = [];        // { t, rs, ax, na, pinch, sec }
+  const r0 = rAt(0), r1 = rAt(1);
+  for (let k = 0; k < capSegs; k++) {                 // start cap (excludes t=0)
+    const ph = (k / capSegs) * (Math.PI / 2);
+    rings.push({ t: 0, rs: Math.sin(ph), ax: -Math.cos(ph) * r0 * capStart,
+      na: -Math.cos(ph), pinch: Math.sin(ph), sec: 0 });
+  }
+  for (let si = 0; si < live.length; si++) {
+    const s = live[si];
+    const steps = Math.max(2, Math.round(stepsPer * (s.t1 - s.t0) * 4) + 2);
+    for (let i = 0; i <= steps; i++) {
+      rings.push({ t: lerp(s.t0, s.t1, i / steps), rs: 1, ax: 0, na: 0, pinch: 1, sec: si });
+    }
+  }
+  for (let k = capSegs - 1; k >= 0; k--) {            // end cap
+    const ph = (k / capSegs) * (Math.PI / 2);
+    rings.push({ t: 1, rs: Math.sin(ph), ax: Math.cos(ph) * r1 * capEnd,
+      na: Math.cos(ph), pinch: Math.sin(ph), sec: live.length - 1 });
+  }
+
+  // --- emit ------------------------------------------------------------------
+  const pos = [], nor = [], uvs = [], idx = [];
+  const w = radial + 1;
+  const centres = [];
+  const eps = 1.5 / total;
+  for (const R of rings) {
+    frameAt(R.t);
+    const r = rAt(R.t) * R.rs;
+    const sc = scAt(R.t);
+    const cx = P.x + T.x * R.ax, cy = P.y + T.y * R.ax, cz = P.z + T.z * R.ax;
+    centres.push(cx, cy, cz);
+    // radius slope along arc length, so a taper tilts its own normal correctly
+    const dr = R.rs >= 1
+      ? (rAt(R.t + eps) - rAt(R.t - eps)) / (2 * eps * total)
+      : 0;
+    for (let j = 0; j <= radial; j++) {
+      const a = -(j / radial) * TAU;
+      const sa = Math.sin(a), ca = Math.cos(a);
+      pos.push(
+        cx + xAx.x * sa * r * sc[0] + zAx.x * ca * r * sc[1],
+        cy + xAx.y * sa * r * sc[0] + zAx.y * ca * r * sc[1],
+        cz + xAx.z * sa * r * sc[0] + zAx.z * ca * r * sc[1],
+      );
+      const rad = R.rs >= 1 ? 1 : R.rs;
+      nv.set(0, 0, 0)
+        .addScaledVector(xAx, (sa / sc[0]) * rad)
+        .addScaledVector(zAx, (ca / sc[1]) * rad)
+        .addScaledVector(T, R.na - dr * (R.rs >= 1 ? 1 : 0));
+      if (nv.lengthSq() < 1e-12) nv.copy(T).multiplyScalar(R.na >= 0 ? 1 : -1);
+      nv.normalize();
+      nor.push(nv.x, nv.y, nv.z);
+      uvs.push(0.5 + (j / radial - 0.5) * R.pinch, 0);       // v filled in below
+    }
+  }
+  // v: arc length along the ring centres, normalised INSIDE each section band
+  const nRings = rings.length;
+  const arc = new Float64Array(nRings);
+  for (let i = 1; i < nRings; i++) {
+    const a = (i - 1) * 3, b = i * 3;
+    arc[i] = arc[i - 1] + Math.hypot(centres[b] - centres[a],
+      centres[b + 1] - centres[a + 1], centres[b + 2] - centres[a + 2]);
+  }
+  for (let si = 0; si < live.length; si++) {
+    let lo = -1, hi = -1;
+    for (let i = 0; i < nRings; i++) {
+      if (rings[i].sec !== si) continue;
+      if (lo < 0) lo = i;
+      hi = i;
+    }
+    if (lo < 0) continue;
+    const span = Math.max(arc[hi] - arc[lo], 1e-6);
+    const [v0, v1] = atlas.band(live[si].key);
+    const a0 = live[si].v0 ?? 0, a1 = live[si].v1 ?? 1;
+    for (let i = lo; i <= hi; i++) {
+      const k = lerp(a0, a1, (arc[i] - arc[lo]) / span);
+      const vv = lerp(v0, v1, clamp(k, 0, 1));
+      for (let j = 0; j <= radial; j++) uvs[((i * w) + j) * 2 + 1] = vv;
+    }
+    // u into the region's own sub-range if the section asks for one
+    if (live[si].u0 !== undefined) {
+      for (let i = lo; i <= hi; i++) {
+        for (let j = 0; j <= radial; j++) {
+          const o = ((i * w) + j) * 2;
+          uvs[o] = lerp(live[si].u0, live[si].u1, uvs[o]);
+        }
+      }
+    }
+    for (let i = lo; i < hi; i++) {
+      for (let j = 0; j < radial; j++) {
+        const A = i * w + j, B = A + w;
+        idx.push(A, B, A + 1, B, B + 1, A + 1);
+      }
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(idx);
+  return geo;
+}
+
+/**
  * An orthonormal frame from a primary direction and a hint, used by every part
  * that has to be built in the space of something else (a hand on a bar, a shoe
  * on an ankle).
@@ -489,15 +642,46 @@ function lumOf(c) {
 /**
  * Cloth albedo floor. A "black" tee picked in the creator is 0x24262b — under
  * 2 % reflectance, which crushes to pure black the moment the rider turns away
- * from the sun and takes the fold and seam detail with it. Real black cotton
- * sits nearer 5 %, so anything darker is lifted to that floor, keeping its hue.
- * This is why the rider still reads as a rider in shadow.
+ * from the sun and takes the fold, seam and print detail with it, and the whole
+ * character collapses into one silhouette-shaped mass.
+ *
+ * The lift is MULTIPLICATIVE over a small achromatic pedestal, not a mix toward
+ * white: mixing toward white desaturates, which is what turned a black skate
+ * shoe into a pale grey lump and a navy tee into pale slate. Scaling the channels
+ * keeps the hue and the chroma ratio, so a lifted black denim still reads blue.
  */
-function fabricAlbedo(c, floor = 0.215) {
+function toLuminance(c, target) {
   const l = lumOf(c);
-  if (l >= floor) return c;
-  const k = clamp((floor - l) / Math.max(1 - l, 1e-3), 0, 1);
-  return mixc(c, 0xf4f2ef, k * 0.94);
+  const [r, g, b] = RGB(c);
+  if (target <= l) {                              // darkening is a pure scale
+    const k = clamp(target / Math.max(l, 1e-4), 0, 1);
+    const f = (v) => clamp(Math.round(v * k), 0, 255);
+    return (f(r) << 16) | (f(g) << 8) | f(b);
+  }
+  const ped = target * 0.30;                      // ambient pedestal, achromatic
+  const s = clamp((target - ped) / Math.max(l, 0.012), 0, 7);
+  const base = Math.round(255 * ped);
+  const f = (v) => clamp(Math.round(v * s + base), 0, 255);
+  return (f(r) << 16) | (f(g) << 8) | f(b);
+}
+
+function fabricAlbedo(c, floor = 0.34) {
+  return lumOf(c) >= floor ? c : toLuminance(c, floor);
+}
+
+/**
+ * Real anodised aluminium is a SATURATED but DARK finish: a red ano top cap under
+ * an overcast dusk sits near 0.20 luminance and gets its punch from the specular
+ * lobe, not the albedo. Painting it at full swatch brightness is what made the
+ * bar-end caps read as glowing LEDs.
+ */
+function anodise(c, maxLum = 0.21) {
+  const l = lumOf(c);
+  if (l <= maxLum) return c;
+  const k = maxLum / Math.max(l, 1e-3);
+  const [r, g, b] = RGB(c);
+  const f = (v) => clamp(Math.round(v * k), 0, 255);
+  return (f(r) << 16) | (f(g) << 8) | f(b);
 }
 
 /** Ink that stays readable on `c` — used for every printed graphic. */
@@ -507,6 +691,22 @@ function inkOn(c) { return lumOf(c) > 0.52 ? 0x191b20 : 0xf2efe6; }
 function separate(c, from, minDelta = 0.22) {
   if (Math.abs(lumOf(c) - lumOf(from)) >= minDelta) return c;
   return lumOf(from) > 0.5 ? shade(c, -0.42) : shade(c, 0.46);
+}
+
+/**
+ * Force a real tonal gap between two garments. `separate` only nudges; this
+ * guarantees the delta, which is what stops top and bottom fusing into one
+ * black mass under a low-key grade. The LIGHTER of the two moves.
+ */
+function splitTone(c, from, minDelta = 0.30) {
+  const lf = lumOf(from), lc = lumOf(c);
+  if (Math.abs(lc - lf) >= minDelta) return c;
+  // Move whichever way has room, and land EXACTLY on the target: nudging by a
+  // shade() factor never converged, which is how a mid-grey tee and mid-grey
+  // jeans both survived the "enforce a delta" pass looking identical.
+  const up = lf + minDelta <= 0.66 || lf - minDelta < 0.07;
+  const target = clamp(up ? lf + minDelta : lf - minDelta, 0.07, 0.66);
+  return toLuminance(c, target);
 }
 
 /** Plausible eye colour for a head of hair — no extra profile field needed. */
@@ -570,6 +770,47 @@ const _weaveTile = (() => {
   for (let y = 0; y < 64; y += 4) {
     g.fillStyle = 'rgba(255,255,255,0.22)'; g.fillRect(0, y, 64, 2);
     g.fillStyle = 'rgba(0,0,0,0.20)'; g.fillRect(0, y + 2, 64, 2);
+  }
+  return g.canvas;
+})();
+
+/**
+ * 3/1 denim twill: the diagonal float that makes jeans read as jeans instead of
+ * flat blue. Warp threads run vertically, the weft steps one thread per pick,
+ * which is what produces the wale running up-right.
+ */
+const _twillTile = (() => {
+  const g = c2d(64, 64);
+  g.fillStyle = '#808080'; g.fillRect(0, 0, 64, 64);
+  const cell = 4;
+  for (let y = 0; y < 16; y++) {
+    for (let x = 0; x < 16; x++) {
+      // 3 warp floats then 1 weft float, stepping one cell per row → wale
+      const phase = (x - y + 32) % 4;
+      const warp = phase !== 0;
+      g.fillStyle = warp ? 'rgba(255,255,255,0.34)' : 'rgba(0,0,0,0.36)';
+      g.fillRect(x * cell, y * cell, cell, cell);
+      g.fillStyle = warp ? 'rgba(0,0,0,0.18)' : 'rgba(255,255,255,0.14)';
+      g.fillRect(x * cell, y * cell + cell - 1, cell, 1);
+    }
+  }
+  return g.canvas;
+})();
+
+/** Diamond knurl — grip flanges, peg ends, machined thumbwheels. */
+const _knurlTile = (() => {
+  const g = c2d(32, 32);
+  g.fillStyle = '#808080'; g.fillRect(0, 0, 32, 32);
+  g.lineWidth = 1.6;
+  for (let i = -32; i < 64; i += 6) {
+    g.strokeStyle = 'rgba(255,255,255,0.55)';
+    g.beginPath(); g.moveTo(i, 0); g.lineTo(i + 32, 32); g.stroke();
+    g.strokeStyle = 'rgba(0,0,0,0.5)';
+    g.beginPath(); g.moveTo(i + 2, 0); g.lineTo(i + 34, 32); g.stroke();
+    g.strokeStyle = 'rgba(255,255,255,0.55)';
+    g.beginPath(); g.moveTo(i, 32); g.lineTo(i + 32, 0); g.stroke();
+    g.strokeStyle = 'rgba(0,0,0,0.5)';
+    g.beginPath(); g.moveTo(i + 2, 32); g.lineTo(i + 34, 0); g.stroke();
   }
   return g.canvas;
 })();
@@ -640,6 +881,61 @@ function chips(g, w, h, n, css, r0, r1) {
     g.beginPath();
     g.ellipse(rand(0, w), rand(0, h), rand(r0, r1), rand(r0, r1), rand(0, 3), 0, TAU);
     g.fill();
+  }
+  g.restore();
+}
+
+/**
+ * Handling smudges for a roughness mask. Polished metal is NEVER uniformly
+ * polished: it is a mirror interrupted by fingerprints, dust films and the
+ * dull haze where a hand or a shoe has been. Without this a chrome frame reads
+ * as one flat value with a single soft highlight — exactly the note we got.
+ */
+function smudges(g, w, h, n, lo = 'rgba(255,255,255,0.55)', hi = 'rgba(0,0,0,0.25)') {
+  g.save();
+  for (let i = 0; i < n; i++) {
+    const x = rand(0, w), y = rand(0, h);
+    const rx = rand(w * 0.02, w * 0.14), ry = rand(h * 0.06, h * 0.34);
+    const grd = g.createRadialGradient(x, y, 0, x, y, 1);
+    // radial gradients need a real radius; scale instead so the blob can be oval
+    g.save();
+    g.translate(x, y); g.scale(rx, ry);
+    const gg = g.createRadialGradient(0, 0, 0, 0, 0, 1);
+    gg.addColorStop(0, rng() < 0.7 ? lo : hi);
+    gg.addColorStop(1, 'rgba(128,128,128,0)');
+    g.globalAlpha = rand(0.18, 0.62);
+    g.fillStyle = gg;
+    g.beginPath(); g.arc(0, 0, 1, 0, TAU); g.fill();
+    g.restore();
+    void grd;
+  }
+  // a few real fingerprint whorls
+  for (let i = 0; i < Math.max(2, n >> 2); i++) {
+    const x = rand(0, w), y = rand(0, h);
+    const rr = rand(h * 0.05, h * 0.12);
+    g.save();
+    g.globalAlpha = rand(0.20, 0.5);
+    g.strokeStyle = lo;
+    g.lineWidth = 1.2;
+    g.translate(x, y); g.rotate(rand(0, TAU)); g.scale(1, 0.72);
+    for (let k = 1; k <= 6; k++) {
+      g.beginPath();
+      g.arc(0, 0, rr * (k / 6), rand(0, 1.2), rand(3.4, 5.6));
+      g.stroke();
+    }
+    g.restore();
+  }
+  g.restore();
+}
+
+/** Machining passes: the concentric / linear tool marks on a milled face. */
+function machined(g, w, h, spacing = 5, css = 'rgba(255,255,255,0.20)', dark = 'rgba(0,0,0,0.22)') {
+  g.save();
+  for (let y = 0; y < h; y += spacing) {
+    g.strokeStyle = css; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke();
+    g.strokeStyle = dark; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, y + spacing * 0.5); g.lineTo(w, y + spacing * 0.5); g.stroke();
   }
   g.restore();
 }
@@ -845,6 +1141,12 @@ function createAtlas(name, opts) {
     patch(geo, key, u0 = 0.15, u1 = 0.85, inset = 0.16) {
       return this.uv(geo, key, u0, u1, inset);
     },
+    /** The [v0, v1] band a region occupies, for meshes that map themselves. */
+    band(key, inset = 0.012) {
+      const R = index[key] || index[Object.keys(index)[0]];
+      const pad = (R.v1 - R.v0) * inset;
+      return [R.v0 + pad, R.v1 - pad];
+    },
     repaint,
     dispose() {
       for (const t of Object.values(maps)) { if (t) { _allTextures.delete(t); t.dispose(); } }
@@ -1015,11 +1317,18 @@ function paintFinish(c, w, h, F, wear = 1) {
 function bikePaintRegions() {
   const sig = (X) => `${X.frame.colour}|${X.frame.finish}`;
   const dsig = (X) => `${sig(X)}|${X.decals.id}|${X.decals.colour}|${X.accent}`;
+  // The roughness MASK carries the variation; the material scalar carries the
+  // level (see applyMaterialParams). Chrome is a mirror broken by handling, a
+  // powdercoat is a satin broken by polish where the rider's shins rub it.
   const roughOf = (X) => (c, w, h) => {
-    fill(c, w, h, X.frame.finish === 'chrome' ? '#c8c8c8' : '#e6e6e6');
-    overlay(c, w, h, 0.22, 2);
-    scratches(c, w, h, 90, '#ffffff', 8, 90, 0.9);
-    chips(c, w, h, 24, '#9a9a9a', 1, 3);
+    const chrome = X.frame.finish === 'chrome';
+    fill(c, w, h, chrome ? '#4a4a4a' : '#a6a6a6');
+    overlay(c, w, h, chrome ? 0.30 : 0.22, 2);
+    smudges(c, w, h, chrome ? 16 : 10,
+      chrome ? 'rgba(210,210,210,0.85)' : 'rgba(190,190,190,0.5)', 'rgba(30,30,30,0.35)');
+    // a scratch cuts THROUGH a finish: bare metal in the groove is smoother
+    scratches(c, w, h, 90, chrome ? '#1e1e1e' : '#5a5a5a', 8, 90, 0.9);
+    chips(c, w, h, 24, chrome ? '#c8c8c8' : '#dadada', 1, 3);
   };
   return [
     {
@@ -1092,19 +1401,37 @@ function bikePaintRegions() {
 }
 
 function bikeHardwareRegions() {
-  const hwSig = (X) => `${X.hw.colour}|${X.hw.finish}`;
+  const hwSig = (X) => `${X.hw.colour}|${X.hw.finish}|${X.accent}`;
   const metal = (c, w, h, F, style) => {
     if (F.finish === 'chrome') {
+      // A chrome tube does not have a single soft highlight: it has a hard
+      // horizon line where the sky reflection stops and the ground reflection
+      // starts, a bright sky band above it and a dark earth band below. That
+      // horizon IS what makes a viewer read chrome; the PMREM then moves it.
       const grd = c.createLinearGradient(0, 0, 0, h);
-      grd.addColorStop(0, HEX(shade(F.colour, 0.18)));
-      grd.addColorStop(0.5, HEX(shade(F.colour, -0.42)));
-      grd.addColorStop(1, HEX(shade(F.colour, 0.10)));
+      grd.addColorStop(0.00, HEX(shade(F.colour, -0.30)));
+      grd.addColorStop(0.14, HEX(shade(F.colour, 0.34)));
+      grd.addColorStop(0.30, HEX(shade(F.colour, 0.55)));   // sky
+      grd.addColorStop(0.455, HEX(shade(F.colour, 0.10)));
+      grd.addColorStop(0.475, HEX(shade(F.colour, -0.74))); // horizon
+      grd.addColorStop(0.62, HEX(shade(F.colour, -0.50)));  // ground
+      grd.addColorStop(0.84, HEX(shade(F.colour, 0.16)));
+      grd.addColorStop(1.00, HEX(shade(F.colour, -0.34)));
       c.fillStyle = grd; c.fillRect(0, 0, w, h);
       scratches(c, w, h, 160, '#ffffff', 10, 120, 0.6);
       scratches(c, w, h, 60, '#7e888e', 6, 40, 0.6);
       chips(c, w, h, 14, '#8a7a64', 0.8, 2.2);
     } else {
       fill(c, w, h, HEX(F.colour));
+      // anodised aluminium has a fine axial brush under the dye
+      c.save(); c.globalAlpha = 0.5;
+      for (let i = 0; i < 150; i++) {
+        c.strokeStyle = rgba(shade(F.colour, rng() < 0.5 ? 0.45 : -0.45), rand(0.05, 0.22));
+        c.lineWidth = rand(0.5, 1.8);
+        const y = rand(0, h);
+        c.beginPath(); c.moveTo(0, y); c.lineTo(w, y + rand(-2, 2)); c.stroke();
+      }
+      c.restore();
       overlay(c, w, h, style === 'satin' ? 0.26 : 0.18, 2);
       scratches(c, w, h, 130, HEX(shade(F.colour, 0.52)), 6, 70, 0.7);
       chips(c, w, h, 20, HEX(shade(F.colour, 0.30)), 0.7, 2.0);
@@ -1115,23 +1442,33 @@ function bikeHardwareRegions() {
       key: 'CHROME', u: 1, sig: hwSig,
       colour: (c, w, h, X) => metal(c, w, h, X.hw),
       rough: (c, w, h, X) => {
-        fill(c, w, h, X.hw.finish === 'chrome' ? '#2a2a2a' : '#9c9c9c');
-        scratches(c, w, h, 150, X.hw.finish === 'chrome' ? '#6e6e6e' : '#4a4a4a', 10, 120, 0.7);
+        const chrome = X.hw.finish === 'chrome';
+        fill(c, w, h, chrome ? '#3a3a3a' : '#9c9c9c');
+        smudges(c, w, h, chrome ? 18 : 8,
+          chrome ? 'rgba(224,224,224,0.9)' : 'rgba(190,190,190,0.5)', 'rgba(24,24,24,0.4)');
+        scratches(c, w, h, 150, chrome ? '#1c1c1c' : '#4a4a4a', 10, 120, 0.7);
       },
       hsig: () => 'k',
       height: (c, w, h) => { fill(c, w, h, '#808080'); scratches(c, w, h, 120, '#6c6c6c', 6, 80, 0.8); },
     },
     {
       key: 'ANOD', u: 1, sig: hwSig,
-      colour: (c, w, h, X) => metal(c, w, h, { colour: mixc(X.hw2.colour, 0x141519, 0.45), finish: 'anod' }, 'satin'),
-      rough: (c, w, h) => { fill(c, w, h, '#8a8a8a'); scratches(c, w, h, 130, '#3c3c3c', 6, 70, 0.8); },
+      // Every anodised part on the bike is driven from ONE accent hue, dyed dark
+      // to a real anodised albedo. Teal spacers against candy-red caps was the
+      // note; there is now a single ano colour on the whole machine.
+      colour: (c, w, h, X) => metal(c, w, h, { colour: X.anod, finish: 'anod' }, 'satin'),
+      rough: (c, w, h) => {
+        fill(c, w, h, '#6e6e6e');
+        smudges(c, w, h, 8, 'rgba(170,170,170,0.45)', 'rgba(40,40,40,0.4)');
+        scratches(c, w, h, 130, '#3c3c3c', 6, 70, 0.8);
+      },
       hsig: () => 'k',
       height: (c, w, h) => { fill(c, w, h, '#808080'); overlay(c, w, h, 0.20, 2); },
     },
     {
       key: 'ALLOY', u: 1, sig: hwSig,
       colour: (c, w, h, X) => {
-        fill(c, w, h, HEX(mixc(0x8d949a, X.hw.colour, 0.35)));
+        fill(c, w, h, HEX(mixc(0x9aa2a8, X.hw.colour, 0.30)));
         for (let i = 0; i < 60; i++) {                    // lathe rings
           c.strokeStyle = `rgba(${rand(200, 255) | 0},${rand(200, 255) | 0},255,${rand(0.04, 0.14).toFixed(2)})`;
           c.lineWidth = rand(0.5, 2);
@@ -1139,9 +1476,48 @@ function bikeHardwareRegions() {
         }
         overlay(c, w, h, 0.2, 2);
       },
-      rough: (c, w, h) => { fill(c, w, h, '#7a7a7a'); overlay(c, w, h, 0.4, 3); },
+      rough: (c, w, h) => {
+        fill(c, w, h, '#828282');
+        overlay(c, w, h, 0.4, 3);
+        smudges(c, w, h, 6, 'rgba(190,190,190,0.4)', 'rgba(50,50,50,0.35)');
+      },
       hsig: () => 'k',
       height: (c, w, h) => { fill(c, w, h, '#808080'); scratches(c, w, h, 90, '#6c6c6c', 6, 60, 0.8); },
+    },
+    {
+      // A milled face: the stem faceplate, the top cap, the crank spider. Cut
+      // marks in the NORMAL map at a real pitch, not a flat plate.
+      key: 'MACHINED', u: 1, sig: hwSig,
+      colour: (c, w, h, X) => {
+        fill(c, w, h, HEX(mixc(0x9aa2a8, X.hw.colour, 0.30)));
+        machined(c, w, h, 6, 'rgba(255,255,255,0.16)', 'rgba(0,0,0,0.20)');
+        overlay(c, w, h, 0.18, 2);
+        scratches(c, w, h, 60, '#e6ecef', 5, 45, 0.6);
+      },
+      rough: (c, w, h) => {
+        fill(c, w, h, '#7a7a7a');
+        machined(c, w, h, 6, 'rgba(60,60,60,0.45)', 'rgba(200,200,200,0.35)');
+      },
+      hsig: () => 'k',
+      height: (c, w, h) => {
+        fill(c, w, h, '#808080');
+        machined(c, w, h, 6, 'rgba(216,216,216,0.95)', 'rgba(48,48,48,0.95)');
+      },
+    },
+    {
+      // Spokes get their OWN region. Mapped into CHROME they were 1 mm mirrors:
+      // sub-pixel specular highlights that MSAA cannot resolve, which is exactly
+      // the "white speckle noise" in the wheel. Stainless spokes are satin.
+      key: 'SPOKE', u: 1, sig: () => 'k',
+      colour: (c, w, h) => {
+        const grd = c.createLinearGradient(0, 0, 0, h);
+        grd.addColorStop(0.0, '#7f858a');
+        grd.addColorStop(0.5, '#c2c9ce');
+        grd.addColorStop(1.0, '#6d7377');
+        c.fillStyle = grd; c.fillRect(0, 0, w, h);
+        overlay(c, w, h, 0.16, 3);
+      },
+      rough: (c, w, h) => { fill(c, w, h, '#9e9e9e'); overlay(c, w, h, 0.25, 3); },
     },
     {
       key: 'PEG', u: 1, sig: (X) => `${X.peg ? X.peg.colour : 0}|${X.peg ? X.peg.finish : '-'}`,
@@ -1181,9 +1557,30 @@ function bikeHardwareRegions() {
       },
     },
     {
+      // The chain. A used BMX chain is NOT black: the plate faces are polished
+      // bright by the sprocket and the rollers are oil-wet steel. Painting it
+      // near-black is why the chain died to a dotted line at gameplay distance.
       key: 'OILY', u: 1, sig: () => 'k',
-      colour: (c, w, h) => { fill(c, w, h, '#2b2a28'); overlay(c, w, h, 0.3, 2); scratches(c, w, h, 80, '#b9b2a4', 4, 30, 0.7); },
-      rough: (c, w, h) => { fill(c, w, h, '#8a8a8a'); overlay(c, w, h, 0.5, 4, _speck); },
+      colour: (c, w, h) => {
+        // Oiled steel, not bare aluminium: the punch comes from the low roughness
+        // below, so the albedo stays a dark grey-brown or the chain reads as a
+        // bright rope draped along the chainstay.
+        const grd = c.createLinearGradient(0, 0, 0, h);
+        grd.addColorStop(0.00, '#25231f');
+        grd.addColorStop(0.32, '#5e5b53');            // polished plate face
+        grd.addColorStop(0.50, '#807c72');            // specular run along the top
+        grd.addColorStop(0.68, '#54514a');
+        grd.addColorStop(1.00, '#211f1c');
+        c.fillStyle = grd; c.fillRect(0, 0, w, h);
+        overlay(c, w, h, 0.22, 2);
+        chips(c, w, h, 40, 'rgba(38,33,26,0.55)', 0.8, 2.6);   // oil and grit
+        scratches(c, w, h, 80, '#e6e6df', 4, 30, 0.7);
+      },
+      rough: (c, w, h) => {
+        fill(c, w, h, '#4c4c4c');                     // oil-wet: tight specular
+        overlay(c, w, h, 0.5, 4, _speck);
+        c.fillStyle = 'rgba(30,30,30,0.55)'; c.fillRect(0, h * 0.36, w, h * 0.28);
+      },
       hsig: () => 'k',
       height: (c, w, h) => { fill(c, w, h, '#808080'); overlay(c, w, h, 0.8, 6, _speck); },
     },
@@ -1198,13 +1595,29 @@ function bikeHardwareRegions() {
       rough: (c, w, h) => { fill(c, w, h, '#8a8a8a'); overlay(c, w, h, 0.35, 3); },
     },
     {
-      key: 'ACCENT', u: 1, sig: (X) => `${X.accent}`,
+      // Anodised accent parts — top cap, bar-end plugs, headset cups, hub nuts.
+      // Same single hue as ANOD, dyed to a real anodised albedo (~0.20 luma) so
+      // it stops reading as a lit LED at dusk.
+      key: 'ACCENT', u: 1, sig: (X) => `${X.anod}`,
       colour: (c, w, h, X) => {
-        fill(c, w, h, HEX(X.accent));
+        fill(c, w, h, HEX(X.anod));
+        c.save(); c.globalAlpha = 0.45;
+        for (let i = 0; i < 120; i++) {
+          c.strokeStyle = rgba(shade(X.anod, rng() < 0.5 ? 0.55 : -0.5), rand(0.06, 0.24));
+          c.lineWidth = rand(0.5, 1.6);
+          const y = rand(0, h);
+          c.beginPath(); c.moveTo(0, y); c.lineTo(w, y + rand(-2, 2)); c.stroke();
+        }
+        c.restore();
         overlay(c, w, h, 0.20, 2);
-        scratches(c, w, h, 70, HEX(shade(X.accent, 0.5)), 5, 40, 0.7);
+        scratches(c, w, h, 70, HEX(shade(X.anod, 0.5)), 5, 40, 0.7);
       },
-      rough: (c, w, h) => fill(c, w, h, '#7a7a7a'),
+      rough: (c, w, h) => {
+        fill(c, w, h, '#5e5e5e');
+        smudges(c, w, h, 6, 'rgba(180,180,180,0.4)', 'rgba(40,40,40,0.4)');
+      },
+      hsig: () => 'k',
+      height: (c, w, h) => { fill(c, w, h, '#808080'); overlay(c, w, h, 0.18, 2); },
     },
     {
       key: 'RIM', u: 2, sig: (X) => `${X.rim.colour}|${X.rim.finish}|${X.accent}`,
@@ -1237,6 +1650,72 @@ function bikeHardwareRegions() {
   ];
 }
 
+// ---------------------------------------------------------------------------
+// tyre tread — ONE pattern definition, read by both the painter and the mesh
+// ---------------------------------------------------------------------------
+
+/** Repeats around the circumference. 48 blocks on a 1.63 m rolling circumference
+ *  is a 34 mm pitch: dense enough to read as a tread at 3 m, coarse enough to
+ *  break the silhouette against the sky at the top of the wheel. */
+const TREAD_N = 48;
+
+/**
+ * One block list in (u = around the wheel, v = across the casing) space.
+ * `uo`/`du` are fractions of ONE repeat, so a block can straddle a repeat
+ * boundary and the shoulder lugs can stagger against the centre file.
+ * `rise` is the real displacement in metres — the same number the geometry uses.
+ */
+function treadPattern(tread) {
+  const out = [];
+  const put = (i, uo, du, v0, v1, rise) => out.push({ i, uo, du, v0, v1, rise });
+  for (let i = 0; i < TREAD_N; i++) {
+    const odd = i % 2 === 1;
+    if (tread === 'slick') {
+      put(i, 0.04, 0.92, 0.468, 0.532, 0.0014);                       // moulded centre rib
+      if (odd) {
+        put(i, 0.10, 0.80, 0.636, 0.692, 0.0012);                     // shoulder sipe
+        put(i, 0.10, 0.80, 0.308, 0.364, 0.0012);
+      }
+    } else if (tread === 'street') {
+      put(i, 0.06, 0.64, 0.438, 0.562, 0.0034);                       // centre file
+      put(i, odd ? 0.34 : -0.16, 0.46, 0.574, 0.658, 0.0032);
+      put(i, odd ? -0.16 : 0.34, 0.46, 0.342, 0.426, 0.0032);
+      if (odd) {
+        put(i, 0.08, 0.58, 0.688, 0.754, 0.0028);                     // shoulder lugs
+        put(i, 0.08, 0.58, 0.246, 0.312, 0.0028);
+      }
+    } else {                                                          // knobby park tread
+      put(i, 0.08, 0.58, 0.430, 0.570, 0.0046);
+      put(i, odd ? 0.36 : -0.14, 0.44, 0.580, 0.670, 0.0044);
+      put(i, odd ? -0.14 : 0.36, 0.44, 0.330, 0.420, 0.0044);
+      put(i, odd ? 0.00 : 0.50, 0.48, 0.684, 0.762, 0.0040);
+      put(i, odd ? 0.50 : 0.00, 0.48, 0.238, 0.316, 0.0040);
+    }
+  }
+  return out;
+}
+
+/** Paint the tread blocks into the TYRE region, matched 1:1 to the geometry. */
+function drawTread(c, w, h, tread, css, edge) {
+  const yv = (v) => (1 - v) * h;
+  for (const b of treadPattern(tread)) {
+    const x = ((b.i + b.uo) / TREAD_N) * w;
+    const bw = (b.du / TREAD_N) * w;
+    const y0 = yv(b.v1), y1 = yv(b.v0);
+    const bh = y1 - y0;
+    for (const dx of [-w, 0, w]) {
+      const px = x + dx;
+      if (px > w || px + bw < 0) continue;
+      c.fillStyle = css;
+      c.beginPath();
+      c.roundRect(px, y0, bw, bh, Math.min(bw, bh) * 0.24);
+      c.fill();
+      c.fillStyle = edge;                                   // lit crown of the block
+      c.fillRect(px + bw * 0.10, y0 + bh * 0.06, bw * 0.80, Math.max(1, bh * 0.16));
+    }
+  }
+}
+
 function bikeRubberRegions() {
   return [
     {
@@ -1262,53 +1741,39 @@ function bikeRubberRegions() {
           text(c, 'GRIT CO', x, yv(0.900), h * 0.024, rgba(wallInk, 0.6),
             { font: '700', family: 'sans-serif', spacing: h * 0.003, rot: Math.PI });
         }
-        // tread pattern
-        c.fillStyle = HEX(shade(X.tyre.colour, -0.45));
-        if (tread === 'slick') {
-          for (let i = 0; i < 3; i++) {
-            const v = 0.42 + i * 0.08;
-            c.fillRect(0, yv(v), w, h * 0.006);
-          }
-        } else if (tread === 'street') {
-          for (let i = 0; i < 34; i++) {
-            const x = (i / 34) * w;
-            c.fillRect(x + w * 0.004, yv(0.60), w * 0.010, yv(0.40) - yv(0.60));
-          }
-          c.fillRect(0, yv(0.50), w, h * 0.010);
-        } else {
-          for (let i = 0; i < 24; i++) {
-            const x = (i / 24) * w;
-            c.fillRect(x + w * 0.006, yv(0.66), w * 0.022, h * 0.05);
-            c.fillRect(x + w * 0.020, yv(0.54), w * 0.020, h * 0.04);
-            c.fillRect(x + w * 0.006, yv(0.44), w * 0.022, h * 0.05);
-          }
+        // casing weave: the cords show through the sidewall rubber on a real tyre
+        c.save();
+        c.globalAlpha = 0.22;
+        c.strokeStyle = HEX(shade(X.tyre.wall, -0.35));
+        c.lineWidth = 1.1;
+        for (let i = -h; i < w; i += 6) {
+          c.beginPath(); c.moveTo(i, yv(0.30)); c.lineTo(i + h * 0.30, yv(0.02)); c.stroke();
+          c.beginPath(); c.moveTo(i, yv(0.70)); c.lineTo(i + h * 0.30, yv(0.98)); c.stroke();
         }
+        c.restore();
+        // tread pattern — matched 1:1 to the tread GEOMETRY built in buildTyre so
+        // the painted block and the displaced block are the same block
+        drawTread(c, w, h, tread, HEX(shade(X.tyre.colour, -0.42)), HEX(shade(X.tyre.colour, 0.16)));
         overlay(c, w, h, 0.16, 3);
         chips(c, w, h, 40, 'rgba(58,55,51,0.6)', 1, 3.5);
       },
-      rough: (c, w, h) => {
+      rough: (c, w, h, X) => {
         const yv = (v) => (1 - v) * h;
         fill(c, w, h, '#e2e2e2');
         overlay(c, w, h, 0.3, 4);
-        c.fillStyle = 'rgba(140,140,140,0.6)';
-        c.fillRect(0, yv(0.62), w, yv(0.38) - yv(0.62));      // polished centre strip
+        // the block crowns polish where they touch the ground; the sipes stay matt
+        c.fillStyle = 'rgba(128,128,128,0.55)';
+        c.fillRect(0, yv(0.62), w, yv(0.38) - yv(0.62));
+        drawTread(c, w, h, X.tyre.tread, 'rgba(96,96,96,0.55)', 'rgba(230,230,230,0.45)');
+        c.fillStyle = 'rgba(210,210,210,0.5)';                 // sidewall is dull
+        c.fillRect(0, 0, w, yv(0.76)); c.fillRect(0, yv(0.24), w, h - yv(0.24));
       },
       hsig: (X) => `${X.tyre.tread}`,
       height: (c, w, h, X) => {
         const yv = (v) => (1 - v) * h;
         fill(c, w, h, '#808080');
         overlay(c, w, h, 0.4, 4);
-        c.fillStyle = '#ffffff';
-        if (X.tyre.tread === 'knobby') {
-          for (let i = 0; i < 24; i++) {
-            const x = (i / 24) * w;
-            c.fillRect(x + w * 0.006, yv(0.66), w * 0.022, h * 0.05);
-            c.fillRect(x + w * 0.020, yv(0.54), w * 0.020, h * 0.04);
-            c.fillRect(x + w * 0.006, yv(0.44), w * 0.022, h * 0.05);
-          }
-        } else if (X.tyre.tread === 'street') {
-          for (let i = 0; i < 34; i++) c.fillRect((i / 34) * w + w * 0.004, yv(0.60), w * 0.010, yv(0.40) - yv(0.60));
-        }
+        drawTread(c, w, h, X.tyre.tread, '#ffffff', '#3c3c3c');
         c.fillStyle = '#c8c8c8';
         for (let i = 0; i < 4; i++) {
           text(c, 'RUCKUS', w * (i + 0.5) / 4, yv(0.150), h * 0.052, '#c8c8c8', { spacing: h * 0.004 });
@@ -1319,6 +1784,9 @@ function bikeRubberRegions() {
     {
       key: 'GRIP', u: 1, sig: (X) => `${X.grip}`,
       colour: (c, w, h, X) => {
+        // The grip lathe runs v = 0 (inboard flange) → 1 (bar end). The flange is
+        // a knurled collar; the barrel is ribbed; the last band is the bar plug seat.
+        const yv = (v) => (1 - v) * h;
         fill(c, w, h, HEX(X.grip));
         overlay(c, w, h, 0.22, 3);
         for (let i = 0; i < 40; i++) {
@@ -1326,13 +1794,34 @@ function bikeRubberRegions() {
           const x = (i / 40) * w;
           c.beginPath(); c.moveTo(x, 0); c.lineTo(x, h); c.stroke();
         }
-        text(c, 'GRIT', w * 0.5, h * 0.5, h * 0.26, rgba(inkOn(X.grip), 0.45), { spacing: 2 });
+        // knurled flange band
+        c.save();
+        c.beginPath(); c.rect(0, yv(0.135), w, yv(0.0) - yv(0.135)); c.clip();
+        fill(c, w, h, HEX(shade(X.grip, -0.30)));
+        overlay(c, w, h, 0.7, 10, _knurlTile, 'overlay');
+        c.restore();
+        c.fillStyle = rgba(shade(X.grip, 0.4), 0.5);
+        c.fillRect(0, yv(0.145), w, h * 0.008);
+        text(c, 'GRIT', w * 0.5, yv(0.55), h * 0.20, rgba(inkOn(X.grip), 0.45), { spacing: 2 });
       },
-      rough: (c, w, h) => { fill(c, w, h, '#e8e8e8'); overlay(c, w, h, 0.3, 4); },
+      rough: (c, w, h) => {
+        const yv = (v) => (1 - v) * h;
+        fill(c, w, h, '#e8e8e8');
+        overlay(c, w, h, 0.3, 4);
+        c.fillStyle = 'rgba(190,190,190,0.5)';               // palm-polished barrel
+        c.fillRect(0, yv(0.72), w, yv(0.20) - yv(0.72));
+      },
       hsig: () => 'k',
       height: (c, w, h) => {
+        const yv = (v) => (1 - v) * h;
+        fill(c, w, h, '#808080');
         for (let i = 0; i < 40; i++) { c.fillStyle = '#d0d0d0'; c.fillRect((i / 40) * w, 0, w / 80, h); }
         overlay(c, w, h, 0.5, 6, _speck);
+        c.save();
+        c.beginPath(); c.rect(0, yv(0.135), w, yv(0.0) - yv(0.135)); c.clip();
+        fill(c, w, h, '#808080');
+        overlay(c, w, h, 1.0, 10, _knurlTile, 'source-over');
+        c.restore();
       },
     },
     {
@@ -1484,11 +1973,14 @@ function drawEye(c, x, y, sx, sy, out, iris, skin) {
   c.fill();
   c.restore();
 
-  // lash line: thin at the inner corner, heavy over the outer half
+  // Lash line: thin at the inner corner, heavy over the outer half. Weight is
+  // 2.1 px/mm of eye height rather than 1.05 — at the old width the lash was a
+  // single texel that the mip chain ate before the eye was ever 40 px on screen,
+  // and the eye stopped reading as an eye at exactly the distance it matters.
   c.save();
   c.lineCap = 'round';
-  c.strokeStyle = 'rgba(20,15,13,0.92)';
-  c.lineWidth = Math.max(1.6, 1.05 * sy);
+  c.strokeStyle = 'rgba(12,9,8,0.98)';
+  c.lineWidth = Math.max(2.4, 2.1 * sy);
   c.beginPath();
   c.moveTo(inner + out * 0.6 * sx, y + 0.6 * sy);
   c.bezierCurveTo(x - out * W * 0.55, y - H * 1.34, x + out * W * 0.35, y - H * 1.28,
@@ -1626,7 +2118,10 @@ function riderRegions() {
     },
     // ---------------------------------------------------------------- face
     {
-      key: 'FACE', u: 4,
+      // 6 units, not 4: the head is read at ~900 px in the closeup and the face
+      // occupies barely a third of the atlas width, so the vertical resolution is
+      // what limits the eyes. At 6 x 160 = 960 rows this is 4.3 px/mm.
+      key: 'FACE', u: 6,
       sig: (X) => `${X.skin}|${X.beard.style}|${X.beard.colour}|${X.hair.colour}|${X.hair.style}|${X.eye}`,
       colour: (c, w, h, X) => {
         const fx = (u) => u * w, fy = (v) => (1 - v) * h;
@@ -1709,12 +2204,17 @@ function riderRegions() {
         // --- brows ------------------------------------------------------------
         const browC = mixc(X.beard.colour, X.hair.colour, 0.5);
         for (const sgn of [-1, 1]) {
-          const x0 = mx(sgn * 5), x1 = mx(sgn * 22), x2 = mx(sgn * 36);
+          // inner ends 9 mm off centre, not 5: at 5 the two brows nearly met and
+          // read as a unibrow at any distance where the face was legible at all
+          const x0 = mx(sgn * 9), x1 = mx(sgn * 24), x2 = mx(sgn * 38);
           const y0 = fy(FL.brow - 0.008), y1 = fy(FL.brow + 0.016), y2 = fy(FL.brow + 0.002);
           c.save();
-          c.globalAlpha = 0.55;
-          c.strokeStyle = HEX(shade(browC, -0.15));
-          c.lineWidth = 4.6 * sy; c.lineCap = 'round';
+          // The brow is the strongest value in a face read at distance. At 0.55
+          // alpha over a mid skin tone it sat barely 0.1 luminance below the
+          // cheek and vanished the moment the exposure dropped.
+          c.globalAlpha = 0.74;
+          c.strokeStyle = HEX(shade(browC, -0.40));
+          c.lineWidth = 4.4 * sy; c.lineCap = 'round';
           c.beginPath(); c.moveTo(x0, y0); c.quadraticCurveTo(x1, y1, x2, y2); c.stroke();
           c.restore();
           // individual hairs, sweeping up from the inner end and down at the tail
@@ -1736,6 +2236,15 @@ function riderRegions() {
         }
 
         // --- eyes -------------------------------------------------------------
+        // The socket shadow goes down FIRST: an eye without a dark orbit around
+        // it is a decal on a ball. This alone is worth more at 900 px than any
+        // amount of detail inside the iris.
+        for (const sgn of [-1, 1]) {
+          blob(c, fx(0.5 + sgn * FL.eyeDX), fy(FL.eye + 0.004), 26 * sx, 13 * sy,
+            rgba(shade(skin, -0.55), 0.42), 0.95);
+          blob(c, fx(0.5 + sgn * FL.eyeDX), fy(FL.eye + 0.020), 22 * sx, 7 * sy,
+            rgba(shade(skin, -0.62), 0.34), 0.95);
+        }
         drawEye(c, fx(0.5 - FL.eyeDX), fy(FL.eye), sx, sy, -1, X.eye, skin);
         drawEye(c, fx(0.5 + FL.eyeDX), fy(FL.eye), sx, sy, +1, X.eye, skin);
 
@@ -1953,7 +2462,11 @@ function riderRegions() {
         // garment body
         c.fillStyle = HEX(T.body);
         c.fillRect(0, 0, w, yv(hem));
-        overlay(c, w, h, 0.10, 3, _weaveTile);
+        // Weave at a real texel density. The old overlay drew the 64 px tile at
+        // a third of the atlas width — a 20 mm thread pitch, which is not a weave,
+        // it is a wallpaper. At scale 16 the pitch is ~3.5 mm on the garment and
+        // the mip chain resolves it into a soft cloth grain at distance.
+        overlay(c, w, yv(hem), 0.20, 16, _weaveTile);
         // hem: a turned-and-stitched band in the garment's own colour, and only a
         // contrast band on the styles that actually have one
         if (T.trimCuff) {
@@ -2024,44 +2537,82 @@ function riderRegions() {
           fn();
           c.restore();
         };
-        printed(() => drawMark(c, w * 0.75, yv(0.615), h * 0.185, T.graphic, ink, T.body), 0.75);
+        // On the TORSO capsule u = 0.75 is dead centre front and u = 0.25 is the
+        // back (see capsule2 — the leg tubes are the other way round because their
+        // axis points down). The chest print therefore lives at 0.75, and it gets
+        // a real panel size: a print reads at a third of the chest width, or it is
+        // not a print, it is a badge.
+        printed(() => {
+          drawMark(c, w * 0.75, yv(0.640), h * 0.225, T.graphic, ink, T.body);
+          if (T.graphic.mark !== 'none') {
+            text(c, 'MIRRA CITY', w * 0.75, yv(0.500), h * 0.038, rgba(ink, 0.85),
+              { spacing: h * 0.008, maxWidth: w * 0.26 });
+          }
+        }, 0.75);
         if (T.graphic.mark !== 'none') {
           printed(() => {
-            drawMark(c, w * 0.25, yv(0.66), h * 0.180, T.graphic, ink, T.body);
-            text(c, 'MIRRA CITY', w * 0.25, yv(0.50), h * 0.030, rgba(ink, 0.8),
+            drawMark(c, w * 0.25, yv(0.640), h * 0.165, T.graphic, T.body, ink);
+            text(c, 'RIDE THE LOT', w * 0.25, yv(0.505), h * 0.030, rgba(ink, 0.7),
               { spacing: h * 0.006, maxWidth: w * 0.22 });
           }, 0.25);
         }
-        overlay(c, w, yv(hem), 0.14, 3, _weaveTile);
+        overlay(c, w, yv(hem), 0.16, 16, _weaveTile);
         folds(c, w, yv(hem), 16, rgba(shade(T.body, -0.65), 0.38), 0.55);
         folds(c, w, yv(hem), 8, rgba(shade(T.body, 0.5), 0.16), 0.5);
-        // the garment pulls into the armpits and drapes off the shoulders
+        // Baked crease occlusion where a top ACTUALLY creases on a rider bent over
+        // the bars: a horizontal bunch above the waist, a pull from each armpit,
+        // and the drape off the shoulder yoke.
+        const bunch = c.createLinearGradient(0, yv(hem + 0.16), 0, yv(hem + 0.02));
+        bunch.addColorStop(0, rgba(shade(T.body, -0.72), 0));
+        bunch.addColorStop(0.55, rgba(shade(T.body, -0.72), 0.34));
+        bunch.addColorStop(1, rgba(shade(T.body, -0.72), 0.10));
+        c.fillStyle = bunch; c.fillRect(0, yv(hem + 0.16), w, yv(hem + 0.02) - yv(hem + 0.16));
         for (const u0 of [0.02, 0.48]) {
           const g3 = c.createLinearGradient(w * u0, 0, w * (u0 + 0.10), 0);
-          g3.addColorStop(0, rgba(shade(T.body, -0.55), 0.30));
+          g3.addColorStop(0, rgba(shade(T.body, -0.55), 0.34));
           g3.addColorStop(1, rgba(shade(T.body, -0.55), 0));
           c.fillStyle = g3; c.fillRect(w * u0, 0, w * 0.10, yv(hem + 0.25));
         }
+        const yoke = c.createLinearGradient(0, 0, 0, h * 0.20);
+        yoke.addColorStop(0, rgba(shade(T.body, 0.35), 0.16));
+        yoke.addColorStop(1, rgba(shade(T.body, 0.35), 0));
+        c.fillStyle = yoke; c.fillRect(0, 0, w, h * 0.20);
         overlay(c, w, h, 0.10, 4);
       },
       rough: (c, w, h, X) => {
-        fill(c, w, h, X.top.style === 'jersey' ? '#d2d2d2' : '#f0f0f0');
+        const yv = (v) => (1 - v) * h;
+        const hem = X.top.style === 'jersey' ? 0.135 : X.top.style === 'hoodie' ? 0.115 : 0.175;
+        // Cloth sits at 0.85–0.95 and it VARIES: fold crests polish, the printed
+        // panel is plastisol (much tighter), the weave between them stays matt.
+        fill(c, w, h, X.top.style === 'jersey' ? '#d8d8d8' : '#f2f2f2');
+        overlay(c, w, h, 0.32, 16, _weaveTile);
         overlay(c, w, h, 0.25, 4);
-        // cloth is not uniformly matte: fold crests and the printed panel take a
-        // slightly tighter sheen than the flat weave around them
-        folds(c, w, h, 14, 'rgba(176,176,176,0.45)', 0.5);
-        blob(c, w * 0.75, h * 0.40, w * 0.10, h * 0.10, 'rgba(150,150,150,0.55)', 0.9);
-        blob(c, w * 0.25, h * 0.36, w * 0.10, h * 0.10, 'rgba(150,150,150,0.55)', 0.9);
+        folds(c, w, h, 14, 'rgba(168,168,168,0.5)', 0.5);
+        if (X.top.graphic.mark !== 'none') {
+          const printed = (fn, ux) => {
+            c.save(); c.translate(w * ux, 0); c.scale(-1, 1); c.translate(-w * ux, 0);
+            fn(); c.restore();
+          };
+          printed(() => drawMark(c, w * 0.75, yv(0.640), h * 0.225, X.top.graphic, 0x585858, 0x6a6a6a), 0.75);
+          printed(() => drawMark(c, w * 0.25, yv(0.640), h * 0.165, X.top.graphic, 0x585858, 0x6a6a6a), 0.25);
+        }
+        // below the hem is trousers, which are a different cloth again
+        c.fillStyle = 'rgba(216,216,216,0.55)';
+        c.fillRect(0, yv(hem), w, h - yv(hem));
       },
       hsig: (X) => `${X.top.style}|${X.top.graphic.mark}`,
       height: (c, w, h, X) => {
         const yv = (v) => (1 - v) * h;
+        const hem = X.top.style === 'jersey' ? 0.135 : X.top.style === 'hoodie' ? 0.115 : 0.175;
         fill(c, w, h, '#808080');
-        overlay(c, w, h, 0.55, 12, _weaveTile);
+        overlay(c, w, h, 0.75, 16, _weaveTile);
         folds(c, w, h, 18, '#4e4e4e', 0.6);
         folds(c, w, h, 10, '#b6b6b6', 0.5);
-        c.fillStyle = '#c0c0c0'; c.fillRect(0, 0, w, h * 0.030);
-        drawMarkHeight(c, w * 0.75, yv(0.615), h * 0.185, X.top.graphic);
+        c.fillStyle = '#c0c0c0'; c.fillRect(0, 0, w, h * 0.030);     // collar rib
+        // the hem's turned edge and the waist bunch, in real relief
+        c.fillStyle = '#c8c8c8'; c.fillRect(0, yv(hem) - h * 0.016, w, h * 0.016);
+        c.fillStyle = '#5c5c5c'; c.fillRect(0, yv(hem + 0.045), w, h * 0.020);
+        drawMarkHeight(c, w * 0.75, yv(0.640), h * 0.225, X.top.graphic);
       },
     },
     // ---------------------------------------------------------------- sleeve
@@ -2072,32 +2623,66 @@ function riderRegions() {
       sig: (X) => `${X.top.sleeve}|${X.top.trim}|${X.top.style}`,
       colour: (c, w, h, X) => {
         const T = X.top;
+        // v = 0 (canvas bottom) is the shoulder, v = 1 (canvas top) the cuff.
         fill(c, w, h, HEX(T.sleeve));
-        overlay(c, w, h, 0.10, 2, _weaveTile);
-        // cuff at the far end of the sleeve (v = 1 → canvas top)
-        c.fillStyle = HEX(T.trim);
-        c.fillRect(0, 0, w, h * 0.075);
+        overlay(c, w, h, 0.20, 16, _weaveTile);
+        // raglan seam: a real stitched line running down from the neck, which is
+        // the thing that makes a raglan read as a raglan
+        if (T.style === 'raglan' || T.style === 'jersey') {
+          c.save();
+          c.strokeStyle = rgba(shade(T.sleeve, -0.55), 0.55);
+          c.lineWidth = 3; c.setLineDash([7, 8]);
+          c.beginPath(); c.moveTo(0, h * 0.955); c.lineTo(w, h * 0.955); c.stroke();
+          c.restore();
+        }
+        // Cuff at the far end of the sleeve (v = 1 → canvas top). Only a garment
+        // that actually HAS contrast ribbing gets it: a plain tee has a turned
+        // and stitched hem in its own cloth, and painting a white rib band on one
+        // made every tee look like a baseball raglan.
+        const cuffCol = T.trimCuff ? T.trim : shade(T.sleeve, 0.10);
+        c.fillStyle = HEX(cuffCol);
+        c.fillRect(0, 0, w, T.trimCuff ? h * 0.075 : h * 0.030);
+        if (T.trimCuff) {
+          for (let i = 0; i < 150; i++) {                   // rib knit on the cuff
+            c.fillStyle = rgba(shade(T.trim, i % 2 ? 0.26 : -0.24), 0.4);
+            c.fillRect((i / 150) * w, 0, w / 300, h * 0.075);
+          }
+        } else {
+          stitchLine(c, 0, h * 0.032, w, h * 0.032, rgba(shade(T.sleeve, 0.35), 0.55), 2, [6, 7]);
+        }
         c.fillStyle = rgba(shade(T.sleeve, -0.5), 0.5);
-        c.fillRect(0, h * 0.075, w, h * 0.022);
+        c.fillRect(0, T.trimCuff ? h * 0.075 : h * 0.038, w, h * 0.020);
         if (T.style === 'jersey' || T.style === 'raglan') {
           c.fillStyle = rgba(T.trim, 0.75);
           c.fillRect(0, h * 0.15, w, h * 0.030);
           c.fillRect(0, h * 0.20, w, h * 0.014);
         }
-        folds(c, w, h, 10, rgba(shade(T.sleeve, -0.6), 0.32), 0.55);
+        folds(c, w, h, 14, rgba(shade(T.sleeve, -0.62), 0.36), 0.55);
+        folds(c, w, h, 7, rgba(shade(T.sleeve, 0.5), 0.14), 0.5);
+        // the sleeve bunches at the elbow end of its run
+        const bunch = c.createLinearGradient(0, h * 0.06, 0, h * 0.30);
+        bunch.addColorStop(0, rgba(shade(T.sleeve, -0.7), 0.30));
+        bunch.addColorStop(1, rgba(shade(T.sleeve, -0.7), 0));
+        c.fillStyle = bunch; c.fillRect(0, h * 0.06, w, h * 0.24);
         overlay(c, w, h, 0.10, 3);
       },
       rough: (c, w, h) => {
         fill(c, w, h, '#f0f0f0');
+        overlay(c, w, h, 0.32, 16, _weaveTile);
         overlay(c, w, h, 0.25, 3);
-        folds(c, w, h, 10, 'rgba(180,180,180,0.45)', 0.5);
+        folds(c, w, h, 10, 'rgba(172,172,172,0.5)', 0.5);
+        c.fillStyle = 'rgba(206,206,206,0.6)'; c.fillRect(0, 0, w, h * 0.060);
       },
       hsig: () => 'k',
       height: (c, w, h) => {
         fill(c, w, h, '#808080');
-        overlay(c, w, h, 0.5, 6, _weaveTile);
+        overlay(c, w, h, 0.75, 16, _weaveTile);
         folds(c, w, h, 12, '#4e4e4e', 0.6);
         folds(c, w, h, 7, '#b8b8b8', 0.5);
+        for (let i = 0; i < 150; i++) {
+          c.fillStyle = i % 2 ? '#c6c6c6' : '#5a5a5a';
+          c.fillRect((i / 150) * w, 0, w / 300, h * 0.075);
+        }
       },
     },
     // ---------------------------------------------------------------- trim
@@ -2127,54 +2712,99 @@ function riderRegions() {
     {
       key: 'BOTTOM', u: 2, sig: (X) => `${X.bottom.colour}|${X.bottom.style}`,
       colour: (c, w, h, X) => {
+        // v = 0 (canvas BOTTOM) is the hip, v = 1 (canvas TOP) the cuff, u = 0.25
+        // is the front of the leg, u = 0 the outseam and u = 0.5 the inseam.
         const col = X.bottom.colour;
         const denim = X.bottom.style === 'jeans';
+        const yv = (v) => (1 - v) * h;
         fill(c, w, h, HEX(col));
-        overlay(c, w, h, denim ? 0.16 : 0.10, 3, _weaveTile);
+        // The twill IS the material. A real 3/1 wale, tiled at ~2 mm on the
+        // garment, not a handful of hairlines drawn across the whole panel.
+        overlay(c, w, h, denim ? 0.34 : 0.18, denim ? 18 : 14, denim ? _twillTile : _weaveTile);
         if (denim) {
-          // warp/weft twill: fine diagonal lines
-          c.save(); c.globalAlpha = 0.16;
-          c.strokeStyle = HEX(shade(col, 0.42)); c.lineWidth = 1.2;
-          for (let i = -h; i < w; i += 5) {
-            c.beginPath(); c.moveTo(i, 0); c.lineTo(i + h, h); c.stroke();
-          }
-          c.restore();
-          // whiskering + fade at the thigh front (u = 0.25)
+          // whiskering + fade at the thigh front (u = 0.25) and the seat (u=0.75)
           const fade = c.createLinearGradient(0, 0, w, 0);
           fade.addColorStop(0, 'rgba(255,255,255,0)');
-          fade.addColorStop(0.25, rgba(shade(col, 0.35), 0.12));
+          fade.addColorStop(0.25, rgba(shade(col, 0.45), 0.16));
           fade.addColorStop(0.5, 'rgba(255,255,255,0)');
-          fade.addColorStop(0.75, rgba(shade(col, 0.55), 0.22));
+          fade.addColorStop(0.75, rgba(shade(col, 0.60), 0.24));
           fade.addColorStop(1, 'rgba(255,255,255,0)');
           c.fillStyle = fade; c.fillRect(0, 0, w, h);
+          // ABRADED KNEE: a real lighter patch on the front of the leg at the
+          // knee station, with whisker creases fanning out of it
+          const kneeY = yv(0.48);
+          blob(c, w * 0.25, kneeY, w * 0.13, h * 0.075, rgba(shade(col, 0.62), 0.34), 0.95);
+          blob(c, w * 0.25, kneeY, w * 0.08, h * 0.045, rgba(shade(col, 0.75), 0.24), 0.95);
+          c.save();
+          c.strokeStyle = rgba(shade(col, 0.70), 0.30); c.lineCap = 'round';
+          for (let i = 0; i < 16; i++) {
+            const t = i / 15;
+            const y = kneeY + lerp(-h * 0.075, h * 0.075, t);
+            c.lineWidth = rand(1.4, 3.4);
+            c.beginPath();
+            c.moveTo(w * (0.25 - 0.115), y + rand(-4, 4));
+            c.quadraticCurveTo(w * 0.25, y + rand(-10, 10), w * (0.25 + 0.115), y + rand(-4, 4));
+            c.stroke();
+          }
+          c.restore();
+          // seat wear, high on the back of the leg
+          blob(c, w * 0.75, yv(0.90), w * 0.15, h * 0.055, rgba(shade(col, 0.50), 0.22), 0.95);
         }
         folds(c, w, h, 22, rgba(shade(col, -0.62), 0.40), 0.6);
         folds(c, w, h, 12, rgba(shade(col, 0.55), 0.16), 0.5);
-        // seams at u = 0 (outer) and u = 0.5 (inner)
-        const seam = rgba(denim ? 0xd6c6a0 : shade(col, 0.4), 0.55);
-        stitchLine(c, 2, 0, 2, h, seam, 2, [5, 6]);
-        stitchLine(c, w - 2, 0, w - 2, h, seam, 2, [5, 6]);
-        stitchLine(c, w * 0.5 - 3, 0, w * 0.5 - 3, h, seam, 2, [5, 6]);
-        stitchLine(c, w * 0.5 + 3, 0, w * 0.5 + 3, h, seam, 2, [5, 6]);
+        // the trouser stacks on the shoe: hard bunched creases at the cuff
+        for (let i = 0; i < 5; i++) {
+          const y = h * (0.012 + i * 0.026);
+          c.strokeStyle = rgba(shade(col, i % 2 ? -0.6 : 0.35), 0.30);
+          c.lineWidth = rand(2.5, 6);
+          c.beginPath();
+          c.moveTo(0, y);
+          c.bezierCurveTo(w * 0.33, y + rand(-6, 6), w * 0.66, y + rand(-6, 6), w, y);
+          c.stroke();
+        }
+        // seams at u = 0 (outseam) and u = 0.5 (inseam), with real topstitch
+        const seam = rgba(denim ? 0xe0cfa2 : shade(col, 0.45), 0.7);
+        for (const x of [2, w - 2, w * 0.5 - 4, w * 0.5 + 4]) {
+          c.fillStyle = rgba(shade(col, -0.45), 0.5);
+          c.fillRect(x - 3, 0, 6, h);
+          stitchLine(c, x, 0, x, h, seam, 2.2, [6, 7]);
+        }
+        // felled outseam: a second row of topstitch beside the first
+        stitchLine(c, 9, 0, 9, h, seam, 1.8, [6, 8]);
+        stitchLine(c, w - 9, 0, w - 9, h, seam, 1.8, [6, 8]);
         overlay(c, w, h, 0.12, 4);
         chips(c, w, h, 30, rgba(shade(col, 0.6), 0.10), 2, 7);
       },
       rough: (c, w, h, X) => {
-        fill(c, w, h, X.bottom.style === 'jeans' ? '#e6e6e6' : '#efefef');
+        const yv = (v) => (1 - v) * h;
+        const denim = X.bottom.style === 'jeans';
+        fill(c, w, h, denim ? '#e8e8e8' : '#f0f0f0');
+        overlay(c, w, h, denim ? 0.35 : 0.25, denim ? 18 : 14, denim ? _twillTile : _weaveTile);
         overlay(c, w, h, 0.3, 4);
-        // denim polishes where it rubs: the crest of every fold and the knee
-        folds(c, w, h, 20, 'rgba(168,168,168,0.45)', 0.5);
-        blob(c, w * 0.25, h * 0.52, w * 0.16, h * 0.10, 'rgba(150,150,150,0.40)', 0.9);
+        // denim polishes where it rubs: fold crests, the knee and the seat
+        folds(c, w, h, 20, 'rgba(160,160,160,0.5)', 0.5);
+        if (denim) {
+          blob(c, w * 0.25, yv(0.48), w * 0.13, h * 0.075, 'rgba(120,120,120,0.55)', 0.95);
+          blob(c, w * 0.75, yv(0.90), w * 0.15, h * 0.055, 'rgba(132,132,132,0.45)', 0.95);
+        }
       },
       hsig: (X) => `${X.bottom.style}`,
       height: (c, w, h, X) => {
+        const denim = X.bottom.style === 'jeans';
         fill(c, w, h, '#808080');
-        overlay(c, w, h, X.bottom.style === 'jeans' ? 0.62 : 0.45, 10, _weaveTile);
+        overlay(c, w, h, denim ? 0.85 : 0.55, denim ? 18 : 14, denim ? _twillTile : _weaveTile);
         folds(c, w, h, 24, '#4a4a4a', 0.65);
         folds(c, w, h, 14, '#bcbcbc', 0.55);
-        stitchLine(c, 2, 0, 2, h, '#d0d0d0', 3, [5, 6]);
-        stitchLine(c, w - 2, 0, w - 2, h, '#d0d0d0', 3, [5, 6]);
-        stitchLine(c, w * 0.5, 0, w * 0.5, h, '#d0d0d0', 3, [5, 6]);
+        for (const x of [2, w - 2, w * 0.5 - 4, w * 0.5 + 4]) {
+          c.fillStyle = '#9c9c9c'; c.fillRect(x - 3, 0, 6, h);        // felled seam ridge
+          stitchLine(c, x, 0, x, h, '#dcdcdc', 3, [6, 7]);
+        }
+        for (let i = 0; i < 5; i++) {                                 // cuff stack
+          const y = h * (0.012 + i * 0.026);
+          c.strokeStyle = i % 2 ? '#4c4c4c' : '#c4c4c4';
+          c.lineWidth = 5;
+          c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke();
+        }
       },
     },
     // ---------------------------------------------------------------- shoes
@@ -2261,53 +2891,144 @@ function riderRegions() {
       },
     },
     {
+      // The sole capsule is laid out with u = 0 on the OUTSOLE (the ground face),
+      // u = 0.25 / 0.75 on the two sidewalls and u = 0.5 on top; v = 0 at the heel
+      // and 1 at the toe. Painting a "midsole stripe" across v put it on the toe;
+      // it belongs on the sidewalls, running heel to toe.
       key: 'SOLE', u: 1, sig: (X) => `${X.shoe.sole}|${X.shoe.colour}`,
       colour: (c, w, h, X) => {
-        fill(c, w, h, HEX(X.shoe.sole));
+        const S = X.shoe.sole;
+        fill(c, w, h, HEX(shade(S, -0.20)));
+        // outsole: herringbone tread, wrapping the u seam
+        c.save();
+        for (const x0 of [-w, 0]) {
+          c.save();
+          c.beginPath(); c.rect(x0 + w * 0.85, 0, w * 0.30, h); c.clip();
+          fill(c, w, h, HEX(shade(S, -0.32)));
+          c.strokeStyle = rgba(shade(S, -0.70), 0.75); c.lineWidth = 3.2;
+          for (let i = 0; i < 40; i++) {
+            const y = (i / 40) * h;
+            const dir = i % 2 ? 1 : -1;
+            c.beginPath();
+            c.moveTo(x0 + w * 0.85, y);
+            c.lineTo(x0 + w * 1.00, y + dir * h * 0.012);
+            c.lineTo(x0 + w * 1.15, y);
+            c.stroke();
+          }
+          c.restore();
+        }
+        c.restore();
+        // midsole foxing band on both sidewalls, in a lighter compound
+        for (const u0 of [0.19, 0.69]) {
+          c.fillStyle = HEX(shade(S, 0.42));
+          c.fillRect(w * u0, 0, w * 0.12, h);
+          c.fillStyle = rgba(shade(S, -0.35), 0.55);
+          c.fillRect(w * u0, 0, w * 0.012, h);
+          c.fillRect(w * (u0 + 0.108), 0, w * 0.012, h);
+          stitchLine(c, w * (u0 + 0.06), 0, w * (u0 + 0.06), h, rgba(shade(S, 0.7), 0.4), 2, [5, 6]);
+        }
         overlay(c, w, h, 0.22, 4);
-        c.fillStyle = rgba(shade(X.shoe.sole, -0.55), 0.5);
-        for (let i = 0; i < 28; i++) c.fillRect((i / 28) * w, h * 0.15, w * 0.016, h * 0.7);
-        c.fillStyle = HEX(shade(X.shoe.sole, 0.55));
-        c.fillRect(0, 0, w, h * 0.12);                        // midsole stripe
-        chips(c, w, h, 40, 'rgba(60,52,40,0.4)', 1, 4);
+        chips(c, w, h, 60, 'rgba(52,44,34,0.45)', 1, 4);      // ground-in grit
       },
-      rough: (c, w, h) => fill(c, w, h, '#b8b8b8'),
+      rough: (c, w, h) => {
+        fill(c, w, h, '#c4c4c4');
+        for (const x0 of [-w, 0]) { c.fillStyle = 'rgba(90,90,90,0.6)'; c.fillRect(x0 + w * 0.85, 0, w * 0.30, h); }
+        overlay(c, w, h, 0.3, 5);
+      },
       hsig: () => 'k',
       height: (c, w, h) => {
         fill(c, w, h, '#808080');
-        c.fillStyle = '#d8d8d8';
-        for (let i = 0; i < 28; i++) c.fillRect((i / 28) * w, h * 0.15, w * 0.016, h * 0.7);
+        for (const x0 of [-w, 0]) {
+          c.save();
+          c.beginPath(); c.rect(x0 + w * 0.85, 0, w * 0.30, h); c.clip();
+          c.strokeStyle = '#e2e2e2'; c.lineWidth = 5;
+          for (let i = 0; i < 40; i++) {
+            const y = (i / 40) * h, dir = i % 2 ? 1 : -1;
+            c.beginPath();
+            c.moveTo(x0 + w * 0.85, y);
+            c.lineTo(x0 + w * 1.00, y + dir * h * 0.012);
+            c.lineTo(x0 + w * 1.15, y);
+            c.stroke();
+          }
+          c.restore();
+        }
+        for (const u0 of [0.19, 0.69]) {
+          c.fillStyle = '#b0b0b0'; c.fillRect(w * u0, 0, w * 0.12, h);
+          c.fillStyle = '#585858'; c.fillRect(w * u0, 0, w * 0.010, h);
+          c.fillRect(w * (u0 + 0.110), 0, w * 0.010, h);
+        }
       },
     },
     // ---------------------------------------------------------------- gloves
     {
+      // The fist is a merge of a dozen sweeps and capsules with their own UVs, so
+      // a glove graphic pinned to one (u, v) would land somewhere arbitrary. This
+      // is authored as a REPEATING padded-leather panel instead: quilted cells,
+      // a seam grid and perforation, so wherever a finger or a knuckle samples it
+      // it reads as a padded glove rather than a flat mitten.
       key: 'GLOVE', u: 1, sig: (X) => `${X.glove.colour}|${X.glove.on}|${X.top.trim}`,
       colour: (c, w, h, X) => {
         const col = X.glove.colour;
         fill(c, w, h, HEX(col));
-        overlay(c, w, h, 0.20, 3, _weaveTile);
-        // knuckle panels on the back of the hand (u = 0.75 side of the palm capsule)
-        c.fillStyle = rgba(shade(col, -0.35), 0.9);
-        for (let i = 0; i < 4; i++) {
-          c.beginPath();
-          c.roundRect(w * (0.12 + i * 0.075), h * 0.30, w * 0.055, h * 0.30, w * 0.012);
-          c.fill();
+        overlay(c, w, h, 0.24, 14, _weaveTile);
+        // quilted padding cells with a stitched border
+        const cols = 10, rows = 5;
+        for (let i = 0; i < cols; i++) {
+          for (let j = 0; j < rows; j++) {
+            const x = (i / cols) * w, y = (j / rows) * h;
+            const cw = w / cols, ch = h / rows;
+            const g2 = c.createLinearGradient(x, y, x, y + ch);
+            g2.addColorStop(0, rgba(shade(col, 0.26), 0.55));
+            g2.addColorStop(0.55, rgba(shade(col, 0.05), 0.2));
+            g2.addColorStop(1, rgba(shade(col, -0.45), 0.6));
+            c.fillStyle = g2;
+            c.beginPath();
+            c.roundRect(x + cw * 0.07, y + ch * 0.10, cw * 0.86, ch * 0.80, Math.min(cw, ch) * 0.22);
+            c.fill();
+            c.strokeStyle = rgba(shade(col, -0.55), 0.55);
+            c.lineWidth = 2;
+            c.stroke();
+          }
         }
-        c.fillStyle = rgba(separate(X.top.trim, col, 0.2), 0.9);
-        c.fillRect(0, h * 0.80, w, h * 0.075);                // wrist strap
-        c.fillStyle = rgba(shade(col, 0.35), 0.4);
-        c.fillRect(0, h * 0.06, w, h * 0.05);                 // palm grip patch
+        // seam runs and the wrist-strap band along the low-v edge
+        c.save();
+        c.strokeStyle = rgba(shade(col, 0.45), 0.45); c.lineWidth = 2; c.setLineDash([6, 7]);
+        for (let i = 0; i <= cols; i++) {
+          c.beginPath(); c.moveTo((i / cols) * w, 0); c.lineTo((i / cols) * w, h); c.stroke();
+        }
+        c.restore();
+        c.fillStyle = rgba(separate(X.top.trim, col, 0.24), 0.92);
+        c.fillRect(0, h * 0.86, w, h * 0.10);                 // closure strap
+        c.fillStyle = rgba(shade(col, -0.55), 0.6);
+        c.fillRect(0, h * 0.96, w, h * 0.020);
+        // perforation on the palm side
+        c.fillStyle = rgba(shade(col, -0.65), 0.5);
+        for (let i = 0; i < 260; i++) {
+          c.beginPath(); c.arc(rand(0, w), rand(h * 0.10, h * 0.80), rand(1.2, 2.4), 0, TAU); c.fill();
+        }
         folds(c, w, h, 10, rgba(shade(col, -0.6), 0.35), 0.55);
       },
-      rough: (c, w, h) => { fill(c, w, h, '#e2e2e2'); overlay(c, w, h, 0.3, 4); },
+      rough: (c, w, h) => {
+        fill(c, w, h, '#c8c8c8');                              // padded leather
+        overlay(c, w, h, 0.35, 14, _weaveTile);
+        smudges(c, w, h, 6, 'rgba(180,180,180,0.35)', 'rgba(80,80,80,0.35)');
+      },
       hsig: () => 'k',
       height: (c, w, h) => {
         fill(c, w, h, '#808080');
-        overlay(c, w, h, 0.45, 6, _weaveTile);
-        c.fillStyle = '#c8c8c8';
-        for (let i = 0; i < 4; i++) {
-          c.beginPath(); c.roundRect(w * (0.12 + i * 0.075), h * 0.30, w * 0.055, h * 0.30, w * 0.012); c.fill();
+        overlay(c, w, h, 0.55, 14, _weaveTile);
+        const cols = 10, rows = 5;
+        for (let i = 0; i < cols; i++) {
+          for (let j = 0; j < rows; j++) {
+            const x = (i / cols) * w, y = (j / rows) * h;
+            const cw = w / cols, ch = h / rows;
+            c.fillStyle = '#cccccc';
+            c.beginPath();
+            c.roundRect(x + cw * 0.07, y + ch * 0.10, cw * 0.86, ch * 0.80, Math.min(cw, ch) * 0.22);
+            c.fill();
+          }
         }
+        c.fillStyle = '#c0c0c0'; c.fillRect(0, h * 0.86, w, h * 0.10);
       },
     },
     // ---------------------------------------------------------------- pads
@@ -2392,31 +3113,92 @@ function riderRegions() {
 
 function helmetRegions() {
   const sig = (X) => `${X.lid.colour}|${X.accent}`;
+  // The shell is a 0.25 m object read at 900 px in the closeup. At u:2 the decal
+  // band was 6–8 px per stripe and stair-stepped; u:4 gives 512 rows and, with
+  // the shell UV running u = azimuth, ~2.8 px/mm across the graphics.
   return [
     {
-      key: 'SHELL', u: 2, sig,
+      key: 'SHELL', u: 4, sig,
       colour: (c, w, h, X) => {
         const col = X.lid.colour;
+        // The shell's own UV: u = azimuth (0 = dead ahead, 0.25 = the rider's
+        // right flank, 0.5 = the back, 0.75 = the left flank) and g = 0 at the
+        // crown → 1 at the lower edge. Region rows run the other way, so
+        // `cy(g)` is the one place that conversion lives.
+        const cy = (g) => (1 - g) * h;
         fill(c, w, h, HEX(col));
-        const grad = c.createLinearGradient(0, 0, 0, h);
-        grad.addColorStop(0, 'rgba(255,255,255,0.12)');
-        grad.addColorStop(1, 'rgba(0,0,0,0.38)');
+        const grad = c.createLinearGradient(0, h, 0, 0);
+        grad.addColorStop(0, 'rgba(255,255,255,0.16)');        // crown catches light
+        grad.addColorStop(0.55, 'rgba(255,255,255,0.02)');
+        grad.addColorStop(1, 'rgba(0,0,0,0.34)');              // edge falls away
         c.fillStyle = grad; c.fillRect(0, 0, w, h);
-        c.fillStyle = HEX(X.accent);
-        c.fillRect(0, 0, w * 0.028, h); c.fillRect(w * 0.972, 0, w * 0.028, h);
-        c.fillRect(w * 0.486, 0, w * 0.028, h);
-        c.fillStyle = rgba(shade(X.accent, -0.4), 0.9);
-        c.fillRect(w * 0.032, 0, w * 0.014, h); c.fillRect(w * 0.954, 0, w * 0.014, h);
-        c.fillRect(w * 0.518, 0, w * 0.014, h);
+
+        // ONE decal band, running continuously fore-and-aft over the crown, i.e.
+        // a horizontal stripe in g. The old version painted vertical bars in u,
+        // which cut the shell into 6–8 px blocks and mirrored on both flanks.
+        const band = (g0, g1, css) => {
+          c.fillStyle = css; c.fillRect(0, cy(g1), w, cy(g0) - cy(g1));
+        };
+        band(0.280, 0.400, HEX(X.accent));
+        band(0.402, 0.424, HEX(shade(X.accent, -0.45)));
+        band(0.432, 0.462, rgba(shade(col, 0.55), 0.85));
+        band(0.845, 0.868, rgba(X.accent, 0.75));
+        // a soft swoosh so the band is not a plain ring
+        c.save();
+        c.globalAlpha = 0.75;
+        c.fillStyle = HEX(shade(X.accent, -0.25));
+        c.beginPath();
+        c.moveTo(0, cy(0.400));
+        for (let i = 0; i <= 64; i++) {
+          const u = i / 64;
+          c.lineTo(u * w, cy(0.400 + 0.075 * (0.5 + 0.5 * Math.cos(u * TAU * 2))));
+        }
+        c.lineTo(w, cy(0.400)); c.closePath(); c.fill();
+        c.restore();
+
+        // Type. MEASURED off a render, not derived: the shell's swept UV runs u
+        // toward the viewer's LEFT on both flanks, so anything laid out
+        // left-to-right here comes out reversed on the helmet. Every mark is
+        // therefore drawn through a mirror about its OWN centre — which keeps it
+        // in place on the band while making it read forwards from either side.
+        // (The band and the swoosh are symmetric in u and need no such thing.)
         const ink = inkOn(col);
-        text(c, 'GRIT', w * 0.25, h * 0.62, h * 0.26, HEX(ink), { skew: -0.2, spacing: 3 });
-        text(c, 'GRIT', w * 0.75, h * 0.62, h * 0.26, HEX(ink), { skew: -0.2, spacing: 3 });
-        scratches(c, w, h, 60, HEX(shade(col, 0.5)), 6, 50, 0.7);
+        const printed = (fn, ux) => {
+          c.save();
+          c.translate(w * ux, 0); c.scale(-1, 1); c.translate(-w * ux, 0);
+          fn(); c.restore();
+        };
+        for (const ux of [0.25, 0.75]) {
+          printed(() => {
+            text(c, 'GRIT', w * ux, cy(0.560), h * 0.130, HEX(ink),
+              { skew: -0.2, spacing: h * 0.012, outline: rgba(X.accent, 0.9) });
+            text(c, 'SHELL SERIES', w * ux, cy(0.470), h * 0.042, rgba(ink, 0.7),
+              { font: '700', family: 'sans-serif', spacing: h * 0.010 });
+          }, ux);
+        }
+        printed(() => text(c, 'VOLTA', w * 0.5, cy(0.560), h * 0.078, rgba(ink, 0.8),
+          { skew: -0.16, spacing: h * 0.010 }), 0.5);
+
+        scratches(c, w, h, 90, HEX(shade(col, 0.5)), 6, 50, 0.7);
+        chips(c, w, h, 26, rgba(shade(col, 0.35), 0.5), 0.8, 2.4);
         overlay(c, w, h, 0.1, 3);
       },
-      rough: (c, w, h) => { fill(c, w, h, '#3a3a3a'); scratches(c, w, h, 70, '#8a8a8a', 6, 50, 0.8); },
+      rough: (c, w, h) => {
+        const cy = (g) => (1 - g) * h;
+        fill(c, w, h, '#2e2e2e');                              // moulded gloss shell
+        smudges(c, w, h, 8, 'rgba(150,150,150,0.45)', 'rgba(20,20,20,0.4)');
+        c.fillStyle = 'rgba(120,120,120,0.55)';                // the decal band is matte vinyl
+        c.fillRect(0, cy(0.462), w, cy(0.280) - cy(0.462));
+        scratches(c, w, h, 70, '#8a8a8a', 6, 50, 0.8);
+      },
       hsig: () => 'k',
-      height: (c, w, h) => { fill(c, w, h, '#808080'); overlay(c, w, h, 0.25, 4); },
+      height: (c, w, h) => {
+        const cy = (g) => (1 - g) * h;
+        fill(c, w, h, '#808080');
+        overlay(c, w, h, 0.25, 4);
+        // the decal is a vinyl wrap: a real, if shallow, step at its edges
+        c.fillStyle = '#8e8e8e'; c.fillRect(0, cy(0.462), w, cy(0.280) - cy(0.462));
+      },
     },
     {
       key: 'VENT', u: 1, sig: () => 'k',
@@ -2537,6 +3319,15 @@ function buildContext(profile, materials) {
 
   const twoTone = P.top.style === 'raglan' || P.top.style === 'jersey';
   const trim = separate(P.top.accent, P.top.colour, 0.16);
+  // Top and bottom must be readably DIFFERENT garments. At the shipped floor a
+  // near-black tee over near-black jeans collapsed into one silhouette-shaped
+  // mass with no waist, no hem and no readable top at all.
+  const topBody = fabricAlbedo(P.top.colour, 0.34);
+  const botCol = splitTone(fabricAlbedo(P.bottom.colour, 0.30), topBody, 0.30);
+  // Even a one-colour tee gets a tonal split at the sleeve, the way a real
+  // garment does where the sleeve panel catches light differently to the body.
+  const sleeveCol = twoTone ? fabricAlbedo(trim, 0.34)
+    : shade(topBody, lumOf(topBody) > 0.5 ? -0.13 : 0.15);
 
   return {
     P, M, plan,
@@ -2549,6 +3340,10 @@ function buildContext(profile, materials) {
     grip: grip.colour,
     decals: { id: B.decals.id, mark: B.decals.mark, text: B.decals.text, colour: separate(B.decals.colour, frame.colour, 0.18) },
     accent: separate(P.top.accent, frame.colour, 0.14),
+    // ONE anodised hue for the whole machine (spacers, caps, plugs, tensioners),
+    // dyed to a real anodised albedo so it reads as metal and not as an emitter.
+    anod: anodise(mixc(separate(P.top.accent, frame.colour, 0.14),
+      hw2.colour !== hw.colour ? hw2.colour : separate(P.top.accent, frame.colour, 0.14), 0.35), 0.21),
     // --- rider -------------------------------------------------------------
     skin: R.skin.colour,
     hair: { colour: P.hair.colour, style: P.hair.style, volume: hairOpt.volume ?? 0.4, long: hairOpt.long ?? 0 },
@@ -2556,9 +3351,9 @@ function buildContext(profile, materials) {
     eye: eyeColourFor(P.hair.colour),
     top: {
       style: P.top.style,
-      body: fabricAlbedo(P.top.colour),
-      sleeve: fabricAlbedo(twoTone ? trim : P.top.colour),
-      trim: fabricAlbedo(trim, 0.19),
+      body: topBody,
+      sleeve: sleeveCol,
+      trim: separate(fabricAlbedo(trim, 0.36), topBody, 0.26),
       sleeveLen: TOP_SLEEVE[P.top.style] ?? 0.45,
       loose: TOP_LOOSE[P.top.style] ?? 0.5,
       hood: P.top.style === 'hoodie',
@@ -2566,22 +3361,24 @@ function buildContext(profile, materials) {
       graphic: { mark: R.top.graphicMark, text: R.top.graphicText },
     },
     bottom: {
-      style: P.bottom.style, colour: fabricAlbedo(P.bottom.colour, 0.20),
+      style: P.bottom.style, colour: botCol,
       length: BOTTOM_LEN[P.bottom.style] ?? 1,
       loose: BOTTOM_LOOSE[P.bottom.style] ?? 0.5,
       cuffed: P.bottom.style === 'joggers',
     },
     shoe: {
-      style: P.shoes.style, colour: fabricAlbedo(P.shoes.colour, 0.185), laces: P.shoes.laces,
-      sole: P.shoes.style === 'vulc' || P.shoes.style === 'skate' ? 0x9c6a34
-        : P.shoes.style === 'boot' ? 0x2a2723 : 0xd8d6cf,
+      style: P.shoes.style, colour: fabricAlbedo(P.shoes.colour, 0.30), laces: P.shoes.laces,
+      // the sole is ALWAYS a separate material from the upper — rubber against
+      // canvas or suede is half of what makes a shoe read as a shoe
+      sole: P.shoes.style === 'vulc' || P.shoes.style === 'skate' ? 0xb98a52
+        : P.shoes.style === 'boot' ? 0x4a423a : 0xdedbd2,
       bulk: SHOE_BULK[P.shoes.style] ?? 0.6,
       high: SHOE_HIGH[P.shoes.style] ?? 0,
     },
-    glove: { on: !!P.gloves.on, colour: fabricAlbedo(P.gloves.colour, 0.19) },
-    pad: { ...P.pads, colour: 0x2e3138 },
+    glove: { on: !!P.gloves.on, colour: fabricAlbedo(P.gloves.colour, 0.30) },
+    pad: { ...P.pads, colour: 0x3a3e46 },
     lid: {
-      style: P.headwear, colour: fabricAlbedo(P.headwearColour, 0.185),
+      style: P.headwear, colour: fabricAlbedo(P.headwearColour, 0.26),
       covers: lidOpt.covers ?? 0, helmet: P.headwear === 'helmet',
     },
   };
@@ -2632,9 +3429,14 @@ function buildWheelCore(isRear, AH) {
     hw.push(AH.patch(nut, 'ACCENT'));
   }
 
-  // --- 36 spokes, three-cross, plus brass nipples -----------------------------
+  // --- 36 spokes, three-cross, plus brass nipples and rim eyelets --------------
+  // Spokes are the noisiest thing in the frame if they are thin mirrors: a 1.0 mm
+  // chrome cylinder is sub-pixel at gameplay distance and every frame it lands on
+  // a different set of specular samples, which is what read as white speckle.
+  // They are now 1.35 mm, satin stainless (their OWN atlas region), and laced
+  // 3-cross with alternating flange sides so the pattern is legible.
   const rimHole = 0.1955, crossA = G.cross * 2 * (TAU / G.spokes);
-  const nipples = [];
+  const nipples = [], eyelets = [], flangeHoles = [];
   for (let s = 0; s < 2; s++) {
     const sx = s ? 1 : -1;
     for (let i = 0; i < G.spokes / 2; i++) {
@@ -2643,12 +3445,22 @@ function buildWheelCore(isRear, AH) {
       const rimA = hubA + dir * crossA;
       const a = wheelPt(sx * (G.flangeX + 0.0018), G.flangeR - 0.0035, hubA);
       const b = wheelPt(sx * 0.0062, rimHole, rimA);
-      hw.push(AH.patch(rod(a, b, 0.00105, 0.00095, 5, false), 'CHROME', 0.2, 0.8));
+      hw.push(AH.patch(rod(a, b, 0.00135, 0.00125, 6, false), 'SPOKE', 0.2, 0.8));
       const nb = wheelPt(sx * 0.0062, rimHole - 0.0075, rimA);
-      nipples.push(rod(b, nb, 0.0027, 0.0022, 5, true));
+      nipples.push(rod(b, nb, 0.0030, 0.0024, 6, true));
+      // eyelet: a ferrule sitting in the rim bed, so the spoke enters something
+      const eA = wheelPt(sx * 0.0062, rimHole + 0.0016, rimA);
+      const eB = wheelPt(sx * 0.0062, rimHole - 0.0016, rimA);
+      eyelets.push(rod(eA, eB, 0.0040, 0.0040, 6, true));
+      // drilled flange hole
+      const hA = wheelPt(sx * (G.flangeX - 0.0020), G.flangeR - 0.0035, hubA);
+      const hB = wheelPt(sx * (G.flangeX + 0.0026), G.flangeR - 0.0035, hubA);
+      flangeHoles.push(rod(hA, hB, 0.0022, 0.0022, 6, true));
     }
   }
   hw.push(AH.patch(merge(nipples), 'BRASS'));
+  hw.push(AH.patch(merge(eyelets), 'BRASS'));
+  hw.push(AH.patch(merge(flangeHoles), 'STEEL'));
 
   // --- valve stem -------------------------------------------------------------
   const va = 0.6;
@@ -2672,37 +3484,94 @@ function buildWheelCore(isRear, AH) {
 }
 
 /** The tyre alone: casing plus tread blocks, rebuilt when the tread style changes. */
+// the bead sits just proud of the rim's outer wall so the rim colour reads
+const TYRE_PROFILE = [
+  [0.2140, -0.0110], [0.2215, -0.0225], [0.2360, -0.0288], [0.2505, -0.0268],
+  [0.2578, -0.0160], [0.2600, 0.0000], [0.2578, 0.0160], [0.2505, 0.0268],
+  [0.2360, 0.0288], [0.2215, 0.0225], [0.2140, 0.0110],
+];
+
+/**
+ * Sample the casing at profile coordinate v (0..1, index-parameterised exactly as
+ * LatheGeometry writes its own v) and azimuth `a`, returning the point and the
+ * true outward surface normal. Real block placement needs the normal, not a
+ * radial approximation: a shoulder lug leans outward AND sideways.
+ */
+function tyreSurface(v, a) {
+  const n = TYRE_PROFILE.length - 1;
+  const f = clamp(v, 0, 1) * n;
+  const i = Math.min(n - 1, Math.floor(f));
+  const t = f - i;
+  const r = lerp(TYRE_PROFILE[i][0], TYRE_PROFILE[i + 1][0], t);
+  const x = lerp(TYRE_PROFILE[i][1], TYRE_PROFILE[i + 1][1], t);
+  // profile tangent (dx along the axle, dr radial) → normal = (-dr, dx), outward
+  let dx = TYRE_PROFILE[i + 1][1] - TYRE_PROFILE[i][1];
+  let dr = TYRE_PROFILE[i + 1][0] - TYRE_PROFILE[i][0];
+  const L = Math.hypot(dx, dr) || 1;
+  dx /= L; dr /= L;
+  let nAx = -dr, nRad = dx;
+  if (nRad < 0) { nAx = -nAx; nRad = -nRad; }
+  const ca = Math.cos(a), sa = Math.sin(a);
+  return {
+    p: V(x, r * ca, r * sa),
+    n: V(nAx, nRad * ca, nRad * sa).normalize(),
+  };
+}
+
+/**
+ * Real tread geometry. Each block is a drafted prism lofted off the casing, so it
+ * holds a silhouette against the sky at the top of the wheel — a normal map alone
+ * leaves the tyre a perfectly smooth torus, which is exactly the note we got.
+ */
+function buildTreadGeometry(tread) {
+  const pos = [], uvs = [];
+  const draft = 0.16;                                    // top face inset (mould draft)
+  // LatheGeometry writes u = phi/TAU with vertex (r sinφ, axial, r cosφ); latheX
+  // then rotates it onto the +X spin axis, which puts wheel azimuth a = phi + π/2.
+  // Blocks are placed through the SAME relation, so a block lands exactly on the
+  // block that was painted for it.
+  const corner = (u, v, lift) => {
+    const s = tyreSurface(v, u * TAU + Math.PI / 2);
+    return s.p.addScaledVector(s.n, lift);
+  };
+  // flat-shaded: every face gets its own vertices, so a block keeps crisp edges
+  // instead of averaging into a soft bump
+  const tri = (a, b, c, ua, ub, uc) => {
+    pos.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+    uvs.push(ua[0], ua[1], ub[0], ub[1], uc[0], uc[1]);
+  };
+  const quad = (p, uv) => {
+    tri(p[0], p[1], p[2], uv[0], uv[1], uv[2]);
+    tri(p[0], p[2], p[3], uv[0], uv[2], uv[3]);
+  };
+  for (const b of treadPattern(tread)) {
+    const u0 = (b.i + b.uo) / TREAD_N, u1 = (b.i + b.uo + b.du) / TREAD_N;
+    const du = (u1 - u0) * draft, dv = (b.v1 - b.v0) * draft;
+    const baseUV = [[u0, b.v0], [u1, b.v0], [u1, b.v1], [u0, b.v1]];
+    const topUV = [[u0 + du, b.v0 + dv], [u1 - du, b.v0 + dv],
+      [u1 - du, b.v1 - dv], [u0 + du, b.v1 - dv]];
+    // the block sinks slightly INTO the casing so no crack shows at its foot
+    const B = baseUV.map(([u, v]) => corner(u, v, -0.0006));
+    const T = topUV.map(([u, v]) => corner(u, v, b.rise));
+    quad(T, topUV);
+    for (let k = 0; k < 4; k++) {
+      const j = (k + 1) % 4;
+      quad([B[k], B[j], T[j], T[k]], [baseUV[k], baseUV[j], topUV[j], topUV[k]]);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.computeVertexNormals();
+  return normalise(geo);
+}
+
 function buildTyre(tread, AR) {
   const rub = [];
-  // the bead sits just proud of the rim's outer wall so the rim colour reads
-  const tyreProfile = [
-    [0.2140, -0.0110], [0.2215, -0.0225], [0.2360, -0.0288], [0.2505, -0.0268],
-    [0.2578, -0.0160], [0.2600, 0.0000], [0.2578, 0.0160], [0.2505, 0.0268],
-    [0.2360, 0.0288], [0.2215, 0.0225], [0.2140, 0.0110],
-  ];
-  rub.push(AR.uv(latheX(tyreProfile, 40), 'TYRE'));
-
-  if (tread !== 'slick') {
-    const knobs = [];
-    const rows = tread === 'street' ? 26 : 20;
-    for (let i = 0; i < rows; i++) {
-      const a = (i / rows) * TAU;
-      const set = tread === 'street'
-        ? [[-0.012, 0.2585, 0.0090, 0.0060], [0.012, 0.2585, 0.0090, 0.0060]]
-        : i % 2 === 0
-          ? [[0, 0.2585, 0.0135, 0.0095], [-0.0195, 0.2505, 0.0105, 0.0115], [0.0195, 0.2505, 0.0105, 0.0115]]
-          : [[-0.0085, 0.2570, 0.0110, 0.0090], [0.0085, 0.2570, 0.0110, 0.0090],
-            [-0.0245, 0.2440, 0.0100, 0.0110], [0.0245, 0.2440, 0.0100, 0.0110]];
-      for (const [x, r, len, wid] of set) {
-        const kb = new THREE.BoxGeometry(wid, tread === 'street' ? 0.0032 : 0.0055, len);
-        const p = wheelPt(x, r, a);
-        const out = V(0, Math.cos(a), Math.sin(a));
-        place(kb, p, p.clone().addScaledVector(out, 0.0055), V(1, 0, 0));
-        knobs.push(kb);
-      }
-    }
-    rub.push(AR.patch(merge(knobs), 'TYRE', 0.02, 0.03, 0.44));
-  }
+  rub.push(AR.uv(latheX(TYRE_PROFILE, 48), 'TYRE'));
+  // The blocks carry the SAME uv as the casing beneath them, so a block is painted
+  // with the block that was painted for it — no separate patch, no mip drift.
+  rub.push(AR.uv(buildTreadGeometry(tread), 'TYRE'));
   return merge(rub);
 }
 
@@ -2909,28 +3778,40 @@ function buildFork(AP, AH) {
   paint.push(AP.uv(weld(crown, axisUp, 0.031), 'MAIN'));
 
   for (const s of [-1, 1]) {
+    // 32 mm offset, and the leg BOWS to get it: a fork whose legs run dead
+    // straight from crown to axle reads as two pieces of tube, which is the note.
     const a = crown.clone().add(V(s * 0.040, 0.006, 0));
-    const m = crown.clone().lerp(frontAxle, 0.55).add(V(s * 0.052, 0.006, 0.004));
-    const b = V(s * 0.056, frontAxle.y + 0.006, frontAxle.z - 0.002);
+    const m = crown.clone().lerp(frontAxle, 0.52).add(V(s * 0.053, 0.004, 0.019));
+    const b = V(s * 0.056, frontAxle.y + 0.006, frontAxle.z + 0.004);
     paint.push(AP.uv(sweep([a, m, b], {
-      radius: 0.0182, radial: 8, steps: 16,
-      taper: (t) => lerp(1.0, 0.62, smoothstep(t)),
-      oval: (t) => [lerp(0.92, 0.78, t), lerp(1.06, 1.22, t)],
+      radius: 0.0188, radial: 10, steps: 20, tension: 0.42,
+      taper: (t) => lerp(1.0, 0.60, smoothstep(t)),
+      oval: (t) => [lerp(0.92, 0.74, t), lerp(1.06, 1.26, t)],
     }), 'MAIN'));
+    // weld bead where the leg meets the crown
+    paint.push(AP.uv(weld(a.clone().addScaledVector(m.clone().sub(a).normalize(), 0.008),
+      m.clone().sub(a).normalize(), 0.0192), 'MAIN'));
 
-    // dropout
+    // dropout: a forged slotted plate with a real chamfer around its edge
     const dshape = new THREE.Shape();
-    dshape.moveTo(-0.026, 0.030); dshape.lineTo(0.024, 0.030);
-    dshape.lineTo(0.026, -0.006); dshape.lineTo(0.000, -0.026);
-    dshape.lineTo(-0.026, -0.020); dshape.closePath();
+    dshape.moveTo(-0.034, 0.040); dshape.lineTo(0.030, 0.040);
+    dshape.quadraticCurveTo(0.036, 0.012, 0.032, -0.008);
+    dshape.lineTo(0.002, -0.032);
+    dshape.quadraticCurveTo(-0.018, -0.036, -0.034, -0.026);
+    dshape.closePath();
     const slot = new THREE.Path();
-    slot.moveTo(-0.0085, -0.026); slot.absarc(0, 0, 0.0085, -Math.PI / 2, Math.PI / 2, true);
-    slot.lineTo(0.0085, -0.026); slot.lineTo(-0.0085, -0.026);
+    slot.moveTo(-0.0088, -0.032); slot.absarc(0, 0, 0.0088, -Math.PI / 2, Math.PI / 2, true);
+    slot.lineTo(0.0088, -0.032); slot.lineTo(-0.0088, -0.032);
     dshape.holes.push(slot);
-    const dp = plate(dshape, 0.0085, 0.0007, 4);
+    const dp = plate(dshape, 0.0100, 0.0020, 6);
     dp.rotateY(Math.PI / 2);
     dp.translate(s * 0.056, frontAxle.y, frontAxle.z);
     paint.push(AP.uv(dp, 'DARK'));
+    // axle nut so the dropout terminates in something
+    const nut = new THREE.CylinderGeometry(0.0135, 0.0135, 0.010, 6);
+    nut.rotateZ(Math.PI / 2);
+    nut.translate(s * 0.0645, frontAxle.y, frontAxle.z);
+    hw.push(AH.patch(nut, 'ACCENT'));
   }
 
   // headset cups, spacers, gyro lower plate
@@ -2958,12 +3839,16 @@ function buildBars(AH, AR) {
   const stemBase = htTop.clone().addScaledVector(axisUp, 0.046);
   const barCentre = stemBase.clone().addScaledVector(axisFwd, 0.050).addScaledVector(axisUp, 0.004);
 
-  // bar: one continuous sweep from grip to grip, with the crossbar added after
+  // bar: one continuous sweep from grip to grip, with the crossbar added after.
+  // 750 mm grip-to-grip x 240 mm rise — a modern park bar. The old 660 x 228 read
+  // as barely wider than the rider's shoulders and made the cockpit look toy-like.
   const half = [
-    [0.000, 0.000, 0.000], [0.052, 0.004, 0.000], [0.086, 0.062, -0.010],
-    [0.104, 0.150, -0.028], [0.132, 0.208, -0.044], [0.186, 0.222, -0.056],
-    [0.262, 0.226, -0.066], [0.330, 0.228, -0.074],
+    [0.000, 0.000, 0.000], [0.056, 0.005, 0.000], [0.094, 0.068, -0.011],
+    [0.115, 0.162, -0.030], [0.148, 0.222, -0.047], [0.208, 0.236, -0.060],
+    [0.296, 0.240, -0.071], [0.375, 0.242, -0.079],
   ];
+  // one place that owns where a grip starts and ends along the bar
+  const GRIP_A = V(0.222, 0.2366, -0.0618), GRIP_B = V(0.378, 0.2420, -0.0793);
   const pts = [];
   for (let i = half.length - 1; i >= 1; i--) pts.push(barCentre.clone().add(V(-half[i][0], half[i][1], half[i][2])));
   pts.push(barCentre.clone());
@@ -2971,10 +3856,10 @@ function buildBars(AH, AR) {
   hw.push(AH.uv(sweep(pts, { radius: 0.0143, radial: 8, steps: 40, tension: 0.42 }), 'CHROME'));
 
   // crossbar
-  const cbY = 0.150, cbA = [], cbB = [];
+  const cbY = 0.162, cbA = [], cbB = [];
   for (const s of [-1, 1]) {
-    cbA.push(barCentre.clone().add(V(s * 0.104, cbY, -0.028)));
-    cbB.push(barCentre.clone().add(V(s * 0.070, cbY + 0.028, -0.020)));
+    cbA.push(barCentre.clone().add(V(s * 0.115, cbY, -0.030)));
+    cbB.push(barCentre.clone().add(V(s * 0.078, cbY + 0.030, -0.022)));
   }
   hw.push(AH.uv(sweep([cbA[0], cbB[0], cbB[1], cbA[1]], { radius: 0.0105, radial: 8, steps: 14, tension: 0.3 }), 'CHROME'));
 
@@ -2993,18 +3878,31 @@ function buildBars(AH, AR) {
   clampRing.translate(stemBase.x, stemBase.y, stemBase.z);
   hw.push(AH.patch(clampRing, 'ANOD'));
 
-  const face = plate(roundedRectShape(0.048, 0.052, 0.008), 0.014, 0.001, 4);
-  face.applyMatrix4(basis);
-  face.translate(barCentre.x + fwd.x * 0.018, barCentre.y + fwd.y * 0.018, barCentre.z + fwd.z * 0.018);
-  hw.push(AH.uv(face, 'ANOD'));
+  // Faceplate: a milled block whose face actually points FORWARD (the old one was
+  // a slab 50 mm deep and 14 mm across, so its face pointed sideways and the four
+  // clamp bolts sat outside it), with real relief cuts across the face.
+  const faceBasis = new THREE.Matrix4().makeBasis(side, up, fwd);
+  const face = plate(roundedRectShape(0.052, 0.056, 0.009), 0.013, 0.001, 4);
+  face.applyMatrix4(faceBasis);
+  face.translate(barCentre.x + fwd.x * 0.019, barCentre.y + fwd.y * 0.019, barCentre.z + fwd.z * 0.019);
+  hw.push(AH.uv(face, 'MACHINED'));
+  for (let i = -1; i <= 1; i++) {
+    const groove = plate(roundedRectShape(0.0060, 0.030, 0.0025), 0.0045, 0.0004, 3);
+    groove.applyMatrix4(faceBasis);
+    const o = barCentre.clone()
+      .addScaledVector(fwd, 0.0250)
+      .addScaledVector(side, i * 0.0100);
+    groove.translate(o.x, o.y, o.z);
+    hw.push(AH.patch(groove, 'MACHINED'));
+  }
 
   for (const sx of [-1, 1]) {
     for (const sy of [-1, 1]) {
       const bolt = new THREE.CylinderGeometry(0.0042, 0.0042, 0.020, 6);
       const o = barCentre.clone()
-        .addScaledVector(fwd, 0.022)
-        .addScaledVector(up, sy * 0.017)
-        .addScaledVector(side, sx * 0.017);
+        .addScaledVector(fwd, 0.028)
+        .addScaledVector(up, sy * 0.018)
+        .addScaledVector(side, sx * 0.018);
       place(bolt, o, o.clone().addScaledVector(fwd, -0.02));
       hw.push(AH.patch(bolt, 'CHROME'));
     }
@@ -3028,62 +3926,93 @@ function buildBars(AH, AR) {
   gyroHi.translate(ghp.x, ghp.y, ghp.z);
   hw.push(AH.patch(gyroHi, 'ANOD'));
 
-  // brake lever on the right bar
-  const gripInner = barCentre.clone().add(V(0.180, 0.222, -0.056));
-  const gripOuter = barCentre.clone().add(V(0.330, 0.228, -0.074));
-  const perch = latheX([[0.0143, 0], [0.0210, 0], [0.0210, 0.020], [0.0143, 0.020]], 14);
+  // brake lever on the right bar — a real perch, a curved blade with a hooked
+  // tip, a reach-adjust barrel and a cable stop the gyro cable actually lands on
+  const gripInner = barCentre.clone().add(GRIP_A);
+  const gripOuter = barCentre.clone().add(GRIP_B);
   const gdir = gripOuter.clone().sub(gripInner).normalize();
+  const gPerp = new THREE.Vector3().crossVectors(gdir, V(0, 1, 0)).normalize();   // ~forward
+  const gUp = new THREE.Vector3().crossVectors(gPerp, gdir).normalize();
+  const perch = latheX([
+    [0.0143, 0], [0.0225, 0.002], [0.0235, 0.008], [0.0225, 0.024], [0.0143, 0.026],
+  ], 16);
   _q.setFromUnitVectors(V(1, 0, 0), gdir);
   perch.applyQuaternion(_q);
-  const perchP = gripInner.clone().addScaledVector(gdir, -0.020);
+  const perchP = gripInner.clone().addScaledVector(gdir, -0.028);
   perch.translate(perchP.x, perchP.y, perchP.z);
   hw.push(AH.patch(perch, 'ANOD'));
 
   const bladeShape = new THREE.Shape();
-  bladeShape.moveTo(0, 0); bladeShape.lineTo(0.086, -0.012);
-  bladeShape.quadraticCurveTo(0.100, -0.014, 0.098, -0.024);
-  bladeShape.lineTo(0.080, -0.026); bladeShape.lineTo(0.004, -0.012); bladeShape.closePath();
-  const blade = plate(bladeShape, 0.0075, 0.0008, 4);
-  const bFwd = V(0, 0, 1), bUp = V(0, 1, 0);
-  blade.applyMatrix4(new THREE.Matrix4().makeBasis(bFwd, bUp, new THREE.Vector3().crossVectors(bFwd, bUp)));
-  blade.translate(perchP.x + 0.012, perchP.y - 0.006, perchP.z + 0.016);
-  hw.push(AH.patch(blade, 'ALLOY'));
+  bladeShape.moveTo(0, 0.004);
+  bladeShape.quadraticCurveTo(0.052, -0.004, 0.092, -0.020);
+  bladeShape.quadraticCurveTo(0.110, -0.028, 0.108, -0.042);
+  bladeShape.lineTo(0.094, -0.044);
+  bladeShape.quadraticCurveTo(0.092, -0.034, 0.080, -0.030);
+  bladeShape.quadraticCurveTo(0.044, -0.016, 0.000, -0.010);
+  bladeShape.closePath();
+  const blade = plate(bladeShape, 0.0090, 0.0012, 6);
+  // the blade lies in the plane spanned by (forward, up) at the bar, so it sweeps
+  // forward off the perch instead of sitting in an arbitrary world plane
+  blade.applyMatrix4(new THREE.Matrix4().makeBasis(gPerp, gUp, gdir));
+  const bladeAt = perchP.clone().addScaledVector(gPerp, 0.020).addScaledVector(gUp, -0.004)
+    .addScaledVector(gdir, 0.006);
+  blade.translate(bladeAt.x, bladeAt.y, bladeAt.z);
+  hw.push(AH.patch(blade, 'MACHINED'));
+  const barrel = new THREE.CylinderGeometry(0.0048, 0.0048, 0.016, 8);
+  const barrelAt = perchP.clone().addScaledVector(gPerp, 0.004).addScaledVector(gUp, 0.020);
+  place(barrel, barrelAt, barrelAt.clone().addScaledVector(gUp, 0.016));
+  hw.push(AH.patch(barrel, 'ANOD'));
 
   rub.push(AR.uv(sweep([
-    perchP.clone().add(V(0.004, 0.010, 0.016)),
-    perchP.clone().add(V(-0.03, 0.036, 0.030)),
-    barCentre.clone().add(V(0.02, 0.230, -0.010)),
-    barCentre.clone().add(V(0.0, 0.120, 0.010)),
+    barrelAt.clone().addScaledVector(gUp, 0.014),
+    perchP.clone().add(V(-0.03, 0.046, 0.028)),
+    barCentre.clone().add(V(0.02, 0.238, -0.010)),
+    barCentre.clone().add(V(0.0, 0.126, 0.010)),
     ghp.clone().add(V(0.0, 0.014, 0.012)),
-  ], { radius: 0.0026, radial: 5, steps: 24 }), 'CABLE'));
+  ], { radius: 0.0028, radial: 6, steps: 24 }), 'CABLE'));
 
-  // grips with bar-end plugs
+  // grips: knurled inboard flange, ribbed barrel, bar-end plug seat.
+  // v = 0 is the flange, v = 1 the bar end — the GRIP region is painted to match.
   const gripPts = [];
-  gripPts.push([0.0125, 0.000], [0.0175, 0.004], [0.0178, 0.013], [0.0150, 0.017]);
+  gripPts.push([0.0125, 0.000], [0.0205, 0.003], [0.0212, 0.014], [0.0206, 0.019], [0.0160, 0.022]);
   for (let i = 0; i < 11; i++) {
-    const y = 0.019 + i * 0.0106;
-    gripPts.push([i % 2 ? 0.0172 : 0.0159, y]);
+    const y = 0.026 + i * 0.0104;
+    gripPts.push([i % 2 ? 0.0176 : 0.0162, y]);
   }
-  gripPts.push([0.0168, 0.140], [0.0180, 0.146], [0.0150, 0.150], [0.0, 0.150]);
+  gripPts.push([0.0172, 0.142], [0.0184, 0.147], [0.0150, 0.151], [0.0, 0.151]);
+  const gripLen = 0.151;
   for (const s of [-1, 1]) {
-    const gi = barCentre.clone().add(V(s * 0.180, 0.222, -0.056));
-    const go = barCentre.clone().add(V(s * 0.336, 0.228, -0.075));
-    const gr = new THREE.LatheGeometry(gripPts.map(([r, y]) => new THREE.Vector2(r, y)), 18);
+    const gi = barCentre.clone().add(V(s * GRIP_A.x, GRIP_A.y, GRIP_A.z));
+    const go = barCentre.clone().add(V(s * GRIP_B.x, GRIP_B.y, GRIP_B.z));
+    const gr = new THREE.LatheGeometry(gripPts.map(([r, y]) => new THREE.Vector2(r, y)), 20);
     place(gr, gi, go);
     rub.push(AR.uv(gr, 'GRIP'));
 
-    const plug = latheX([[0, 0], [0.0130, 0], [0.0150, 0.004], [0.0140, 0.010], [0, 0.010]], 16);
+    // Bar-end plug: seated FLUSH in the grip's own end recess. Its face sits at
+    // gripLen, not proud of it, so it can never punch out through a palm.
+    const plug = latheX([[0, 0], [0.0136, 0], [0.0152, 0.003], [0.0146, 0.0075], [0, 0.0075]], 18);
     const pdir = go.clone().sub(gi).normalize();
     _q.setFromUnitVectors(V(1, 0, 0), pdir);
     plug.applyQuaternion(_q);
-    const pp = gi.clone().addScaledVector(pdir, 0.148);
+    const pp = gi.clone().addScaledVector(pdir, gripLen - 0.0072);
     plug.translate(pp.x, pp.y, pp.z);
     hw.push(AH.patch(plug, 'ACCENT'));
   }
 
-  const gripAnchorL = barCentre.clone().add(V(-0.255, 0.2245, -0.0655));
-  const gripAnchorR = barCentre.clone().add(V(0.255, 0.2245, -0.0655));
-  return { hardware: merge(hw), rubber: merge(rub), gripAnchorL, gripAnchorR, barCentre };
+  const gMidL = V(-(GRIP_A.x + GRIP_B.x) / 2, (GRIP_A.y + GRIP_B.y) / 2, (GRIP_A.z + GRIP_B.z) / 2);
+  const gMidR = V((GRIP_A.x + GRIP_B.x) / 2, (GRIP_A.y + GRIP_B.y) / 2, (GRIP_A.z + GRIP_B.z) / 2);
+  const gripAnchorL = barCentre.clone().add(gMidL);
+  const gripAnchorR = barCentre.clone().add(gMidR);
+  // Axis + radius the HAND is placed from. Publishing these is what lets the fist
+  // be driven by IK off the grip instead of guessed off the arm chain.
+  const gripAxisR = V(GRIP_B.x - GRIP_A.x, GRIP_B.y - GRIP_A.y, GRIP_B.z - GRIP_A.z).normalize();
+  const gripAxisL = V(-gripAxisR.x, gripAxisR.y, gripAxisR.z);
+  return {
+    hardware: merge(hw), rubber: merge(rub), gripAnchorL, gripAnchorR, barCentre,
+    gripAxisL, gripAxisR, gripRadius: 0.0176, gripLen,
+    gripStartL: barCentre.clone().add(V(-GRIP_A.x, GRIP_A.y, GRIP_A.z)),
+    gripStartR: barCentre.clone().add(V(GRIP_A.x, GRIP_A.y, GRIP_A.z)),
+  };
 }
 
 function buildSeat(AR, AH) {
@@ -3155,18 +4084,23 @@ function buildDrivetrain(AH) {
   }
   hw.push(AH.patch(rod(V(-0.062, bb.y, bb.z), V(0.062, bb.y, bb.z), 0.0115), 'STEEL'));
 
-  // chainring on the drive side
+  // chainring on the drive side — 25T, milled face, real 5-bolt circle
   const { shape: ringShape, R: ringR } = sprocketShape(G.sprocketTeeth, G.pitch, 5, 0.0115);
-  const ring = plate(ringShape, 0.0052, 0.0007, 4);
+  const ring = plate(ringShape, 0.0062, 0.0009, 4);
   ring.rotateY(Math.PI / 2);
   ring.rotateX(Math.PI / 2);
   ring.translate(G.chainLine, bb.y, bb.z);
-  hw.push(AH.uv(ring, 'ALLOY'));
-  for (let i = 0; i < 4; i++) {
-    const a = (i / 4) * TAU + 0.5;
-    const bolt = new THREE.CylinderGeometry(0.0045, 0.0045, 0.014, 6);
+  hw.push(AH.uv(ring, 'MACHINED'));
+  for (let i = 0; i < 5; i++) {                    // 5-bolt circle, both faces
+    const a = (i / 5) * TAU + 0.3;
+    const y = bb.y + Math.sin(a) * ringR * 0.42, z = bb.z + Math.cos(a) * ringR * 0.42;
+    const boss = new THREE.CylinderGeometry(0.0082, 0.0082, 0.0090, 10);
+    boss.rotateZ(Math.PI / 2);
+    boss.translate(G.chainLine, y, z);
+    hw.push(AH.patch(boss, 'MACHINED'));
+    const bolt = new THREE.CylinderGeometry(0.0050, 0.0050, 0.0160, 6);
     bolt.rotateZ(Math.PI / 2);
-    bolt.translate(0.048, bb.y + Math.sin(a) * ringR * 0.30, bb.z + Math.cos(a) * ringR * 0.30);
+    bolt.translate(G.chainLine + 0.0035, y, z);
     hw.push(AH.patch(bolt, 'CHROME'));
   }
 
@@ -3222,15 +4156,30 @@ function buildDrivetrain(AH) {
   const total = cum[n];
   const links = Math.max(8, Math.round(total / G.pitch));
 
+  // A link is outer plate + inner plate + roller + pin head, not a single strip:
+  // at 3 m a 1.3 mm plate is under a pixel and the chain dissolves into specks.
+  // 9.2 mm tall plates and a 4.4 mm roller give the run a continuous highlight
+  // along its top tangent instead of a dotted line.
   const linkParts = [];
   for (const s of [-1, 1]) {
-    const pl = new THREE.BoxGeometry(G.pitch * 1.12, 0.0072, 0.0013);
-    pl.translate(G.pitch * 0.5, 0, s * 0.0026);
-    linkParts.push(AH.patch(pl, 'OILY'));
+    const outerPl = new THREE.BoxGeometry(G.pitch * 1.16, 0.0092, 0.0019);
+    outerPl.translate(G.pitch * 0.5, 0, s * 0.0040);
+    linkParts.push(AH.patch(outerPl, 'OILY', 0.10, 0.90));
+    const innerPl = new THREE.BoxGeometry(G.pitch * 0.96, 0.0078, 0.0016);
+    innerPl.translate(G.pitch * 0.5, 0, s * 0.0021);
+    linkParts.push(AH.patch(innerPl, 'OILY', 0.20, 0.80));
   }
-  const roller = new THREE.CylinderGeometry(0.0037, 0.0037, 0.0048, 5);
+  // 7.6 mm roller against 9.2 mm plates: it has to sit INSIDE the plate height or
+  // consecutive rollers merge into a continuous knurled rod that reads as cable.
+  const roller = new THREE.CylinderGeometry(0.0038, 0.0038, 0.0044, 8);
   roller.rotateX(Math.PI / 2);
   linkParts.push(AH.patch(roller, 'STEEL'));
+  for (const s of [-1, 1]) {                        // pin heads, peened proud
+    const pin = new THREE.CylinderGeometry(0.0021, 0.0018, 0.0014, 6);
+    pin.rotateX(Math.PI / 2);
+    pin.translate(0, 0, s * 0.0052);
+    linkParts.push(AH.patch(pin, 'CHROME'));
+  }
 
   return {
     hardware: merge(hw), pedals,
@@ -3273,8 +4222,19 @@ function riderPose(pts, X) {
   const L = limbLengths(M);
   const hs = M.heightScale;
 
-  const gripMid = pts.gripL.clone().add(pts.gripR).multiplyScalar(0.5);
-  const wristMid = V(0, gripMid.y + 0.012 * hs, gripMid.z - 0.020 * hs);
+  // The hands are IK'd off the GRIPS: `fistWrist` says exactly where a wrist has
+  // to be for a fist of this size to be closed on a grip of this radius, and the
+  // whole stance is then solved to put the wrists there. Previously the wrist was
+  // a fixed offset guess and the fist was hung off it, which is why one palm
+  // floated clear of its grip and the other swallowed the bar-end cap.
+  const handR = 0.041 * hs * lerp(0.92, 1.10, M.build);
+  const barR = pts.gripRadius ?? 0.0176;
+  const curlR = barR + handR * (X.glove.on ? 0.10 : 0.045);
+  const axisFor = (s) => (s > 0 ? pts.gripAxisR : pts.gripAxisL) || V(s, 0.02, -0.08).normalize();
+  const gripFor = (s) => (s > 0 ? pts.gripR : pts.gripL);
+  const wristAt = (s) => fistWrist(gripFor(s), axisFor(s), handR, curlR);
+
+  const wristMid = wristAt(1).lerp(wristAt(-1), 0.5).setX(0);
   const pedalMid = pts.pedalL.clone().add(pts.pedalR).multiplyScalar(0.5);
   const ankleMid = V(0, pedalMid.y + 0.074 * hs + M.fit.pedalDrop, pedalMid.z - 0.030);
 
@@ -3314,12 +4274,19 @@ function riderPose(pts, X) {
 
   const shoulder = (s) => chest.clone()
     .add(V(s * 0.180 * M.shoulderWidth, 0.022 * hs, 0.004));
-  const wristFor = (s) => (s > 0 ? pts.gripR : pts.gripL).clone().add(V(0, 0.012 * hs, -0.020 * hs));
+  const wristFor = (s) => wristAt(s);
   const hip = (s) => hips.clone().add(V(s * 0.096 * M.hipWidth, -0.014 * hs, 0.012));
   const ankle = (s) => (s > 0 ? pts.pedalR : pts.pedalL).clone()
     .add(V(s * -0.008, 0.074 * hs + M.fit.pedalDrop, -0.030));
 
-  const pose = { hips, spine, chest, neck, head, lean, front, leanA, L };
+  const pose = {
+    hips, spine, chest, neck, head, lean, front, leanA, L,
+    // published so the body builder places the fists from exactly the same grip
+    // transform the stance was solved against
+    handR, curlR, gripRadius: barR,
+    gripAxisR: axisFor(1), gripAxisL: axisFor(-1),
+    gripPointR: gripFor(1).clone(), gripPointL: gripFor(-1).clone(),
+  };
   for (const [side, s] of [['R', 1], ['L', -1]]) {
     const sh = shoulder(s), wr = wristFor(s);
     const el = ikJoint(sh, wr, L.upperArm, L.foreArm, V(s * 0.86, -0.34, -0.38));
@@ -3575,24 +4542,29 @@ function headSurface(a, t, R, S) {
     const across = Math.exp(-Math.pow(p, 2.5) * 1.35);
     const along = smoothstep(clamp((nh + 0.06) / 0.26, 0, 1))
       * (1 - smoothstep(clamp((nh - 0.96) / 0.26, 0, 1)));
-    const fwd = lerp(0.028, 0.185, smoothstep(clamp((nh - 0.10) / 0.66, 0, 1)));
+    const fwd = lerp(0.034, 0.228, smoothstep(clamp((nh - 0.10) / 0.66, 0, 1)));
     pz += along * across * fwd * R * front;
     // alae flare either side of the tip, nostrils cut in underneath
     const ala = _g(nh - 0.95, 0.13) * _g(ax - 0.180, 0.080) * front;
-    px += sgn * ala * 0.030 * R;
-    pz += ala * 0.020 * R;
+    px += sgn * ala * 0.036 * R;
+    pz += ala * 0.026 * R;
     const nostril = _g(nh - 1.09, 0.09) * _g(ax - 0.110, 0.060) * front;
     pz -= nostril * 0.032 * R;
     py -= nostril * 0.006 * R;
   }
 
   // --- brow, sockets, eyes ---------------------------------------------------
+  // The brow ridge and the orbital rim are GEOMETRY, not paint: at a 900 px
+  // close-up a painted brow has no self-shadow and the head reads as an egg.
   const brow = _g(yn - 0.157, 0.105) * Math.max(0, zn - 0.22) * (0.50 + 0.50 * _g(ax - 0.30, 0.27));
-  pz += brow * 0.058 * R * S.brow;
+  pz += brow * 0.086 * R * S.brow;
+  py += brow * 0.010 * R * S.brow;                                                       // rim lip
   const eyeX = ax - 0.315;
-  pz -= _g(yn - 0.030, 0.100) * _g(eyeX, 0.170) * Math.max(0, zn - 0.28) * 0.040 * R;   // socket
-  pz += _g(yn - 0.025, 0.065) * _g(eyeX, 0.100) * Math.max(0, zn - 0.42) * 0.032 * R;   // globe
-  pz -= _g(yn - 0.090, 0.028) * _g(eyeX, 0.090) * Math.max(0, zn - 0.42) * 0.014 * R;   // lid crease
+  pz -= _g(yn - 0.030, 0.100) * _g(eyeX, 0.170) * Math.max(0, zn - 0.28) * 0.058 * R;   // socket
+  pz += _g(yn - 0.025, 0.065) * _g(eyeX, 0.100) * Math.max(0, zn - 0.42) * 0.036 * R;   // globe
+  pz -= _g(yn - 0.090, 0.028) * _g(eyeX, 0.090) * Math.max(0, zn - 0.42) * 0.020 * R;   // lid crease
+  // glabella: the bridge between the brows, which is what gives the nose a root
+  pz += _g(yn - 0.150, 0.070) * _g(xn, 0.090) * Math.max(0, zn - 0.40) * 0.022 * R;
 
   // --- cheeks ----------------------------------------------------------------
   const zyg = _g(yn + 0.170, 0.150) * _g(ax - 0.600, 0.245) * Math.max(0, zn * 0.65 + 0.35);
@@ -3608,7 +4580,10 @@ function headSurface(a, t, R, S) {
 }
 
 function buildHead(centre, R, S) {
-  const NU = 40, NV = 26;
+  // 52 x 34 rather than 40 x 26: the brow ridge, the orbital rim and the nose are
+  // all real displacement now, and at the old tessellation the nose was four
+  // quads wide and the socket rim was faceted at a 900 px close-up.
+  const NU = 52, NV = 34;
   const pos = [], uvs = [], idx = [];
   for (let j = 0; j <= NV; j++) {
     const s = j / NV;
@@ -3747,7 +4722,10 @@ function hairThickness(X, R) {
   const spec = HAIR_SPEC[X.hair.style] || HAIR_SPEC.short;
   if (!spec.t) return 0;
   const vol = clamp(X.hair.volume, 0.05, 1);
-  return 0.034 * spec.t * (0.6 + 0.7 * vol) * (R / 0.098);
+  // A helmet crushes hair. Without this an afro under a lid pushes straight
+  // through the EPS liner, which is why the shell used to cull the hair entirely.
+  const crush = X.lid && X.lid.helmet ? 0.42 : 1;
+  return 0.034 * spec.t * (0.6 + 0.7 * vol) * crush * (R / 0.098);
 }
 
 /**
@@ -3769,6 +4747,11 @@ function buildHair(centre, R, S, X, coverV) {
     const f = Math.cos(a);                        // 1 front, -1 back
     // the temple drop stays ABOVE FL.earTop: hair goes around an ear, not over it
     let v = spec.line - 0.070 * (1 - Math.abs(f)) - (f < 0 ? 0.185 : 0);
+    // A helmet crushes hair DOWN and OUT: the fringe that shows below the shell
+    // at the temples and the nape is what stops the lid meeting bare scalp on a
+    // hard geometric seam. Barely touched at the front, so nothing hangs in the
+    // eyes (the shell's front edge sits at v ≈ 0.645, this line at ≈ 0.70).
+    if (X.lid && X.lid.helmet) v -= 0.110 * (1 - Math.max(0, f) * 0.75);
     // a widow's peak: the front line dips a touch dead centre
     if (f > 0.6) v += 0.010 * _g(Math.sin(a), 0.22);
     if (spec.crest) {
@@ -4143,57 +5126,127 @@ function buildLid(centre, R, S, X) {
 // ---------------------------------------------------------------------------
 
 /**
- * A closed fist on a bar. The palm lies along the bar, four fingers curl over
- * the front and tuck under, the thumb crosses the front diagonally toward the
- * fingertips, and the knuckle row stands proud. ~520 triangles.
+ * A frame for a hand on a bar. Deliberately NOT `frameOf`: that derives its third
+ * axis with a cross product, which flips sign between the left and the right bar,
+ * so one hand came out built inside-out — the reason one palm floated above its
+ * grip and the other let the bar-end cap punch through it. `up` and `fwd` here are
+ * always world-up-ish and world-forward-ish for BOTH hands.
  */
-function buildFist(wrist, barDir, handR, glove) {
-  const F = frameOf(barDir, V(0, 1, 0));
-  const along = F.y, up = F.z, fwd = F.x;
+function fistFrame(barDir) {
+  const along = barDir.clone().normalize();
+  const up = new THREE.Vector3(0, 1, 0).addScaledVector(along, -along.y);
+  if (up.lengthSq() < 1e-8) up.set(0, 0, 1).addScaledVector(along, -along.z);
+  up.normalize();
+  const fwd = new THREE.Vector3(0, 0, 1)
+    .addScaledVector(along, -along.z).addScaledVector(up, -up.z);
+  if (fwd.lengthSq() < 1e-8) fwd.set(1, 0, 0).addScaledVector(along, -along.x).addScaledVector(up, -up.x);
+  fwd.normalize();
+  return { along, up, fwd };
+}
+
+/** The angle the wrist leaves the grip at, measured from +up toward +fwd. */
+const FIST_WRIST_DEG = -74;
+
+/**
+ * Where the WRIST BONE has to sit for a fist of this size to be closed on a grip
+ * of this radius at this point along it. This is the IK: the hand is placed from
+ * the GRIP transform and the arm is then solved to reach it, instead of the hand
+ * being hung off the end of the arm chain and hoping it lands on the bar.
+ * `riderPose` and `buildFist` both call it, so they cannot disagree.
+ */
+function fistWrist(gripPoint, barDir, handR, curlR) {
+  const F = fistFrame(barDir);
+  const r = curlR + handR * 0.40;
+  const a = FIST_WRIST_DEG * DEG;
+  return gripPoint.clone()
+    .addScaledVector(F.along, -handR * 0.62)
+    .addScaledVector(F.up, Math.cos(a) * r)
+    .addScaledVector(F.fwd, Math.sin(a) * r);
+}
+
+/**
+ * A closed fist on a bar. The back of the hand lies over the grip, four fingers
+ * curl off the knuckle row, over the front and tuck under, the thumb crosses the
+ * front diagonally toward the fingertips, and a padded knuckle stands proud of
+ * each. Every radius is measured from the GRIP axis (`curlR = grip radius + glove
+ * thickness`), so the palm can neither float off the bar nor interpenetrate it.
+ * Returns the shell and, separately, the glove's wrist cuff.
+ */
+function buildFist(wrist, barDir, handR, glove, barR, gripPoint, side) {
+  const F = fistFrame(barDir);
+  const { along, up, fwd } = F;
   const parts = [];
-  const g = glove ? 1.08 : 1.0;
-  // palm: from just inboard of the wrist to the far side of the fist
-  const a0 = wrist.clone().addScaledVector(along, -handR * 0.22);
-  const a1 = wrist.clone().addScaledVector(along, handR * 1.55);
-  parts.push(placeZ(capsule2(a0.distanceTo(a1), handR * 0.70 * g, handR * 0.64 * g, {
-    radial: 10, capSegs: 3, bodyRings: 3,
-    mid: (t) => 1 + 0.10 * Math.sin(t * Math.PI),
-    shape: (t) => [lerp(0.78, 0.70, t), lerp(0.98, 1.06, t)],
-  }), a0, a1, up));
+  const gT = glove ? handR * 0.10 : handR * 0.045;
+  const curlR = barR + gT;
+  // work in the GRIP's frame; the wrist is wherever fistWrist put it
+  const G = gripPoint ? gripPoint.clone() : fistWrist(wrist, barDir, handR, curlR);
+  const at = (sa, degA, r) => G.clone()
+    .addScaledVector(along, sa)
+    .addScaledVector(up, Math.cos(degA * DEG) * r)
+    .addScaledVector(fwd, Math.sin(degA * DEG) * r);
 
-  // the grip axis the fingers close around, a little forward and below the palm
-  const centre = wrist.clone().addScaledVector(along, handR * 0.62)
-    .addScaledVector(fwd, handR * 0.30).addScaledVector(up, -handR * 0.18);
-  const at = (s, deg, r) => centre.clone()
-    .addScaledVector(along, s)
-    .addScaledVector(up, Math.cos(deg * DEG) * r)
-    .addScaledVector(fwd, Math.sin(deg * DEG) * r);
+  // --- back of the hand: a flattened shell lying over the top-back of the grip
+  const backDeg = -34;
+  const backDir = up.clone().multiplyScalar(Math.cos(backDeg * DEG))
+    .addScaledVector(fwd, Math.sin(backDeg * DEG)).normalize();
+  const bA = at(-handR * 0.42, backDeg, curlR + handR * 0.36);
+  const bB = at(handR * 1.16, backDeg, curlR + handR * 0.30);
+  parts.push(placeZ(capsule2(bA.distanceTo(bB), handR * 0.50, handR * 0.44, {
+    radial: 12, capSegs: 3, bodyRings: 4,
+    mid: (t) => 1 + 0.12 * Math.sin(t * Math.PI),
+    // wide around the bar, thin radially: a hand, not a sausage
+    shape: (t) => [lerp(1.26, 1.16, t), lerp(0.72, 0.64, t)],
+  }), bA, bB, backDir));
 
+  // --- four fingers, index inboard, curling off the knuckle row --------------
   for (let i = 0; i < 4; i++) {
     const t = i / 3;
-    const s = lerp(-handR * 0.42, handR * 0.72, t);
-    const fr = handR * lerp(0.215, 0.170, t) * g;         // index thickest
-    const reach = lerp(1.00, 0.90, Math.abs(t - 0.35) * 1.2);
+    const sa = lerp(-handR * 0.26, handR * 1.02, t);
+    const fr = handR * lerp(0.200, 0.156, t);
+    // the middle finger reaches furthest round the bar
+    const tuck = lerp(198, 176, Math.abs(t - 0.34) * 1.3);
     parts.push(sweep([
-      at(s, 8, handR * 0.86 * reach),
-      at(s, 62, handR * 0.94 * reach),
-      at(s * 0.94, 118, handR * 0.80 * reach),
-      at(s * 0.86, 168, handR * 0.52 * reach),
-    ], { radius: fr, radial: 6, steps: 7, taper: (k) => lerp(1.0, 0.78, k) }));
-    // knuckle
-    const kn = new THREE.SphereGeometry(fr * 1.18, 7, 5);
-    const kp = at(s, 6, handR * 0.90 * reach);
+      at(sa, 14, curlR + fr * 1.12),
+      at(sa, 74, curlR + fr),
+      at(sa * 0.96, 138, curlR + fr * 0.96),
+      at(sa * 0.88, tuck, curlR + fr * 0.80),
+    ], { radius: fr, radial: 7, steps: 8, taper: (k) => lerp(1.0, 0.80, k) }));
+    // knuckle pad: on a glove this is the moulded panel, on skin it is bone
+    const kr = fr * (glove ? 1.30 : 1.14);
+    const kn = new THREE.SphereGeometry(kr, 8, 6);
+    kn.scale(1, 1, 0.82);
+    const kp = at(sa, 8, curlR + fr * 1.10);
     kn.translate(kp.x, kp.y, kp.z);
     parts.push(kn);
+    // a finger segment crease so the digits read as separate at macro distance
+    if (i < 3) {
+      const gap = new THREE.SphereGeometry(fr * 0.30, 6, 4);
+      const gp2 = at(lerp(sa, lerp(-handR * 0.26, handR * 1.02, (i + 1) / 3), 0.5), 80,
+        curlR + fr * 0.55);
+      gap.translate(gp2.x, gp2.y, gp2.z);
+      parts.push(gap);
+    }
   }
-  // thumb: base pad at the inboard back, wrapping across the front
+  // --- thumb: pad on the inboard back, wrapping across the front -------------
+  const th = handR * 0.24;
   parts.push(sweep([
-    at(-handR * 0.52, -66, handR * 0.80),
-    at(-handR * 0.20, -14, handR * 0.95),
-    at(handR * 0.28, 44, handR * 0.94),
-    at(handR * 0.66, 86, handR * 0.80),
-  ], { radius: handR * 0.255 * g, radial: 7, steps: 7, taper: (k) => lerp(1.05, 0.72, k) }));
-  return merge(parts);
+    at(-handR * 0.62, -78, curlR + handR * 0.32),
+    at(-handR * 0.34, -22, curlR + handR * 0.34),
+    at(handR * 0.06, 34, curlR + th * 1.05),
+    at(handR * 0.44, 74, curlR + th * 0.85),
+  ], { radius: th, radial: 8, steps: 8, taper: (k) => lerp(1.10, 0.74, k) }));
+
+  // --- wrist cuff: a real closure band, not a bare tube end ------------------
+  const cuffDir = G.clone().sub(wrist);
+  if (cuffDir.lengthSq() < 1e-9) cuffDir.copy(along);
+  cuffDir.normalize();
+  const cuff = placeZ(capsule2(handR * 0.66, handR * 0.60, handR * 0.66, {
+    radial: 12, capSegs: 2, capA: 0.35, capB: 0.35, shape: () => [1.12, 0.88],
+  }), wrist.clone().addScaledVector(cuffDir, -handR * 0.40),
+  wrist.clone().addScaledVector(cuffDir, handR * 0.26), up);
+  void side;
+
+  return { shell: merge(parts), cuff };
 }
 
 /**
@@ -4248,6 +5301,22 @@ function buildShoe(ankle, toe, hs, X, side) {
     radial: 8, capSegs: 2, shape: () => [1.10, 0.34],
   }), heel.clone().addScaledVector(up, -0.012 * hs).addScaledVector(fwd, -0.006 * hs),
   heel.clone().addScaledVector(up, -0.012 * hs).addScaledVector(fwd, 0.046 * hs), down));
+  // Midsole band: a real proud ring around the whole shoe between the outsole and
+  // the upper. It is what gives a skate shoe its horizontal read — without it the
+  // shoe is one continuous blob with a dark bottom.
+  const mA = heel.clone().addScaledVector(up, 0.012 * hs).addScaledVector(fwd, -0.002 * hs);
+  const mB = tip.clone().addScaledVector(up, 0.014 * hs).addScaledVector(fwd, -0.002 * hs);
+  sole.push(placeZ(capsule2(mA.distanceTo(mB), 0.046 * hs * bulk, 0.038 * hs * bulk, {
+    radial: 12, capSegs: 2, bodyRings: 4, capA: 0.5, capB: 0.5,
+    mid: (t) => 1 + 0.05 * Math.sin(t * Math.PI),
+    shape: (t) => [lerp(1.10, 1.00, t), lerp(0.30, 0.28, t)],
+  }), mA, mB, down));
+  // toe bumper: the vulcanised cap that takes the pedal
+  const tA = tip.clone().addScaledVector(fwd, -0.030 * hs).addScaledVector(up, 0.004 * hs);
+  const tB = tip.clone().addScaledVector(fwd, 0.004 * hs).addScaledVector(up, 0.006 * hs);
+  sole.push(placeZ(capsule2(tA.distanceTo(tB), 0.042 * hs * bulk, 0.034 * hs * bulk, {
+    radial: 12, capSegs: 3, capA: 0.4, capB: 0.8, shape: () => [1.02, 0.66],
+  }), tA, tB, down));
 
   // --- laces -----------------------------------------------------------------
   for (let i = 0; i < 4; i++) {
@@ -4290,17 +5359,34 @@ function buildRiderBody(pose, boneIndex, X, A) {
   const topLoose = X.top.loose, botLoose = X.bottom.loose;
 
   // ------------------------------------------------------------------ torso
-  const torsoA = pose.hips.clone().addScaledVector(pose.lean, -0.105 * hs);
+  const torsoA = pose.hips.clone().addScaledVector(pose.lean, -0.072 * hs);
   const torsoB = pose.neck.clone();
   const torsoLen = torsoA.distanceTo(torsoB);
   const wLo = M.hipWidth * 1.16, wHi = M.shoulderWidth * 1.30;
   const dLo = M.waistDepth * 0.86, dHi = M.chestDepth * 0.90;
+  // The hem is a REAL edge loop, not a painted line: the garment steps out by its
+  // own thickness above the hip, and the turned-and-stitched edge thickens again
+  // right at the hem station, so the top has a visible bottom edge in silhouette.
+  const hemT = X.top.style === 'jersey' ? 0.135 : X.top.style === 'hoodie' ? 0.115 : 0.175;
+  const clothStep = (0.008 + topLoose * 0.010) * hs;
   const torso = limb(torsoA, torsoB, 0.150 * hs, 0.086 * hs, {
-    radial: 18, capSegs: 4, bodyRings: 11,
+    radial: 20, capSegs: 4, bodyRings: 16,
+    // The seat is a FLATTENED cap. At capA = 1 the torso's bottom pole hung a
+    // full hip-radius (150 mm) below and behind the hips, so the tee ended in a
+    // giant blunt dome instead of a hem — the biggest single silhouette error on
+    // the character. capB likewise stops the shoulder yoke ballooning over the neck.
+    capA: 0.30, capB: 0.55,
     // hem flare → waist → ribcage → the shoulder yoke
-    mid: (t) => (t < 0.15 ? lerp(1.10 + topLoose * 0.10, 0.92, smoothstep(t / 0.15))
-      : t < 0.62 ? lerp(0.92, 1.26, smoothstep((t - 0.15) / 0.47))
-        : lerp(1.26, 1.02, smoothstep((t - 0.62) / 0.38))) * (1 + topLoose * 0.10),
+    mid: (t) => {
+      const base = (t < 0.15 ? lerp(1.04 + topLoose * 0.06, 0.92, smoothstep(t / 0.15))
+        : t < 0.62 ? lerp(0.92, 1.16, smoothstep((t - 0.15) / 0.47))
+          : lerp(1.16, 0.99, smoothstep((t - 0.62) / 0.38))) * (1 + topLoose * 0.06);
+      if (X.top.style === 'tank') return base;
+      const r = 0.150 * hs;                        // reference radius for the step
+      const cov = smoothstep(clamp((t - (hemT - 0.012)) / 0.024, 0, 1));
+      const edge = Math.exp(-(((t - hemT - 0.008) / 0.014) ** 2));
+      return base * (1 + (clothStep * cov + clothStep * 0.65 * edge) / r);
+    },
     shape: (t) => [
       lerp(dLo, dHi, smoothstep(clamp(t * 1.4, 0, 1))),
       lerp(wLo, wHi, smoothstep(clamp((t - 0.10) / 0.75, 0, 1))),
@@ -4317,9 +5403,11 @@ function buildRiderBody(pose, boneIndex, X, A) {
   if (X.top.style !== 'tank') {
     const nDir = pose.head.clone().sub(pose.neck).normalize();
     const cR = 0.058 * hs * lerp(0.94, 1.10, M.build) * (X.top.style === 'hoodie' ? 1.18 : 1.0);
-    const collar = placeZ(capsule2(0.030 * hs, cR * 1.24, cR * 1.16, {
-      radial: 14, capSegs: 2, capA: 0.4, capB: 0.4, shape: () => [1.06, 1.0],
-    }), torsoB.clone().addScaledVector(nDir, -0.012 * hs), torsoB.clone().addScaledVector(nDir, 0.018 * hs),
+    // A tee collar is a rib band, not a cowl: 1.10x the neck and 22 mm tall, or
+    // it stands off the throat and reads as a roll-neck under the chin.
+    const collar = placeZ(capsule2(0.022 * hs, cR * 1.10, cR * 1.06, {
+      radial: 16, capSegs: 2, capA: 0.30, capB: 0.30, shape: () => [1.04, 1.0],
+    }), torsoB.clone().addScaledVector(nDir, -0.010 * hs), torsoB.clone().addScaledVector(nDir, 0.012 * hs),
     LEFT);
     // sample only the collar band at the very top of the garment region
     const cu = collar.attributes.uv;
@@ -4350,7 +5438,11 @@ function buildRiderBody(pose, boneIndex, X, A) {
     push(buildEar(headC, headR, S, s), 'SKIN', (g) => skinPart(g, boneIndex, 'head', null), 0.62, 0.86);
   }
 
-  const lidCover = X.lid.style === 'beanie' ? 0.72 : X.lid.style === 'helmet' ? 0.88 : 0.0;
+  // Under a helmet the hair used to be culled to v > 0.88 — nothing showed, so
+  // the lid met bare scalp on a hard geometric seam. The new shell edge sits at
+  // v ≈ 0.66 at the front, so hair from 0.62 up peeks out under it and breaks
+  // that seam, the way it does on every rider in the reference.
+  const lidCover = X.lid.style === 'beanie' ? 0.66 : X.lid.style === 'helmet' ? 0.56 : 0.0;
   push(buildHair(headC, headR, S, X, lidCover), 'HAIR', (g) => skinPart(g, boneIndex, 'head', null));
   push(buildBeardShell(headC, headR, S, X), 'HAIR', (g) => skinPart(g, boneIndex, 'head', null), 0, 0.5);
   push(buildLid(headC, headR, S, X), 'LID', (g) => skinPart(g, boneIndex, 'head', null));
@@ -4372,165 +5464,195 @@ function buildRiderBody(pose, boneIndex, X, A) {
   }
 
   // ------------------------------------------------------------------- arms
+  // ONE lofted tube per arm: shoulder root (buried in the torso) → shoulder →
+  // elbow → wrist. No internal caps, so no joint rims and no dark voids, and the
+  // sleeve is a radius STEP on the same surface rather than a second closed tube
+  // sitting on top of the first.
   const sleeveT = X.top.sleeveLen;
-  const upperFrac = 0.535;
+  const tank = X.top.style === 'tank';
   for (const [side, s] of [['R', 1], ['L', -1]]) {
     const sh = pose['shoulder' + side], el = pose['elbow' + side], wr = pose['wrist' + side];
-    const skinU = (g) => skinPart(g, boneIndex, 'shoulder' + side, 'elbow' + side, sh, el, 0.45, 1.0, 0.62);
-    const skinF = (g) => skinPart(g, boneIndex, 'elbow' + side, 'wrist' + side, el, wr, 0.55, 1.0, 0.9);
-    const rShoulder = 0.052 * hs * girth, rElbow = 0.040 * hs * girth;
-    const rFore = 0.039 * hs * M.forearmGirth, rWrist = 0.029 * hs * M.forearmGirth;
-    const puff = 1 + 0.07 + topLoose * 0.15;
-    // Muscle, not pipe: a deltoid swell at the top of the upper arm, a biceps
-    // belly at 45 %, a brachioradialis swell just past the elbow, then a real
-    // taper into a flattened wrist.
-    const armMid = (t) => bulge(t, 0.08, 0.22, 0.20 * girth) * bulge(t, 0.46, 0.26, 0.11 * girth);
-    const armShape = (t) => [1 + 0.05 * _g(t - 0.10, 0.22), lerp(1.07, 0.99, t)];
-    const foreMid = (t) => bulge(t, 0.17, 0.24, 0.17 * M.forearmGirth);
-    const foreShape = (t) => [lerp(1.03, 0.80, smoothstep(t)), lerp(0.99, 1.14, smoothstep(t))];
+    const rShoulder = 0.055 * hs * girth, rElbow = 0.0395 * hs * girth;
+    const rFore = 0.040 * hs * M.forearmGirth, rWrist = 0.029 * hs * M.forearmGirth;
 
-    // deltoid cap — fills the armpit and gives the silhouette a shoulder
-    const delt = new THREE.SphereGeometry(1, 12, 9);
-    delt.scale(0.062 * hs * girth * M.shoulderWidth, 0.058 * hs * girth, 0.060 * hs * girth);
-    delt.translate(sh.x + s * 0.006 * hs, sh.y + 0.012 * hs, sh.z);
-    // Keep the sphere well inside its region: a small part sitting near a region
-    // boundary samples a coarse mip and drags the neighbouring band's colour on
-    // to the shoulder as a pale blotch.
-    const du = delt.attributes.uv;
-    for (let i = 0; i < du.count; i++) {
-      du.setXY(i, 0.28 + du.getX(i) * 0.44, 0.34 + du.getY(i) * 0.32);
-    }
-    push(delt, X.top.style === 'tank' ? 'SKIN' : (sleeveT > 0.02 ? 'SLEEVE' : 'TOP'),
-      (g) => skinPart(g, boneIndex, 'chest', 'shoulder' + side, pose.chest, sh, 0.1, 0.9, 0.75));
+    const dSE = el.clone().sub(sh).normalize(), dEW = wr.clone().sub(el).normalize();
+    // Overlap the torso by well over one local radius so the two shells can never
+    // separate into a visible junction, whatever the animator does to the arm.
+    const rootExt = rShoulder * 1.45;
+    const tipExt = rWrist * 0.55;
+    const armRoot = sh.clone().addScaledVector(dSE, -rootExt);
+    const armTip = wr.clone().addScaledVector(dEW, tipExt);
+    const lSE = sh.distanceTo(el), lEW = el.distanceTo(wr);
+    const Ltot = rootExt + lSE + lEW + tipExt;
+    const tSh = rootExt / Ltot, tEl = (rootExt + lSE) / Ltot, tWr = (Ltot - tipExt) / Ltot;
+    // arm fraction f: 0 at the shoulder, 1 at the wrist (what garments measure in)
+    const fOf = (t) => clamp((t - tSh) / Math.max(tWr - tSh, 1e-4), -0.4, 1.4);
+    const eF = (tEl - tSh) / Math.max(tWr - tSh, 1e-4);          // elbow in arm space
 
-    // upper arm: sleeve then skin, split wherever the sleeve ends
-    const tUp = clamp(sleeveT / upperFrac, 0, 1);
-    const shOut = sh.clone().addScaledVector(el.clone().sub(sh).normalize(), -0.030 * hs);
-    if (tUp > 0.02) {
-      const end = sh.clone().lerp(el, tUp);
-      const sleeve = limb(shOut, end, rShoulder * puff, lerp(rShoulder, rElbow, tUp) * puff, {
-        radial: 12, capSegs: 4, bodyRings: 6, capB: 0.30,
-        shape: (t) => [1, lerp(1.06, 1.0, t)],
-        // a sleeve hangs off the deltoid: tight at the shoulder, loose and
-        // slightly flared where it ends
-        mid: (t) => 1 + topLoose * (0.05 + 0.10 * smoothstep(t)) * Math.sin(t * 2.2),
-      });
-      push(sleeve, X.top.style === 'tank' ? 'TOP' : 'SLEEVE', skinU);
-      if (tUp < 0.98 && sleeveT > 0.02 && X.top.trimCuff) {
-        const cuff = limb(sh.clone().lerp(el, Math.max(0, tUp - 0.06)), end.clone(),
-          lerp(rShoulder, rElbow, tUp) * (puff + 0.02), lerp(rShoulder, rElbow, tUp) * (puff + 0.04),
-          { radial: 12, capSegs: 2 });
-        push(cuff, 'TRIM', skinU);
+    // Muscle, not pipe: deltoid cap, biceps belly, a narrow elbow, the
+    // brachioradialis swell just past it, then a real taper into a flat wrist.
+    const flesh = (f) => {
+      if (f < eF) {
+        const k = clamp(f / eF, -1, 1);
+        return lerp(rShoulder, rElbow, smoothstep(clamp(k, 0, 1)))
+          * bulge(k, 0.04, 0.30, 0.20 * girth)
+          * bulge(k, 0.50, 0.30, 0.10 * girth);
+      }
+      // just past the elbow the forearm picks up its OWN girth scale
+      const k = clamp((f - eF) / (1 - eF), 0, 1.4);
+      const belly = lerp(rFore, rWrist, smoothstep(clamp(k, 0, 1)));
+      return lerp(rElbow, belly, smoothstep(clamp(k / 0.22, 0, 1)))
+        * bulge(k, 0.20, 0.30, 0.16 * M.forearmGirth);
+    };
+    // The garment: a 7–13 mm shell, thickening toward its hem where cloth drapes.
+    const clothT = (0.0062 + topLoose * 0.0072) * hs;
+    const armRadius = (t) => {
+      const f = fOf(t);
+      let r = flesh(f);
+      if (tank || sleeveT <= 0.02) return r;
+      // 1 → covered, 0 → bare, with the transition one hem-width wide
+      const cov = 1 - smoothstep(clamp((f - (sleeveT - 0.014)) / 0.026, 0, 1));
+      r += clothT * cov * lerp(0.72, 1.10, smoothstep(clamp(f / Math.max(sleeveT, 1e-3), 0, 1)));
+      // the hem itself is turned and stitched: a visible thickened edge loop
+      r += clothT * 0.55 * cov * Math.exp(-(((f - sleeveT + 0.012) / 0.013) ** 2));
+      return r;
+    };
+    const armShape = (t) => {
+      const f = fOf(t);
+      const el2 = _g(f - eF, 0.10);                       // elbow flattens
+      return [1 + 0.06 * _g(f - 0.06, 0.24) - 0.10 * el2, lerp(1.08, 0.94, clamp(f, 0, 1)) + 0.10 * el2];
+    };
+
+    // sections: sleeve → cuff trim → skin, in curve-parameter space
+    const tOfF = (f) => tSh + f * (tWr - tSh);
+    const sleeveKey = tank ? 'TOP' : 'SLEEVE';
+    const cuffW = X.top.trimCuff ? 0.055 : 0.0;
+    const secs = [];
+    if (sleeveT > 0.02) {
+      secs.push({ key: sleeveKey, t0: 0, t1: tOfF(Math.max(0, sleeveT - cuffW)), v0: 0.06, v1: 0.98 });
+      if (cuffW > 0) {
+        secs.push({ key: 'TRIM', t0: tOfF(sleeveT - cuffW), t1: tOfF(sleeveT) });
       }
     }
-    if (tUp < 0.98) {
-      const t0 = Math.max(tUp - 0.10, 0);
-      const a0 = sh.clone().lerp(el, t0);
-      push(limb(a0, el, lerp(rShoulder, rElbow, t0), rElbow, {
-        radial: 10, capSegs: 3, bodyRings: 6,
-        mid: (t) => armMid(lerp(t0, 1, t)), shape: (t) => armShape(lerp(t0, 1, t)),
-      }), 'SKIN', skinU);
+    if (sleeveT < 0.98) {
+      // SKIN is painted with the shaded "into the sleeve" end at high v, so the
+      // band is walked backwards: v = 0.96 at the cuff, 0.06 at the wrist.
+      secs.push({ key: 'SKIN', t0: sleeveT > 0.02 ? tOfF(sleeveT) : 0, t1: 1,
+        v0: 0.96, v1: 0.06 });
     }
-    // forearm
-    const tFore = clamp((sleeveT - upperFrac) / (1 - upperFrac), 0, 1);
-    if (tFore > 0.02) {
-      const end = el.clone().lerp(wr, tFore);
-      push(limb(el, end, rFore * puff, lerp(rFore, rWrist, tFore) * puff,
-        { radial: 12, capSegs: 3, bodyRings: 5, capB: 0.30 }), 'SLEEVE', skinF);
-      push(limb(el.clone().lerp(wr, Math.max(0, tFore - 0.08)), end,
-        lerp(rFore, rWrist, tFore) * (puff + 0.03), lerp(rFore, rWrist, tFore) * (puff + 0.05),
-        { radial: 10, capSegs: 2 }), X.top.trimCuff ? 'TRIM' : 'SLEEVE', skinF);
-    }
-    if (tFore < 0.98) {
-      const t0 = Math.max(0, tFore - 0.10);
-      const a0 = el.clone().lerp(wr, t0);
-      push(limb(a0, wr, lerp(rFore, rWrist, t0), rWrist, {
-        radial: 10, capSegs: 3, bodyRings: 6,
-        mid: (t) => foreMid(lerp(t0, 1, t)), shape: (t) => foreShape(lerp(t0, 1, t)),
-      }), 'SKIN', skinF);
-    }
+    if (!secs.length) secs.push({ key: sleeveKey, t0: 0, t1: 1 });
+
+    const arm = limbTube(A, [armRoot, sh, el, armTip], {
+      radial: 16, stepsPer: 12, zDir: LEFT,
+      radius: armRadius, shape: armShape, sections: secs,
+      capStart: 0.55, capEnd: 0.30, capSegs: 4,
+    });
+    parts.push(skinAlong(normalise(arm), boneIndex,
+      ['chest', 'shoulder' + side, 'elbow' + side, 'wrist' + side],
+      [armRoot, sh, el, armTip]));
+
     // elbow pad
     if (X.pad.elbow) {
-      const dir = el.clone().sub(sh).normalize().add(wr.clone().sub(el).normalize()).normalize();
+      const dir = dSE.clone().add(dEW).normalize();
       const out = V(0, 0, 1).cross(dir).cross(dir).negate().normalize();
       const pA = el.clone().addScaledVector(out, 0.032 * hs).addScaledVector(dir, -0.055 * hs);
       const pB = el.clone().addScaledVector(out, 0.030 * hs).addScaledVector(dir, 0.070 * hs);
       push(limb(pA, pB, 0.050 * hs * girth, 0.044 * hs * girth,
-        { radial: 10, capSegs: 3, shape: () => [1.0, 0.62] }), 'PAD', skinF);
+        { radial: 10, capSegs: 3, shape: () => [1.0, 0.62] }), 'PAD',
+      (g) => skinPart(g, boneIndex, 'elbow' + side, 'wrist' + side, el, wr, 0.55, 1.0, 0.9));
     }
 
-    // hand: a real fist closed on the grip, gloved or bare
-    const gripDir = V(s, 0.02, -0.08).normalize();
+    // hand: a real fist closed on the grip, gloved or bare — placed by IK off the
+    // GRIP transform, not off the arm chain (see buildFist).
     const handKey = X.glove.on ? 'GLOVE' : 'SKIN';
-    const handR = 0.041 * hs * lerp(0.92, 1.10, M.build);
-    push(buildFist(wr, gripDir, handR, X.glove.on), handKey,
-      (g) => skinPart(g, boneIndex, 'wrist' + side, null));
+    const handR = pose.handR ?? (0.041 * hs * lerp(0.92, 1.10, M.build));
+    const gripAxis = (s > 0 ? pose.gripAxisR : pose.gripAxisL) || V(s, 0.02, -0.08).normalize();
+    const gripPoint = (s > 0 ? pose.gripPointR : pose.gripPointL) || wr;
+    const hand = buildFist(wr, gripAxis, handR, X.glove.on, pose.gripRadius ?? 0.0176,
+      gripPoint, s);
+    push(hand.shell, handKey, (g) => skinPart(g, boneIndex, 'wrist' + side, null));
     if (X.glove.on) {
-      // gauntlet cuff over the wrist
-      push(limb(wr.clone().addScaledVector(gripDir, -0.062 * hs),
-        wr.clone().addScaledVector(gripDir, -0.012 * hs), handR * 0.86, handR * 0.98,
-        { radial: 10, capSegs: 2, zDir: V(0, -1, 0) }),
-      'GLOVE', (g) => skinPart(g, boneIndex, 'wrist' + side, null));
+      push(hand.cuff, 'GLOVE', (g) => skinPart(g, boneIndex, 'wrist' + side, null), 0.0, 0.30);
     }
   }
 
   // ------------------------------------------------------------------- legs
+  // Same treatment as the arms: hip root (buried in the pelvis) → hip → knee →
+  // ankle as ONE tube, with the trouser as a radius step and the cuff as a
+  // thickened edge loop that stacks over the shoe.
   const legT = X.bottom.length;
-  const thighFrac = 0.505;
   for (const [side, s] of [['R', 1], ['L', -1]]) {
     const hp = pose['hip' + side], kn = pose['knee' + side];
     const an = pose['ankle' + side], toe = pose['toe' + side];
-    const skinT = (g) => skinPart(g, boneIndex, 'hip' + side, 'knee' + side, hp, kn, 0.62, 1.0, 0.85);
     const skinS = (g) => skinPart(g, boneIndex, 'knee' + side, 'ankle' + side, kn, an, 0.68, 1.02, 0.8);
-    const rHip = 0.085 * hs * girth, rKnee = 0.058 * hs * girth;
-    const rCalf = 0.062 * hs * M.calfGirth, rAnkle = 0.042 * hs * M.calfGirth;
-    const puff = 1 + 0.05 + botLoose * 0.16;
+    const rHip = 0.086 * hs * girth, rKnee = 0.0575 * hs * girth;
+    const rCalf = 0.063 * hs * M.calfGirth, rAnkle = 0.042 * hs * M.calfGirth;
+
+    const dHK = kn.clone().sub(hp).normalize(), dKA = an.clone().sub(kn).normalize();
+    const rootExt = rHip * 0.85;
+    const tipExt = rAnkle * 0.60;
+    const legRoot = hp.clone().addScaledVector(dHK, -rootExt);
+    const legTip = an.clone().addScaledVector(dKA, tipExt);
+    const lHK = hp.distanceTo(kn), lKA = kn.distanceTo(an);
+    const Ltot = rootExt + lHK + lKA + tipExt;
+    const tHp = rootExt / Ltot, tKn = (rootExt + lHK) / Ltot, tAn = (Ltot - tipExt) / Ltot;
+    const fOf = (t) => clamp((t - tHp) / Math.max(tAn - tHp, 1e-4), -0.4, 1.4);
+    const kF = (tKn - tHp) / Math.max(tAn - tHp, 1e-4);
+
     // quad mass high on the thigh, a flattened knee, a gastrocnemius belly a
     // third of the way down the shin, then a narrow ankle
-    const thighMid = (t) => bulge(t, 0.20, 0.30, 0.11 * girth) * (1 - 0.05 * smoothstep(t));
-    const thighShape = (t) => [lerp(1.05, 0.93, t), lerp(1.00, 0.90, t)];
-    const calfMid = (t) => bulge(t, 0.26, 0.24, 0.20 * M.calfGirth);
-    const calfShape = (t) => [lerp(0.98, 0.88, t), lerp(1.00, 0.92, t)];
-    // trousers hang: the cloth ignores the calf and breaks over the shoe
-    const clothMid = (t) => (1 + botLoose * 0.05) * bulge(t, 0.18, 0.30, 0.06)
-      * bulge(t, 0.95, 0.10, botLoose * 0.10);
-
-    const tUp = clamp(legT / thighFrac, 0, 1);
-    push(limb(hp.clone().add(V(0, 0.03 * hs, 0)), tUp >= 1 ? kn : hp.clone().lerp(kn, tUp),
-      rHip * puff, lerp(rHip, rKnee, tUp) * puff,
-      { radial: 12, capSegs: 3, bodyRings: 6, mid: clothMid, shape: thighShape }),
-    'BOTTOM', skinT);
-    if (tUp < 0.99) {
-      // shorts hem, then bare leg
-      const end = hp.clone().lerp(kn, tUp);
-      push(limb(hp.clone().lerp(kn, Math.max(0, tUp - 0.05)), end,
-        lerp(rHip, rKnee, tUp) * (puff + 0.03), lerp(rHip, rKnee, tUp) * (puff + 0.06),
-        { radial: 12, capSegs: 2 }), 'BOTTOM', skinT);
-      const t0 = Math.max(0, tUp - 0.08);
-      push(limb(hp.clone().lerp(kn, t0), kn, lerp(rHip, rKnee, t0), rKnee, {
-        radial: 10, capSegs: 3, bodyRings: 5,
-        mid: (t) => thighMid(lerp(t0, 1, t)), shape: (t) => thighShape(lerp(t0, 1, t)),
-      }), 'SKIN', skinT);
-    }
-    const tLo = clamp((legT - thighFrac) / (1 - thighFrac), 0, 1);
-    if (tLo > 0.02) {
-      const end = kn.clone().lerp(an, tLo);
-      push(limb(kn, end, rCalf * puff, lerp(rCalf, rAnkle, tLo) * puff * (X.bottom.cuffed ? 0.92 : 1),
-        { radial: 12, capSegs: 3, bodyRings: 6, mid: clothMid }), 'BOTTOM', skinS);
-      if (X.bottom.cuffed || tLo < 0.98) {
-        push(limb(kn.clone().lerp(an, Math.max(0, tLo - 0.06)), end,
-          lerp(rCalf, rAnkle, tLo) * (puff + 0.02), lerp(rCalf, rAnkle, tLo) * (puff - 0.04),
-          { radial: 10, capSegs: 2 }), 'BOTTOM', skinS);
+    const flesh = (f) => {
+      if (f < kF) {
+        const k = clamp(f / kF, -1, 1);
+        return lerp(rHip, rKnee, smoothstep(clamp(k, 0, 1)))
+          * bulge(k, 0.18, 0.34, 0.12 * girth);
       }
+      // the gastrocnemius belly carries the calf's own girth scale
+      const k = clamp((f - kF) / (1 - kF), 0, 1.4);
+      const belly = lerp(rCalf, rAnkle, smoothstep(clamp(k, 0, 1)));
+      return lerp(rKnee, belly, smoothstep(clamp(k / 0.20, 0, 1)))
+        * bulge(k, 0.24, 0.26, 0.18 * M.calfGirth);
+    };
+    // Trousers hang: the cloth ignores the calf, breaks over the shoe and gets a
+    // real turned cuff. 9–20 mm of shell depending on how loose the cut is.
+    const clothT = (0.0075 + botLoose * 0.0130) * hs;
+    const legRadius = (t) => {
+      const f = fOf(t);
+      let r = flesh(f);
+      if (legT <= 0.02) return r;
+      const cov = 1 - smoothstep(clamp((f - (legT - 0.012)) / 0.022, 0, 1));
+      // denim does not follow the leg: it hangs off the quad and off the calf,
+      // and it stacks where it lands on the shoe
+      const drape = lerp(0.80, 1.15, smoothstep(clamp(f / Math.max(legT, 1e-3), 0, 1)))
+        * bulge(f, 0.20, 0.26, 0.10) * bulge(f, kF, 0.07, -0.14);
+      r += clothT * cov * drape;
+      r += clothT * (X.bottom.cuffed ? 0.35 : 0.60) * cov
+        * Math.exp(-(((f - legT + 0.010) / 0.012) ** 2));
+      if (X.bottom.cuffed) r -= clothT * 0.45 * cov * smoothstep(clamp((f - legT + 0.06) / 0.05, 0, 1));
+      return r;
+    };
+    const legShape = (t) => {
+      const f = fOf(t);
+      const kn2 = _g(f - kF, 0.09);
+      return [lerp(1.06, 0.94, clamp(f, 0, 1)) + 0.08 * kn2, lerp(1.00, 0.92, clamp(f, 0, 1)) - 0.08 * kn2];
+    };
+
+    const tOfF = (f) => tHp + f * (tAn - tHp);
+    const secs = [];
+    if (legT > 0.02) secs.push({ key: 'BOTTOM', t0: 0, t1: tOfF(legT), v0: 0.03, v1: 0.99 });
+    if (legT < 0.98) {
+      secs.push({ key: 'SKIN', t0: legT > 0.02 ? tOfF(legT) : 0, t1: 1, v0: 0.96, v1: 0.06 });
     }
-    if (tLo < 0.98) {
-      const t0 = Math.max(0, tLo - 0.08);
-      const a0 = kn.clone().lerp(an, t0);
-      push(limb(a0, an, lerp(rCalf, rAnkle, t0), rAnkle, {
-        radial: 10, capSegs: 3, bodyRings: 6,
-        mid: (t) => calfMid(lerp(t0, 1, t)), shape: (t) => calfShape(lerp(t0, 1, t)),
-      }), 'SKIN', skinS);
-    }
+    if (!secs.length) secs.push({ key: 'BOTTOM', t0: 0, t1: 1 });
+
+    const leg = limbTube(A, [legRoot, hp, kn, legTip], {
+      radial: 16, stepsPer: 12, zDir: LEFT,
+      radius: legRadius, shape: legShape, sections: secs,
+      capStart: 0.45, capEnd: 0.35, capSegs: 4,
+    });
+    parts.push(skinAlong(normalise(leg), boneIndex,
+      ['hips', 'hip' + side, 'knee' + side, 'ankle' + side], [legRoot, hp, kn, legTip]));
+
     // knee pad and shin guard
     if (X.pad.knee) {
       const dir = kn.clone().sub(hp).normalize().add(an.clone().sub(kn).normalize()).normalize();
@@ -4574,22 +5696,36 @@ function surfPoint(centre, th, ph, r, s) {
 
 const _qa = new THREE.Vector3(), _qb = new THREE.Vector3(), _qn = new THREE.Vector3();
 
-/** Hand-built quad surface with winding forced to face `ref`. */
+/**
+ * Hand-built quad surface with winding forced to face `ref`.
+ *
+ * The winding fix swaps corners b and d — and their UVs HAVE TO travel with
+ * them. They did not, so every quad whose winding needed flipping got its
+ * texture transposed about the diagonal. On the helmet shell that is every
+ * single quad: it is why the decal type came out mirrored, why it landed on the
+ * wrong faces, and why a stray block of the atlas showed up as a "grey patch"
+ * on the left of the shell.
+ */
 function quadSoup() {
   const pos = [], uv = [];
   return {
     pos, uv,
     add(a, b, c, d, uvs, ref) {
+      const [u0, v0, u1, v1] = uvs;
+      let ub = [u1, v0], ud = [u0, v1];
+      const ua = [u0, v0], uc = [u1, v1];
       if (ref) {
         _qa.copy(b).sub(a); _qb.copy(c).sub(a);
         _qn.copy(_qa).cross(_qb);
-        if (_qn.dot(ref) < 0) { const t = b; b = d; d = t; }
+        if (_qn.dot(ref) < 0) {
+          const t = b; b = d; d = t;
+          const tu = ub; ub = ud; ud = tu;
+        }
       }
       pos.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
       pos.push(a.x, a.y, a.z, c.x, c.y, c.z, d.x, d.y, d.z);
-      const [u0, v0, u1, v1] = uvs;
-      uv.push(u0, v0, u1, v0, u1, v1);
-      uv.push(u0, v0, u1, v1, u0, v1);
+      uv.push(ua[0], ua[1], ub[0], ub[1], uc[0], uc[1]);
+      uv.push(ua[0], ua[1], uc[0], uc[1], ud[0], ud[1]);
     },
     geometry() {
       const g = new THREE.BufferGeometry();
@@ -4601,11 +5737,24 @@ function quadSoup() {
   };
 }
 
+/**
+ * A BMX park lid, not a salad bowl. Measured against the skull `headSurface`
+ * builds: outer half-width 1.085 x 0.90 = 0.977 R0 against a head half-width of
+ * ~0.83 R0, i.e. 1.18x head width — inside the real 1.10–1.20 range and less
+ * than half the 2.1x we shipped. `phiMax` is solved so the lower edge sits just
+ * ABOVE the brow at the front (head height v ≈ 0.66), just above the ear at the
+ * sides (v ≈ 0.63) and down over the occiput at the back (v ≈ 0.44) — the old
+ * edge came down to eye level at the front and buried the face.
+ */
 function buildHelmet(headC, R0, AM) {
-  const R = R0 * 1.20, T = R0 * 0.140;
+  const R = R0 * 1.085, T = R0 * 0.075;
   const NU = 48, NV = 14;
-  const S = [0.88, 1.10, 1.06];
-  const phiMax = (th) => 1.78 - 0.22 * Math.cos(th);
+  const S = [0.915, 1.13, 1.06];
+  // Solved, not guessed: y = cos(ph) * S[1] * R against the skull's own
+  // y = (2v - 1) * 1.128 * R0 puts the lower edge at head height v = 0.645 at the
+  // front (15 mm of forehead below it, above the brow at 0.578), v = 0.605 at the
+  // sides (just clear of the ear top at 0.615) and v = 0.44 over the occiput.
+  const phiMax = (th) => 1.4425 - 0.210 * Math.cos(th) + 0.0675 * Math.cos(2 * th);
   const slots = [[0, 3.4, 0.10, 0.40], [20, 3.2, 0.26, 0.62], [42, 3.0, 0.30, 0.66],
     [66, 2.8, 0.36, 0.60], [150, 3.4, 0.24, 0.52], [180, 3.6, 0.18, 0.42]];
   const angDiff = (a, b) => {
@@ -4664,70 +5813,73 @@ function buildHelmet(headC, R0, AM) {
     AM.uv(walls.geometry(), 'VENT'),
   ];
 
-  // peak / visor
-  const peak = quadSoup();
-  const NP = 18, NL = 3, span = 50 * DEG, len = R0 * 0.70;
-  for (let i = 0; i < NP; i++) {
-    for (let j = 0; j < NL; j++) {
-      const th0 = lerp(-span, span, i / NP), th1 = lerp(-span, span, (i + 1) / NP);
-      const s0 = j / NL, s1 = (j + 1) / NL;
-      const pk = (th, s, up) => {
-        const base = surfPoint(headC, th, phiMax(th) * 0.70, R, S);
-        const out = V(Math.sin(th) * 0.45, -0.10, Math.cos(th)).normalize();
-        return base.addScaledVector(out, len * s)
-          .add(V(0, -0.030 * s * s + (up ? 0.005 : -0.003), 0));
-      };
-      const pu0 = 0.42 + (i / NP) * 0.06, pu1 = 0.42 + ((i + 1) / NP) * 0.06;
-      peak.add(pk(th0, s0, true), pk(th1, s0, true), pk(th1, s1, true), pk(th0, s1, true),
-        [pu0, 0.2, pu1, 0.8], V(0, 1, 0));
-      peak.add(pk(th0, s1, false), pk(th1, s1, false), pk(th1, s0, false), pk(th0, s0, false),
-        [pu0, 0.2, pu1, 0.8], V(0, -1, 0));
-    }
-  }
-  parts.push(AM.uv(peak.geometry(), 'SHELL'));
+  // Peak / visor: a closed slab with a ROUNDED leading edge, swept as one smooth
+  // surface. The old peak was a fan of 18 flat two-sided quads with a per-facet
+  // vertical offset, which is what read as a fluted, radially-ribbed picnic
+  // plate from below. 45 mm projection at R0 = 98 mm.
+  const peakLen = R0 * 0.46, peakSpan = 54 * DEG, peakThick = R0 * 0.052;
+  const peakSurf = (u, t) => {
+    const s = (u - 0.5) * 2;                               // -1 … 1 across the peak
+    const th = s * peakSpan;
+    const base = surfPoint(headC, th, phiMax(th) * 0.985, R * 0.995, S);
+    const out = V(Math.sin(th) * 0.50, -0.14, Math.cos(th)).normalize();
+    // shorter at the corners, curling down along its length, with the leading
+    // edge rolled so the last 15 % of the reach turns under
+    const roll = smoothstep(clamp((t - 0.85) / 0.15, 0, 1));
+    const reach = peakLen * (t - 0.10 * roll) * (1 - 0.26 * s * s);
+    return base.addScaledVector(out, reach)
+      .add(V(0, -peakLen * (0.30 * t * t + 0.22 * roll) - R0 * 0.05 * s * s * t, 0));
+  };
+  parts.push(AM.uv(
+    slab(peakSurf, 26, 6, peakThick, (u, t) => [0.10 + u * 0.80, 0.72 + t * 0.22]),
+    'SHELL'));
 
-  // goggle strap over the shell
-  const strap = quadSoup();
-  for (let i = 0; i < NU; i++) {
-    const th0 = (i / NU) * TAU, th1 = ((i + 1) / NU) * TAU;
-    const inFront = (t) => Math.cos(t) > 0.62;
-    if (inFront(th0) && inFront(th1)) continue;
-    const r = R * 1.018;
-    const a = surfPoint(headC, th0, phiMax(th0) * 0.80, r, S);
-    const b = surfPoint(headC, th1, phiMax(th1) * 0.80, r, S);
-    const c = surfPoint(headC, th1, phiMax(th1) * 0.94, r, S);
-    const d = surfPoint(headC, th0, phiMax(th0) * 0.94, r, S);
-    const outDir = a.clone().sub(headC);
-    strap.add(a, b, c, d, [i / NU, 0.1, (i + 1) / NU, 0.9], outDir);
-    strap.add(a, b, c, d, [i / NU, 0.1, (i + 1) / NU, 0.9], outDir.clone().negate());
-  }
-  parts.push(AM.uv(strap.geometry(), 'STRAP'));
-
-  // chin straps + buckle
-  const chin = headC.clone().add(V(0, -R0 * 1.14, R0 * 0.14));
+  // Chin straps: welded to real shell anchor points just under the ear line,
+  // routed UNDER the jaw, with a slider on each side and a buckle at the throat.
+  // Nothing crosses the face — the old goggle strap ran a black band straight
+  // across the eyes.
+  const chin = headC.clone().add(V(0, -R0 * 1.10, R0 * 0.20));
   for (const s of [-1, 1]) {
-    const a = surfPoint(headC, s * 78 * DEG, phiMax(s * 78 * DEG) * 0.98, R * 0.98, S);
-    const m = a.clone().lerp(chin, 0.5).add(V(s * 0.012, 0.006, 0.006));
-    const g = sweep([a, m, chin], { radius: R0 * 0.117, radial: 5, steps: 8, oval: () => [1, 0.30] });
-    parts.push(AM.uv(g, 'STRAP'));
+    for (const [thDeg, lead] of [[62, 0.30], [116, 0.62]]) {
+      const th = s * thDeg * DEG;
+      const anchor = surfPoint(headC, th, phiMax(th) * 0.995, R - T * 0.4, S);
+      const mid = anchor.clone().lerp(chin, lead)
+        .add(V(s * R0 * 0.16, -R0 * 0.10, 0));
+      const g = sweep([anchor, mid, chin], {
+        radius: R0 * 0.115, radial: 6, steps: 10, oval: () => [1, 0.30],
+      });
+      parts.push(AM.uv(g, 'STRAP'));
+    }
+    // strap slider
+    const sl = new THREE.BoxGeometry(R0 * 0.10, R0 * 0.075, R0 * 0.030);
+    const at = surfPoint(headC, s * 88 * DEG, phiMax(s * 88 * DEG) * 1.14, R * 0.92, S);
+    sl.translate(at.x, at.y, at.z);
+    parts.push(AM.patch(sl, 'LINER'));
   }
-  const buckle = new THREE.BoxGeometry(0.022, 0.016, 0.008);
+  const buckle = new THREE.BoxGeometry(R0 * 0.22, R0 * 0.15, R0 * 0.075);
   buckle.translate(chin.x, chin.y, chin.z);
   parts.push(AM.patch(buckle, 'LINER'));
 
   return merge(parts);
 }
 
+/**
+ * Goggles, PARKED on the brow of the lid the way a rider actually carries them
+ * between runs. They used to span phi 1.14–1.56 at eye level, which put an opaque
+ * dark-brown band straight across the eyes: the single reason the rider "had no
+ * face" at the closest framing. They now sit on the shell above the peak line and
+ * the whole face is clear.
+ */
 function buildGoggleLens(headC, R0) {
   const soup = quadSoup();
   const NU = 18, NV = 4;
-  const S = [0.80, 1.10, 1.03];
-  const th0 = -62 * DEG, th1 = 62 * DEG, p0 = 1.14, p1 = 1.56;
+  const S = [0.90, 1.13, 1.06];
+  const th0 = -50 * DEG, th1 = 50 * DEG, p0 = 0.58, p1 = 0.95;
   for (let i = 0; i < NU; i++) {
     for (let j = 0; j < NV; j++) {
       const ta = lerp(th0, th1, i / NU), tb = lerp(th0, th1, (i + 1) / NU);
       const pa = lerp(p0, p1, j / NV), pb = lerp(p0, p1, (j + 1) / NV);
-      const r = R0 * 1.10, ri = R0 * 1.045;
+      const r = R0 * 1.135, ri = R0 * 1.095;
       const outDir = surfPoint(headC, (ta + tb) / 2, (pa + pb) / 2, r, S).sub(headC);
       soup.add(
         surfPoint(headC, ta, pa, r, S), surfPoint(headC, tb, pa, r, S),
@@ -4744,10 +5896,10 @@ function buildGoggleLens(headC, R0) {
   for (let i = 0; i < NU; i++) {
     const ta = lerp(th0, th1, i / NU), tb = lerp(th0, th1, (i + 1) / NU);
     for (const [p, sgn] of [[p0, -1], [p1, 1]]) {
-      const a = surfPoint(headC, ta, p, R0 * 1.10, S), b = surfPoint(headC, tb, p, R0 * 1.10, S);
-      const c = surfPoint(headC, tb, p, R0 * 1.045, S), d = surfPoint(headC, ta, p, R0 * 1.045, S);
-      const along = surfPoint(headC, (ta + tb) / 2, p + sgn * 0.05, R0 * 1.10, S)
-        .sub(surfPoint(headC, (ta + tb) / 2, p, R0 * 1.10, S));
+      const a = surfPoint(headC, ta, p, R0 * 1.135, S), b = surfPoint(headC, tb, p, R0 * 1.135, S);
+      const c = surfPoint(headC, tb, p, R0 * 1.095, S), d = surfPoint(headC, ta, p, R0 * 1.095, S);
+      const along = surfPoint(headC, (ta + tb) / 2, p + sgn * 0.05, R0 * 1.135, S)
+        .sub(surfPoint(headC, (ta + tb) / 2, p, R0 * 1.135, S));
       soup.add(a, b, c, d, [0, 0, 1, 1], along);
     }
   }
@@ -4835,8 +5987,12 @@ export async function createRider(ctx, profile = DEFAULT_PROFILE) {
   // black cut-out the moment it faces away from it.
   const riderMat = new THREE.MeshPhysicalMaterial({
     ...AD.maps, color: 0xffffff, metalness: 0, roughness: 1,
-    normalScale: new THREE.Vector2(0.70, 0.70), envMapIntensity: 0.95,
-    sheen: 0.26, sheenRoughness: 0.85, sheenColor: new THREE.Color(0x9aa0aa),
+    // The weave and the fold relief only exist in the normal map, so it has to be
+    // read at close to full strength or the garment is a flat colour again.
+    normalScale: new THREE.Vector2(1.05, 1.05), envMapIntensity: 0.95,
+    // Cloth sheen: a retroreflective-ish lobe that lifts grazing angles, which is
+    // what separates a woven garment from painted plastic at a silhouette edge.
+    sheen: 0.55, sheenRoughness: 0.72, sheenColor: new THREE.Color(0xb6bcc6),
   });
   riderMat.name = 'riderSkinned';
 
@@ -4853,15 +6009,29 @@ export async function createRider(ctx, profile = DEFAULT_PROFILE) {
   lensMat.name = 'riderLens';
 
   function applyMaterialParams() {
+    // METAL HAS TO READ AS METAL. The library hands us a "roughness" that is the
+    // colourway's diffuse character (black frame = 1.00); using it raw on a
+    // metalness-1 surface gives a perfectly Lambertian metal, which renders as
+    // flat black plastic with one soft highlight — precisely the note. The scalar
+    // here is the LEVEL; the atlas roughness map carries the variation.
+    //   chrome    0.06 – 0.15 (mirror, smudged by handling)
+    //   raw alloy 0.30 – 0.45 (brushed)
+    //   ano/paint 0.42 – 0.62 under a clearcoat
     const F = X.frame;
+    const level = F.finish === 'chrome' ? 0.30
+      : F.finish === 'raw' ? 0.72
+        : F.finish === 'gloss' ? 0.46
+          : lerp(0.52, 0.78, clamp(F.roughness, 0, 1));
     paint.metalness = F.finish === 'gloss' ? 0.08 : F.metalness;
-    paint.roughness = clamp(F.roughness * (F.finish === 'chrome' ? 0.42 : 0.95), 0.04, 1);
-    paint.clearcoat = F.finish === 'chrome' ? 0.5 : F.finish === 'raw' ? 0.10 : F.finish === 'gloss' ? 0.62 : 0.28;
-    paint.clearcoatRoughness = F.finish === 'chrome' ? 0.06 : 0.34;
-    paint.envMapIntensity = F.env;
+    paint.roughness = clamp(level, 0.04, 1);
+    paint.clearcoat = F.finish === 'chrome' ? 0.85 : F.finish === 'raw' ? 0.10 : F.finish === 'gloss' ? 0.72 : 0.55;
+    paint.clearcoatRoughness = F.finish === 'chrome' ? 0.045 : 0.14;
+    // The sky gradient and the ramp have to land ON the frame. A metal that does
+    // not answer to the environment is a silhouette, not a material.
+    paint.envMapIntensity = F.env * (F.finish === 'chrome' ? 1.7 : 1.25);
     paint.needsUpdate = true;
-    hardware.envMapIntensity = X.hw.env;
-    hardware.roughness = clamp(X.hw.roughness * (X.hw.finish === 'chrome' ? 0.55 : 1.0), 0.05, 1);
+    hardware.envMapIntensity = X.hw.env * (X.hw.finish === 'chrome' ? 1.7 : 1.25);
+    hardware.roughness = clamp(X.hw.finish === 'chrome' ? 0.34 : lerp(0.50, 0.80, clamp(X.hw.roughness, 0, 1)), 0.05, 1);
     rubber.envMapIntensity = X.tyre.env * 0.8;
     rubber.roughness = clamp(X.tyre.roughness * 1.05, 0.2, 1);
     helmetMat.envMapIntensity = 1;
@@ -5044,7 +6214,9 @@ export async function createRider(ctx, profile = DEFAULT_PROFILE) {
       _nrm.set(0, _tan.z, -_tan.y).normalize();
       _lat.crossVectors(_tan, _nrm).normalize();
       _mat.makeBasis(_tan, _nrm, _lat).setPosition(_pA);
-      if (i % 2) _mat.scale(_v1.set(1, 1, 0.55));
+      // Every link carries both an outer and an inner plate now, so the old
+      // "squash every other instance" alternation would just bury the outer
+      // plates inside the inner ones and thin the chain back out.
       chainMesh.setMatrixAt(i, _mat);
     }
     chainMesh.instanceMatrix.needsUpdate = true;
@@ -5073,6 +6245,10 @@ export async function createRider(ctx, profile = DEFAULT_PROFILE) {
     points: {
       gripL: barsGeo.gripAnchorL.clone(),
       gripR: barsGeo.gripAnchorR.clone(),
+      // the grip TRANSFORM, not just a point: the hands are IK'd off this
+      gripAxisL: barsGeo.gripAxisL.clone(),
+      gripAxisR: barsGeo.gripAxisR.clone(),
+      gripRadius: barsGeo.gripRadius,
       pedalR: driveGeo.pedals[0].pos.clone(),
       pedalL: driveGeo.pedals[1].pos.clone(),
       bb: PT.bb.clone(),
