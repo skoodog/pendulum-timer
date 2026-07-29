@@ -665,7 +665,10 @@ function toLuminance(c, target) {
   return (f(r) << 16) | (f(g) << 8) | f(b);
 }
 
-function fabricAlbedo(c, floor = 0.34) {
+// 0.235 sRGB ≈ 0.045 linear, which is what a real black cotton tee measures.
+// The old 0.34 floor was a mid grey: it stopped the crush, but it also meant
+// nothing on the rider could BE dark, and every garment came out chalky.
+function fabricAlbedo(c, floor = 0.235) {
   return lumOf(c) >= floor ? c : toLuminance(c, floor);
 }
 
@@ -694,19 +697,35 @@ function separate(c, from, minDelta = 0.22) {
 }
 
 /**
- * Force a real tonal gap between two garments. `separate` only nudges; this
- * guarantees the delta, which is what stops top and bottom fusing into one
- * black mass under a low-key grade. The LIGHTER of the two moves.
+ * How differently two colours are TINTED, with luminance divided out. Indigo
+ * denim and a charcoal tee sit two points apart in luminance but nowhere near
+ * each other in hue, and they read as two obviously different garments — a
+ * tonal split between them is not only unnecessary, it is destructive.
  */
-function splitTone(c, from, minDelta = 0.30) {
+function chromaGap(a, b) {
+  const A = RGB(a), B = RGB(b);
+  const la = lumOf(a) * 255 + 1.0, lb = lumOf(b) * 255 + 1.0;
+  let d = 0;
+  for (let i = 0; i < 3; i++) d += Math.abs(A[i] / la - B[i] / lb);
+  return d / 3;
+}
+
+/**
+ * Keep two garments readable as two garments. `separate` only nudges; this used
+ * to GUARANTEE a 0.30 luminance delta, landing exactly on the target — and that
+ * is what painted indigo jeans (0.22 luminance) at 0.64 and shipped a rider in
+ * white leggings. Two rules fix it:
+ *   - if the two colours already differ in HUE, leave both alone;
+ *   - otherwise move by a modest delta, and never past the range real clothing
+ *     occupies, so a dark garment stays a dark garment.
+ */
+function splitTone(c, from, minDelta = 0.13) {
   const lf = lumOf(from), lc = lumOf(c);
   if (Math.abs(lc - lf) >= minDelta) return c;
-  // Move whichever way has room, and land EXACTLY on the target: nudging by a
-  // shade() factor never converged, which is how a mid-grey tee and mid-grey
-  // jeans both survived the "enforce a delta" pass looking identical.
-  const up = lf + minDelta <= 0.66 || lf - minDelta < 0.07;
-  const target = clamp(up ? lf + minDelta : lf - minDelta, 0.07, 0.66);
-  return toLuminance(c, target);
+  if (chromaGap(c, from) >= 0.12) return c;            // already two hues
+  const roomDown = lf - 0.10, roomUp = 0.80 - lf;
+  const dir = ((lc <= lf && roomDown >= minDelta) || roomUp < minDelta) ? -1 : 1;
+  return toLuminance(c, clamp(lf + dir * minDelta, 0.075, 0.80));
 }
 
 /** Plausible eye colour for a head of hair — no extra profile field needed. */
@@ -3322,11 +3341,11 @@ function buildContext(profile, materials) {
   // Top and bottom must be readably DIFFERENT garments. At the shipped floor a
   // near-black tee over near-black jeans collapsed into one silhouette-shaped
   // mass with no waist, no hem and no readable top at all.
-  const topBody = fabricAlbedo(P.top.colour, 0.34);
-  const botCol = splitTone(fabricAlbedo(P.bottom.colour, 0.30), topBody, 0.30);
+  const topBody = fabricAlbedo(P.top.colour, 0.235);
+  const botCol = splitTone(fabricAlbedo(P.bottom.colour, 0.205), topBody, 0.13);
   // Even a one-colour tee gets a tonal split at the sleeve, the way a real
   // garment does where the sleeve panel catches light differently to the body.
-  const sleeveCol = twoTone ? fabricAlbedo(trim, 0.34)
+  const sleeveCol = twoTone ? fabricAlbedo(trim, 0.235)
     : shade(topBody, lumOf(topBody) > 0.5 ? -0.13 : 0.15);
 
   return {
@@ -3353,7 +3372,7 @@ function buildContext(profile, materials) {
       style: P.top.style,
       body: topBody,
       sleeve: sleeveCol,
-      trim: separate(fabricAlbedo(trim, 0.36), topBody, 0.26),
+      trim: separate(fabricAlbedo(trim, 0.26), topBody, 0.20),
       sleeveLen: TOP_SLEEVE[P.top.style] ?? 0.45,
       loose: TOP_LOOSE[P.top.style] ?? 0.5,
       hood: P.top.style === 'hoodie',
@@ -3367,7 +3386,7 @@ function buildContext(profile, materials) {
       cuffed: P.bottom.style === 'joggers',
     },
     shoe: {
-      style: P.shoes.style, colour: fabricAlbedo(P.shoes.colour, 0.30), laces: P.shoes.laces,
+      style: P.shoes.style, colour: fabricAlbedo(P.shoes.colour, 0.185), laces: P.shoes.laces,
       // the sole is ALWAYS a separate material from the upper — rubber against
       // canvas or suede is half of what makes a shoe read as a shoe
       sole: P.shoes.style === 'vulc' || P.shoes.style === 'skate' ? 0xb98a52
@@ -3375,7 +3394,7 @@ function buildContext(profile, materials) {
       bulk: SHOE_BULK[P.shoes.style] ?? 0.6,
       high: SHOE_HIGH[P.shoes.style] ?? 0,
     },
-    glove: { on: !!P.gloves.on, colour: fabricAlbedo(P.gloves.colour, 0.30) },
+    glove: { on: !!P.gloves.on, colour: fabricAlbedo(P.gloves.colour, 0.195) },
     pad: { ...P.pads, colour: 0x3a3e46 },
     lid: {
       style: P.headwear, colour: fabricAlbedo(P.headwearColour, 0.26),
@@ -4272,8 +4291,13 @@ function riderPose(pts, X) {
   // the torso's own frame: +X is the chest front, +Z the rider's left
   const front = new THREE.Vector3().crossVectors(lean, V(-1, 0, 0)).normalize();
 
+  // Acromion, not the outside of the deltoid. At 0.180 the joint sat where the
+  // OUTER SURFACE of the arm belongs, so the deltoid's own radius pushed the
+  // silhouette out to a 490 mm shoulder span — a linebacker, and the reason the
+  // arms hung off the torso like a gorilla's. 0.142 + a 60 mm deltoid lands the
+  // silhouette at ~2.2 head-widths, which is the male figure.
   const shoulder = (s) => chest.clone()
-    .add(V(s * 0.180 * M.shoulderWidth, 0.022 * hs, 0.004));
+    .add(V(s * 0.142 * M.shoulderWidth, 0.020 * hs, 0.006));
   const wristFor = (s) => wristAt(s);
   const hip = (s) => hips.clone().add(V(s * 0.096 * M.hipWidth, -0.014 * hs, 0.012));
   const ankle = (s) => (s > 0 ? pts.pedalR : pts.pedalL).clone()
@@ -4291,7 +4315,7 @@ function riderPose(pts, X) {
     const sh = shoulder(s), wr = wristFor(s);
     const el = ikJoint(sh, wr, L.upperArm, L.foreArm, V(s * 0.86, -0.34, -0.38));
     const hp = hip(s), an = ankle(s);
-    const kn = ikJoint(hp, an, L.thigh, L.shin, V(s * (0.30 + M.fit.standWidth * 8), 0.16, 1.0));
+    const kn = ikJoint(hp, an, L.thigh, L.shin, V(s * (0.17 + M.fit.standWidth * 6), 0.16, 1.0));
     pose['shoulder' + side] = sh;
     pose['elbow' + side] = el;
     pose['wrist' + side] = wr;
@@ -5165,18 +5189,32 @@ function fistWrist(gripPoint, barDir, handR, curlR) {
 }
 
 /**
- * A closed fist on a bar. The back of the hand lies over the grip, four fingers
- * curl off the knuckle row, over the front and tuck under, the thumb crosses the
- * front diagonally toward the fingertips, and a padded knuckle stands proud of
- * each. Every radius is measured from the GRIP axis (`curlR = grip radius + glove
- * thickness`), so the palm can neither float off the bar nor interpenetrate it.
+ * A closed fist on a bar, built as ONE continuous shell wrapped around the grip.
+ *
+ * The previous version stacked four separate finger tubes, four knuckle spheres
+ * and a flattened "back of the hand" capsule on top of each other. At macro
+ * framing that read as a rack of dark blades with pale nubs floating over the
+ * forearm — the fingers had no palm behind them, so every gap between them was a
+ * hole straight through to shadow, and nothing connected the digits to the hand.
+ *
+ * Instead this lofts a surface over the grip cylinder in (s, a): `s` runs index →
+ * pinky ACROSS the hand, `a` runs from the heel of the palm, over the back, round
+ * the knuckle row, down the front and under to the fingertips. The radius is the
+ * grip radius plus a flesh thickness that carries the dorsum, the knuckle heads,
+ * the phalanx creases and the inter-finger grooves. Because the grooves are a
+ * modulation of one surface rather than a gap between four, the fist is solid:
+ * the fingers separate where a real hand's do and merge into the palm where a
+ * real hand's do, and the grip cannot show through anywhere.
+ *
+ * The thumb is a separate sweep coming round the inboard side and lying across
+ * the front of the index finger, so the hand visibly CLOSES on the bar.
  * Returns the shell and, separately, the glove's wrist cuff.
  */
 function buildFist(wrist, barDir, handR, glove, barR, gripPoint, side) {
   const F = fistFrame(barDir);
   const { along, up, fwd } = F;
   const parts = [];
-  const gT = glove ? handR * 0.10 : handR * 0.045;
+  const gT = glove ? handR * 0.095 : handR * 0.040;
   const curlR = barR + gT;
   // work in the GRIP's frame; the wrist is wherever fistWrist put it
   const G = gripPoint ? gripPoint.clone() : fistWrist(wrist, barDir, handR, curlR);
@@ -5185,65 +5223,102 @@ function buildFist(wrist, barDir, handR, glove, barR, gripPoint, side) {
     .addScaledVector(up, Math.cos(degA * DEG) * r)
     .addScaledVector(fwd, Math.sin(degA * DEG) * r);
 
-  // --- back of the hand: a flattened shell lying over the top-back of the grip
-  const backDeg = -34;
-  const backDir = up.clone().multiplyScalar(Math.cos(backDeg * DEG))
-    .addScaledVector(fwd, Math.sin(backDeg * DEG)).normalize();
-  const bA = at(-handR * 0.42, backDeg, curlR + handR * 0.36);
-  const bB = at(handR * 1.16, backDeg, curlR + handR * 0.30);
-  parts.push(placeZ(capsule2(bA.distanceTo(bB), handR * 0.50, handR * 0.44, {
-    radial: 12, capSegs: 3, bodyRings: 4,
-    mid: (t) => 1 + 0.12 * Math.sin(t * Math.PI),
-    // wide around the bar, thin radially: a hand, not a sausage
-    shape: (t) => [lerp(1.26, 1.16, t), lerp(0.72, 0.64, t)],
-  }), bA, bB, backDir));
+  const gs = (x, w) => Math.exp(-((x / w) * (x / w)));
+  // hand breadth across the knuckles ≈ 73 mm on a 1.78 m rider
+  const sIn = -handR * 0.42, sOut = handR * 1.36;
+  const A0 = -118, AK = 4, A1 = 210;      // palm heel → knuckle row → tips, tucked
 
-  // --- four fingers, index inboard, curling off the knuckle row --------------
-  for (let i = 0; i < 4; i++) {
-    const t = i / 3;
-    const sa = lerp(-handR * 0.26, handR * 1.02, t);
-    const fr = handR * lerp(0.200, 0.156, t);
-    // the middle finger reaches furthest round the bar
-    const tuck = lerp(198, 176, Math.abs(t - 0.34) * 1.3);
-    parts.push(sweep([
-      at(sa, 14, curlR + fr * 1.12),
-      at(sa, 74, curlR + fr),
-      at(sa * 0.96, 138, curlR + fr * 0.96),
-      at(sa * 0.88, tuck, curlR + fr * 0.80),
-    ], { radius: fr, radial: 7, steps: 8, taper: (k) => lerp(1.0, 0.80, k) }));
-    // knuckle pad: on a glove this is the moulded panel, on skin it is bone
-    const kr = fr * (glove ? 1.30 : 1.14);
-    const kn = new THREE.SphereGeometry(kr, 8, 6);
-    kn.scale(1, 1, 0.82);
-    const kp = at(sa, 8, curlR + fr * 1.10);
-    kn.translate(kp.x, kp.y, kp.z);
-    parts.push(kn);
-    // a finger segment crease so the digits read as separate at macro distance
-    if (i < 3) {
-      const gap = new THREE.SphereGeometry(fr * 0.30, 6, 4);
-      const gp2 = at(lerp(sa, lerp(-handR * 0.26, handR * 1.02, (i + 1) / 3), 0.5), 80,
-        curlR + fr * 0.55);
-      gap.translate(gp2.x, gp2.y, gp2.z);
-      parts.push(gap);
+  /** flesh over the grip, in handR units, at lane `s` and wrap angle `a`. */
+  const thick = (s, a) => {
+    let t;
+    if (a < AK) {
+      // dorsum: thin over the metacarpal heads, thickening into the palm heel
+      const k = clamp((AK - a) / (AK - A0), 0, 1);
+      t = lerp(0.40, 0.70, smoothstep(k));
+    } else {
+      // proximal → middle → distal phalanx, with a real crease at each joint
+      const k = clamp((a - AK) / (A1 - AK), 0, 1);
+      t = lerp(0.47, 0.225, smoothstep(k) ** 0.72);
+      t -= 0.060 * gs(a - 84, 15);                      // PIP crease
+      t -= 0.048 * gs(a - 158, 15);                     // DIP crease
+    }
+    // knuckle heads: one bony dome per lane, standing proud of the dorsum
+    let kn = 0;
+    for (let k = 0; k < 4; k++) kn = Math.max(kn, gs(s - (k + 0.5) / 4, 0.082));
+    t += (glove ? 0.150 : 0.115) * gs(a - 12, 24) * (0.42 + 0.58 * kn);
+    // index side carries the mass, the pinky lane is visibly slimmer and shorter
+    t *= lerp(1.06, 0.82, clamp((s - 0.26) / 0.74, 0, 1));
+    // the outer two fingers do not reach as far round the bar
+    t *= 1 - 0.30 * smoothstep(clamp((a - 150) / 60, 0, 1)) * smoothstep(clamp((s - 0.55) / 0.45, 0, 1));
+    return t;
+  };
+  /** the valleys between the digits — zero across the palm, deep past the knuckles */
+  const groove = (s, a) => {
+    const open = smoothstep(clamp((a - AK) / 50, 0, 1));
+    let g = 0;
+    for (let k = 1; k <= 3; k++) g = Math.max(g, gs(s - k / 4, 0.055));
+    return g * open * 0.150;
+  };
+
+  const NS = 20, NA = 30;
+  const pos = [], uvs = [], idx = [];
+  // One extra ring outside each border drops the surface onto the grip, so the
+  // shell is closed at the index edge, the pinky edge, the heel and the tips.
+  for (let j = -1; j <= NA + 1; j++) {
+    const qa = clamp(j / NA, 0, 1);
+    const a = lerp(A0, A1, qa);
+    const sealA = (j < 0 || j > NA) ? 0 : 1;
+    for (let i = -1; i <= NS + 1; i++) {
+      const s = clamp(i / NS, 0, 1);
+      const sealS = (i < 0 || i > NS) ? 0 : 1;
+      const seal = sealA * sealS;
+      const r = curlR + handR * Math.max(0, thick(s, a) - groove(s, a)) * seal;
+      const p = at(lerp(sIn, sOut, s), a, r);
+      pos.push(p.x, p.y, p.z);
+      // v walks the wrap so the SKIN band's warm extremity lands on the
+      // fingertips; a glove wants its closure strap at the wrist instead.
+      uvs.push(0.06 + s * 0.88, glove ? 1 - qa * 0.94 : 0.03 + qa * 0.94);
     }
   }
-  // --- thumb: pad on the inboard back, wrapping across the front -------------
-  const th = handR * 0.24;
+  const w = NS + 3;
+  for (let j = 0; j < NA + 2; j++) {
+    for (let i = 0; i < NS + 2; i++) {
+      const a = j * w + i, b = a + w;
+      idx.push(a, b, a + 1, b, b + 1, a + 1);
+    }
+  }
+  const shell = new THREE.BufferGeometry();
+  shell.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  shell.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  shell.setIndex(idx);
+  shell.computeVertexNormals();
+  parts.push(shell);
+
+  // --- thenar: the ball of muscle at the base of the thumb -------------------
+  const tA = at(sIn - handR * 0.10, -84, curlR + handR * 0.34);
+  const tB = at(sIn + handR * 0.06, -20, curlR + handR * 0.40);
+  parts.push(placeZ(capsule2(tA.distanceTo(tB), handR * 0.30, handR * 0.34, {
+    radial: 10, capSegs: 3, shape: () => [0.70, 1.10],
+  }), tA, tB, up));
+
+  // --- thumb: round the inboard side, pad across the front of the index ------
+  const th = handR * 0.245;
   parts.push(sweep([
-    at(-handR * 0.62, -78, curlR + handR * 0.32),
-    at(-handR * 0.34, -22, curlR + handR * 0.34),
-    at(handR * 0.06, 34, curlR + th * 1.05),
-    at(handR * 0.44, 74, curlR + th * 0.85),
-  ], { radius: th, radial: 8, steps: 8, taper: (k) => lerp(1.10, 0.74, k) }));
+    at(sIn - handR * 0.18, -60, curlR + handR * 0.50),
+    at(sIn - handR * 0.10, -4, curlR + handR * 0.46),
+    at(sIn + handR * 0.16, 52, curlR + handR * 0.40),
+    at(sIn + handR * 0.60, 104, curlR + handR * 0.33),
+  ], { radius: th, radial: 8, steps: 10, taper: (k) => lerp(1.16, 0.72, k),
+    oval: (k) => [lerp(0.92, 0.86, k), 1] }));
 
   // --- wrist cuff: a real closure band, not a bare tube end ------------------
   const cuffDir = G.clone().sub(wrist);
   if (cuffDir.lengthSq() < 1e-9) cuffDir.copy(along);
   cuffDir.normalize();
-  const cuff = placeZ(capsule2(handR * 0.66, handR * 0.60, handR * 0.66, {
-    radial: 12, capSegs: 2, capA: 0.35, capB: 0.35, shape: () => [1.12, 0.88],
-  }), wrist.clone().addScaledVector(cuffDir, -handR * 0.40),
-  wrist.clone().addScaledVector(cuffDir, handR * 0.26), up);
+  const cuff = placeZ(capsule2(handR * 0.60, handR * 0.46, handR * 0.52, {
+    radial: 12, capSegs: 2, capA: 0.35, capB: 0.35, shape: () => [1.14, 0.86],
+  }), wrist.clone().addScaledVector(cuffDir, -handR * 0.46),
+  wrist.clone().addScaledVector(cuffDir, handR * 0.14), up);
   void side;
 
   return { shell: merge(parts), cuff };
@@ -5359,30 +5434,36 @@ function buildRiderBody(pose, boneIndex, X, A) {
   const topLoose = X.top.loose, botLoose = X.bottom.loose;
 
   // ------------------------------------------------------------------ torso
-  const torsoA = pose.hips.clone().addScaledVector(pose.lean, -0.072 * hs);
+  const torsoA = pose.hips.clone().addScaledVector(pose.lean, -0.052 * hs);
   const torsoB = pose.neck.clone();
   const torsoLen = torsoA.distanceTo(torsoB);
-  const wLo = M.hipWidth * 1.16, wHi = M.shoulderWidth * 1.30;
-  const dLo = M.waistDepth * 0.86, dHi = M.chestDepth * 0.90;
+  const wLo = M.hipWidth * 1.12, wHi = M.shoulderWidth * 1.30;
+  const dLo = M.waistDepth * 0.84, dHi = M.chestDepth * 0.80;
   // The hem is a REAL edge loop, not a painted line: the garment steps out by its
   // own thickness above the hip, and the turned-and-stitched edge thickens again
   // right at the hem station, so the top has a visible bottom edge in silhouette.
   const hemT = X.top.style === 'jersey' ? 0.135 : X.top.style === 'hoodie' ? 0.115 : 0.175;
   const clothStep = (0.008 + topLoose * 0.010) * hs;
-  const torso = limb(torsoA, torsoB, 0.150 * hs, 0.086 * hs, {
-    radial: 20, capSegs: 4, bodyRings: 16,
+  const torso = limb(torsoA, torsoB, 0.140 * hs, 0.090 * hs, {
+    radial: 20, capSegs: 4, bodyRings: 18,
     // The seat is a FLATTENED cap. At capA = 1 the torso's bottom pole hung a
     // full hip-radius (150 mm) below and behind the hips, so the tee ended in a
     // giant blunt dome instead of a hem — the biggest single silhouette error on
     // the character. capB likewise stops the shoulder yoke ballooning over the neck.
     capA: 0.30, capB: 0.55,
-    // hem flare → waist → ribcage → the shoulder yoke
+    // hem flare → WAIST → ribcage → the shoulder yoke.
+    // The base radius already tapers 140 → 90 mm, so the old profile (0.92 at the
+    // waist, 1.16 at the chest) cancelled the taper exactly and left a constant
+    // 128 mm barrel from hip to collarbone — no waist at all, which is the single
+    // reason the rider read as a potato from every angle. These numbers pinch the
+    // section to ~107 mm at the navel and let it open back to ~127 mm at the chest.
     mid: (t) => {
-      const base = (t < 0.15 ? lerp(1.04 + topLoose * 0.06, 0.92, smoothstep(t / 0.15))
-        : t < 0.62 ? lerp(0.92, 1.16, smoothstep((t - 0.15) / 0.47))
-          : lerp(1.16, 0.99, smoothstep((t - 0.62) / 0.38))) * (1 + topLoose * 0.06);
+      const base = (t < 0.12 ? lerp(1.02 + topLoose * 0.05, 0.95, smoothstep(t / 0.12))
+        : t < 0.38 ? lerp(0.95, 0.875, smoothstep((t - 0.12) / 0.26))
+          : t < 0.72 ? lerp(0.875, 1.225, smoothstep((t - 0.38) / 0.34))
+            : lerp(1.225, 0.98, smoothstep((t - 0.72) / 0.28))) * (1 + topLoose * 0.05);
       if (X.top.style === 'tank') return base;
-      const r = 0.150 * hs;                        // reference radius for the step
+      const r = 0.140 * hs;                        // reference radius for the step
       const cov = smoothstep(clamp((t - (hemT - 0.012)) / 0.024, 0, 1));
       const edge = Math.exp(-(((t - hemT - 0.008) / 0.014) ** 2));
       return base * (1 + (clothStep * cov + clothStep * 0.65 * edge) / r);
@@ -5472,8 +5553,11 @@ function buildRiderBody(pose, boneIndex, X, A) {
   const tank = X.top.style === 'tank';
   for (const [side, s] of [['R', 1], ['L', -1]]) {
     const sh = pose['shoulder' + side], el = pose['elbow' + side], wr = pose['wrist' + side];
-    const rShoulder = 0.055 * hs * girth, rElbow = 0.0395 * hs * girth;
-    const rFore = 0.040 * hs * M.forearmGirth, rWrist = 0.029 * hs * M.forearmGirth;
+    // Real arm cross-sections at 1.78 m: deltoid ø108, elbow ø72, forearm belly
+    // ø82, wrist ø52 across the styloids. The wrist is the number that matters —
+    // a forearm that stays 80 mm all the way to the hand is the classic sausage.
+    const rShoulder = 0.054 * hs * girth, rElbow = 0.0360 * hs * girth;
+    const rFore = 0.0385 * hs * M.forearmGirth, rWrist = 0.0250 * hs * M.forearmGirth;
 
     const dSE = el.clone().sub(sh).normalize(), dEW = wr.clone().sub(el).normalize();
     // Overlap the torso by well over one local radius so the two shells can never
@@ -5494,15 +5578,19 @@ function buildRiderBody(pose, boneIndex, X, A) {
     const flesh = (f) => {
       if (f < eF) {
         const k = clamp(f / eF, -1, 1);
-        return lerp(rShoulder, rElbow, smoothstep(clamp(k, 0, 1)))
-          * bulge(k, 0.04, 0.30, 0.20 * girth)
-          * bulge(k, 0.50, 0.30, 0.10 * girth);
+        // deltoid cap high and outboard, biceps/triceps belly at mid-humerus,
+        // then a hard narrowing into the epicondyles
+        return lerp(rShoulder, rElbow, smoothstep(clamp(k, 0, 1)) ** 0.85)
+          * bulge(k, 0.02, 0.26, 0.22 * girth)
+          * bulge(k, 0.46, 0.28, 0.11 * girth);
       }
       // just past the elbow the forearm picks up its OWN girth scale
       const k = clamp((f - eF) / (1 - eF), 0, 1.4);
-      const belly = lerp(rFore, rWrist, smoothstep(clamp(k, 0, 1)));
-      return lerp(rElbow, belly, smoothstep(clamp(k / 0.22, 0, 1)))
-        * bulge(k, 0.20, 0.30, 0.16 * M.forearmGirth);
+      // The taper is the whole point: cubic-ish so the last third of the forearm
+      // really thins, instead of holding girth and butting a fist onto a pipe.
+      const belly = lerp(rFore, rWrist, smoothstep(clamp(k, 0, 1)) ** 0.72);
+      return lerp(rElbow, belly, smoothstep(clamp(k / 0.20, 0, 1)))
+        * bulge(k, 0.17, 0.26, 0.17 * M.forearmGirth);
     };
     // The garment: a 7–13 mm shell, thickening toward its hem where cloth drapes.
     const clothT = (0.0062 + topLoose * 0.0072) * hs;
@@ -5585,8 +5673,11 @@ function buildRiderBody(pose, boneIndex, X, A) {
     const hp = pose['hip' + side], kn = pose['knee' + side];
     const an = pose['ankle' + side], toe = pose['toe' + side];
     const skinS = (g) => skinPart(g, boneIndex, 'knee' + side, 'ankle' + side, kn, an, 0.68, 1.02, 0.8);
-    const rHip = 0.086 * hs * girth, rKnee = 0.0575 * hs * girth;
-    const rCalf = 0.063 * hs * M.calfGirth, rAnkle = 0.042 * hs * M.calfGirth;
+    // Real leg cross-sections at 1.78 m: thigh ø150 at the crotch, knee ø108,
+    // calf belly ø112, ankle ø72. The old thigh was ø186 BEFORE the denim shell
+    // went on it, which is why both legs read as two white bolsters.
+    const rHip = 0.0740 * hs * girth, rKnee = 0.0505 * hs * girth;
+    const rCalf = 0.0555 * hs * M.calfGirth, rAnkle = 0.0355 * hs * M.calfGirth;
 
     const dHK = kn.clone().sub(hp).normalize(), dKA = an.clone().sub(kn).normalize();
     const rootExt = rHip * 0.85;
@@ -5604,18 +5695,20 @@ function buildRiderBody(pose, boneIndex, X, A) {
     const flesh = (f) => {
       if (f < kF) {
         const k = clamp(f / kF, -1, 1);
-        return lerp(rHip, rKnee, smoothstep(clamp(k, 0, 1)))
-          * bulge(k, 0.18, 0.34, 0.12 * girth);
+        // quadriceps mass sits HIGH and dies away above the knee; the last
+        // quarter of the thigh is nearly all bone and tendon
+        return lerp(rHip, rKnee, smoothstep(clamp(k, 0, 1)) ** 0.80)
+          * bulge(k, 0.16, 0.30, 0.13 * girth);
       }
       // the gastrocnemius belly carries the calf's own girth scale
       const k = clamp((f - kF) / (1 - kF), 0, 1.4);
-      const belly = lerp(rCalf, rAnkle, smoothstep(clamp(k, 0, 1)));
-      return lerp(rKnee, belly, smoothstep(clamp(k / 0.20, 0, 1)))
-        * bulge(k, 0.24, 0.26, 0.18 * M.calfGirth);
+      const belly = lerp(rCalf, rAnkle, smoothstep(clamp(k, 0, 1)) ** 0.70);
+      return lerp(rKnee, belly, smoothstep(clamp(k / 0.18, 0, 1)))
+        * bulge(k, 0.22, 0.24, 0.19 * M.calfGirth);
     };
     // Trousers hang: the cloth ignores the calf, breaks over the shoe and gets a
     // real turned cuff. 9–20 mm of shell depending on how loose the cut is.
-    const clothT = (0.0075 + botLoose * 0.0130) * hs;
+    const clothT = (0.0055 + botLoose * 0.0090) * hs;
     const legRadius = (t) => {
       const f = fOf(t);
       let r = flesh(f);
