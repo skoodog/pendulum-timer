@@ -722,10 +722,13 @@ function chromaGap(a, b) {
 function splitTone(c, from, minDelta = 0.13) {
   const lf = lumOf(from), lc = lumOf(c);
   if (Math.abs(lc - lf) >= minDelta) return c;
-  if (chromaGap(c, from) >= 0.12) return c;            // already two hues
+  // Two different HUES already read as two garments; they need a nudge, not a
+  // split, or indigo denim under a charcoal tee gets bleached to slate.
+  const d = chromaGap(c, from) >= 0.12 ? 0.065 : minDelta;
+  if (Math.abs(lc - lf) >= d) return c;
   const roomDown = lf - 0.10, roomUp = 0.80 - lf;
-  const dir = ((lc <= lf && roomDown >= minDelta) || roomUp < minDelta) ? -1 : 1;
-  return toLuminance(c, clamp(lf + dir * minDelta, 0.075, 0.80));
+  const dir = ((lc <= lf && roomDown >= d) || roomUp < d) ? -1 : 1;
+  return toLuminance(c, clamp(lf + dir * d, 0.075, 0.80));
 }
 
 /** Plausible eye colour for a head of hair — no extra profile field needed. */
@@ -2860,8 +2863,9 @@ function riderRegions() {
         c.fillRect(0, h * 0.03, w, h * 0.04);                // scuffed toe
         stitchLine(c, 0, h * 0.16, w, h * 0.16, rgba(shade(col, 0.45), 0.7), 2, [5, 5]);
         stitchLine(c, 0, h * 0.60, w, h * 0.60, rgba(shade(col, 0.35), 0.5), 2, [6, 7]);
-        // eyestay panels either side of the instep
-        c.fillStyle = rgba(shade(col, -0.30), 0.85);
+        // eyestay panels either side of the instep. At 0.85 alpha over a −0.30
+        // shade these were two black slots on the top of the shoe.
+        c.fillStyle = rgba(shade(col, -0.20), 0.50);
         c.fillRect(w * 0.355, h * 0.22, w * 0.055, h * 0.62);
         c.fillRect(w * 0.590, h * 0.22, w * 0.055, h * 0.62);
         // tongue, under the laces
@@ -4695,7 +4699,7 @@ function buildEar(centre, R, S, side) {
   // seated INTO the skull, so the front third of the shell is buried and the ear
   // reads as part of the head rather than a card stuck to it
   const at = headSurface(side * (Math.PI * 0.5 + 0.34), FL.earMid, R, S).add(centre)
-    .addScaledVector(out, -0.040 * R).addScaledVector(fore, -0.020 * R);
+    .addScaledVector(out, -0.022 * R).addScaledVector(fore, -0.020 * R);
   const rx = 0.190 * R, ry = 0.320 * R;
 
   const pos = [], uvs = [], idx = [];
@@ -4711,20 +4715,24 @@ function buildEar(centre, R, S, side) {
     const px = bx * rho, py = by * rho;
     const cth = Math.cos(th), sth = Math.sin(th);
     // helix rim rolls over from the front-top, round the back, into the lobe
-    const rimAmt = smoothstep(clamp((rho - 0.52) / 0.48, 0, 1));
-    const rimArc = smoothstep(clamp((th - 0.05) / 1.05, 0, 1))
-      * (1 - 0.50 * smoothstep(clamp((th - 4.60) / 1.20, 0, 1)));
+    // The helix is a ROLLED rim, not a swelling: it has to be narrow in rho and
+    // tall in relief, or the ear renders as a flat tan card stuck to the skull.
+    const rimAmt = _g(rho - 0.86, 0.19);
+    const rimArc = smoothstep(clamp((th - 0.05) / 0.90, 0, 1))
+      * (1 - 0.45 * smoothstep(clamp((th - 4.60) / 1.20, 0, 1)));
     // concha bowl, antihelix ridge behind it, tragus over the canal
-    const bowl = (1 - smoothstep(clamp((rho - 0.04) / 0.42, 0, 1))) * clamp(0.45 + cth * 0.75, 0, 1);
-    const anti = _g(rho - 0.50, 0.20) * clamp(0.30 - cth * 0.85, 0, 1) * Math.max(0, sth + 0.35);
+    const bowl = (1 - smoothstep(clamp((rho - 0.04) / 0.44, 0, 1))) * clamp(0.45 + cth * 0.75, 0, 1);
+    const anti = _g(rho - 0.52, 0.17) * clamp(0.30 - cth * 0.85, 0, 1) * Math.max(0, sth + 0.35);
     const tragus = _g(rho - 0.30, 0.20) * _g(Math.atan2(Math.sin(th + 0.35), Math.cos(th + 0.35)), 0.45);
-    const d = 0.050 * R * rimAmt * rimArc + 0.020 * R * anti
-      - 0.052 * R * bowl + 0.026 * R * tragus;
+    // the whole shell flares away from the skull toward the top and the back
+    const flare = clamp(0.28 + 0.72 * rho, 0, 1) * (0.45 + 0.55 * clamp(0.5 - cth * 0.7, 0, 1));
+    const d = 0.086 * R * rimAmt * rimArc + 0.026 * R * anti
+      - 0.062 * R * bowl + 0.026 * R * tragus + 0.034 * R * flare;
     const p = at.clone()
       .addScaledVector(fore, px)
       .addScaledVector(up, py)
       .addScaledVector(out, shellOut > 0 ? d + 0.016 * R
-        : -0.014 * R - 0.020 * R * (1 - rho) * clamp(0.5 + Math.cos(th) * 0.9, 0, 1));
+        : d * 0.34 - 0.016 * R - 0.022 * R * (1 - rho) * clamp(0.5 + Math.cos(th) * 0.9, 0, 1));
     return p;
   };
   for (const shellOut of [1, -1]) {
@@ -5107,8 +5115,11 @@ function buildEyelid(centre, R, S, side, lower) {
     const t = FL.eye + lerp(tLash * arc, lerp(tBack * 0.55, tBack, arc), vv);
     const p = headSurface(a, t, R, S);
     const n = p.clone().normalize();
-    // proud at the lash line, flush at the crease so there is no step to catch
-    const out = lerp(lower ? 0.014 : 0.021, -0.003, smoothstep(vv) ** 0.7) * R;
+    // Proud at the lash line, flush at the crease AND flush at both canthi — a
+    // lid that keeps its thickness into the corners leaves a 2 mm step there,
+    // and the whole thing reads as a plate laid on the face instead of a lid.
+    const out = lerp(lower ? 0.014 : 0.021, -0.003, smoothstep(vv) ** 0.7) * R
+      * smoothstep(clamp(arc * 1.35, 0, 1));
     return p.addScaledVector(n, out).add(centre);
   };
   // Painted from the plain SKIN band, not FACE: FACE at the lid's own station is
@@ -5133,7 +5144,10 @@ function buildLid(centre, R, S, X) {
   // a cap band rides across the forehead just above the brow and drops at the
   // sides and the nape
   // worn backwards the band rides up off the brow and drops at the nape
-  const lineAt = (a) => lowV + (beanie ? 0.070 : backwards ? 0.098 : 0.058) * Math.max(0, Math.cos(a))
+  // A cap worn backwards sits BACK: its front edge clears the hairline by a good
+  // 25 mm so a whole band of hair shows above the brow. At 0.098 it landed on the
+  // hairline itself and the rider read as shaved under the lid.
+  const lineAt = (a) => lowV + (beanie ? 0.070 : backwards ? 0.172 : 0.058) * Math.max(0, Math.cos(a))
     - (beanie ? 0.028 : backwards ? 0.048 : 0.030) * Math.max(0, -Math.cos(a));
   const shell = (a, v) => {
     const base = headSurface(a, v, R, S);
@@ -6173,7 +6187,9 @@ export async function createRider(ctx, profile = DEFAULT_PROFILE) {
     normalScale: new THREE.Vector2(1.05, 1.05), envMapIntensity: 0.95,
     // Cloth sheen: a retroreflective-ish lobe that lifts grazing angles, which is
     // what separates a woven garment from painted plastic at a silhouette edge.
-    sheen: 0.55, sheenRoughness: 0.72, sheenColor: new THREE.Color(0xb6bcc6),
+    // 0.55 with a light sheen colour washed every garment pale at grazing angles
+    // — indigo denim came back as stone-washed and the tee lost its value.
+    sheen: 0.30, sheenRoughness: 0.80, sheenColor: new THREE.Color(0x8b8f97),
   });
   riderMat.name = 'riderSkinned';
 
