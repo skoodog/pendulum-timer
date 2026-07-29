@@ -668,8 +668,18 @@ function toLuminance(c, target) {
 // 0.235 sRGB ≈ 0.045 linear, which is what a real black cotton tee measures.
 // The old 0.34 floor was a mid grey: it stopped the crush, but it also meant
 // nothing on the rider could BE dark, and every garment came out chalky.
-function fabricAlbedo(c, floor = 0.235) {
-  return lumOf(c) >= floor ? c : toLuminance(c, floor);
+function fabricAlbedo(c, floor = 0.272) {
+  if (lumOf(c) >= floor) return c;
+  // Lifting luminance alone walks every dark garment toward grey — indigo denim
+  // came back stone-washed. Push the chroma back out by the same factor the
+  // luminance moved, so a black tee gets lighter and a navy one stays navy.
+  const up = toLuminance(c, floor);
+  const l = lumOf(c), k = clamp(floor / Math.max(l, 0.02), 1, 2.4);
+  const lum = lumOf(up) * 255;
+  const [r, g, b] = RGB(up);
+  const sat = 1 + 0.55 * (k - 1);
+  const f = (v) => clamp(Math.round(lum + (v - lum) * sat), 0, 255);
+  return (f(r) << 16) | (f(g) << 8) | f(b);
 }
 
 /**
@@ -2502,7 +2512,7 @@ function riderRegions() {
         // a third of the atlas width — a 20 mm thread pitch, which is not a weave,
         // it is a wallpaper. At scale 16 the pitch is ~3.5 mm on the garment and
         // the mip chain resolves it into a soft cloth grain at distance.
-        overlay(c, w, yv(hem), 0.20, 16, _weaveTile);
+        overlay(c, w, yv(hem), 0.14, 22, _weaveTile);
         // hem: a turned-and-stitched band in the garment's own colour, and only a
         // contrast band on the styles that actually have one
         if (T.trimCuff) {
@@ -3394,7 +3404,7 @@ function resolveSpec(materials, spec, fallbackColour = 0x9aa0a6) {
   return out;
 }
 
-const TOP_SLEEVE = { tee: 0.45, raglan: 0.72, jersey: 0.95, hoodie: 1.0, tank: 0.0 };
+const TOP_SLEEVE = { tee: 0.32, raglan: 0.62, jersey: 0.92, hoodie: 1.0, tank: 0.0 };
 const TOP_LOOSE = { tee: 0.50, raglan: 0.45, jersey: 0.30, hoodie: 0.78, tank: 0.40 };
 const BOTTOM_LEN = { jeans: 1, shorts: 0.45, pants: 1, joggers: 0.95 };
 const BOTTOM_LOOSE = { jeans: 0.60, shorts: 0.55, pants: 0.45, joggers: 0.35 };
@@ -4545,6 +4555,33 @@ function bustPass(geo, origin, axis, front, amount, centreT, width) {
   return geo;
 }
 
+/**
+ * Flatten the BACK of the torso and cut a spine groove down it. A lofted tube is
+ * circular in section, and a circular back renders as a hunched bag of cloth from
+ * every camera behind the rider — which is most of them in a chase-cam game. A
+ * real back is close to a plane between the shoulder blades, broken by the spine.
+ */
+function backPass(geo, origin, axis, back, side, amount, groove) {
+  const p = geo.attributes.position;
+  const len2 = Math.max(axis.lengthSq(), 1e-8);
+  const v = new THREE.Vector3();
+  for (let i = 0; i < p.count; i++) {
+    v.fromBufferAttribute(p, i).sub(origin);
+    const t = v.dot(axis) / len2;
+    const f = v.dot(back);
+    if (f <= 0) continue;
+    const lat = Math.abs(v.dot(side));
+    // strongest across the scapulae, easing out at the waist and at the yoke
+    const band = Math.exp(-(((t - 0.62) / 0.34) ** 2));
+    const k = band * clamp(f / 0.055, 0, 1);
+    const d = -amount * k + groove * band * Math.exp(-((lat / 0.030) ** 2));
+    if (Math.abs(d) < 1e-5) continue;
+    p.setXYZ(i, p.getX(i) + back.x * d, p.getY(i) + back.y * d, p.getZ(i) + back.z * d);
+  }
+  geo.computeVertexNormals();
+  return geo;
+}
+
 // ---------------------------------------------------------------------------
 // rider: head, hair, headwear
 // ---------------------------------------------------------------------------
@@ -4580,12 +4617,6 @@ const FL = {
 
 const _g = (x, s) => Math.exp(-((x / s) * (x / s)));
 
-/**
- * Head surface in local space (origin = head centre, +Z forward, +Y up).
- * `a` = azimuth, 0 at the face; `t` = normalised height (see FL above).
- * Brow, sockets, cheekbones, nose, lips, chin, mandible and occiput are all real
- * displacement — the paint only shades what the skull already does.
- */
 // Measured male SAGITTAL PROFILE — the forward reach of the midline of the face at
 // every head height, in units of R, with the nose left out (it is a separate ridge
 // laid on top). A head parameterised as an ellipsoid puts the chin at a pole where
@@ -4599,7 +4630,7 @@ const SAGZ = [
   [0.480, 1.020], [0.560, 1.012], [0.615, 1.020], [0.680, 1.008],
   [0.760, 0.944], [0.830, 0.842], [0.900, 0.658], [0.955, 0.396],
   [1.000, 0.000],
-]
+];
 
 // Catmull-Rom through the knots. A per-segment smoothstep looked right in the
 // numbers and rendered as a stack of horizontal terraces across the cheeks: the
@@ -4622,6 +4653,12 @@ function sagittalZ(t) {
     + (-2 * u3 + 3 * u2) * p2[1] + (u3 - u2) * m2;
 }
 
+/**
+ * Head surface in local space (origin = head centre, +Z forward, +Y up).
+ * `a` = azimuth, 0 at the face; `t` = normalised height (see FL above).
+ * Brow, sockets, cheekbones, nose, lips, chin, mandible and occiput are all real
+ * displacement — the paint only shades what the skull already does.
+ */
 function headSurface(a, t, R, S) {
   const yn = clamp(t * 2 - 1, -1, 1);
   const ring = Math.sqrt(Math.max(0, 1 - yn * yn));
@@ -5497,8 +5534,8 @@ function buildFist(wrist, barDir, handR, glove, barR, gripPoint, side) {
   const groove = (s, a) => {
     const open = smoothstep(clamp((a - AK) / 50, 0, 1));
     let g = 0;
-    for (let k = 1; k <= 3; k++) g = Math.max(g, gs(s - k / 4, 0.055));
-    return g * open * 0.150;
+    for (let k = 1; k <= 3; k++) g = Math.max(g, gs(s - k / 4, 0.048));
+    return g * open * 0.195;
   };
 
   const NS = 20, NA = 30;
@@ -5722,6 +5759,8 @@ function buildRiderBody(pose, boneIndex, X, A) {
     bustPass(torso, torsoA, torsoB.clone().sub(torsoA), pose.front,
       (M.gender === 'female' ? 0.036 : 0.012) * hs, 0.615, 0.16);
   }
+  backPass(torso, torsoA, torsoB.clone().sub(torsoA), pose.front.clone().negate(),
+    V(1, 0, 0), 0.026 * hs, -0.009 * hs);
   push(torso, 'TOP', (g) => skinAlong(g, boneIndex, ['hips', 'spine', 'chest', 'neck'],
     [torsoA, pose.spine, pose.chest, torsoB]));
 
@@ -5743,7 +5782,7 @@ function buildRiderBody(pose, boneIndex, X, A) {
   }
 
   // ------------------------------------------------------------ neck + head
-  const neckR = 0.055 * hs * lerp(0.92, 1.10, M.build) * (M.gender === 'female' ? 0.93 : 1);
+  const neckR = 0.0505 * hs * lerp(0.92, 1.10, M.build) * (M.gender === 'female' ? 0.93 : 1);
   // The neck's root has to run DOWN THE TORSO AXIS, not down the world Y: with the
   // rider pitched forward over the bars a vertical root pushes its cap out through
   // the back of the shirt as a bare patch on the shoulder.
@@ -5752,9 +5791,9 @@ function buildRiderBody(pose, boneIndex, X, A) {
       radial: 14, capSegs: 3, bodyRings: 5,
       // trapezius flare at the base, a hollow at the throat, and the pair of
       // sternocleidomastoid cords running up to behind the ear
-      mid: (t) => lerp(1.06, 0.95, smoothstep(clamp(t * 1.30, 0, 1)))
-        * (1 + 0.05 * Math.exp(-(((t - 0.30) / 0.26) ** 2))),
-      shape: (t) => [lerp(1.12, 0.96, t), lerp(0.86, 1.00, t)],
+      mid: (t) => lerp(1.14, 0.94, smoothstep(clamp(t * 0.95, 0, 1)))
+        * (1 + 0.05 * Math.exp(-(((t - 0.22) / 0.22) ** 2))),
+      shape: (t) => [lerp(1.16, 0.94, t), lerp(0.84, 1.02, t)],
     }),
   'SKIN', (g) => skinPart(g, boneIndex, 'neck', 'head', pose.neck, pose.head, 0.2, 1.0, 0.85));
 
@@ -5832,8 +5871,9 @@ function buildRiderBody(pose, boneIndex, X, A) {
         // deltoid cap high and outboard, biceps/triceps belly at mid-humerus,
         // then a hard narrowing into the epicondyles
         return lerp(rShoulder, rElbow, smoothstep(clamp(k, 0, 1)) ** 0.85)
-          * bulge(k, 0.02, 0.26, 0.22 * girth)
-          * bulge(k, 0.46, 0.28, 0.11 * girth);
+          * bulge(k, 0.02, 0.22, 0.30 * girth)      // deltoid cap
+          * bulge(k, 0.30, 0.20, 0.09 * girth)      // triceps long head
+          * bulge(k, 0.55, 0.26, 0.13 * girth);     // biceps belly
       }
       // just past the elbow the forearm picks up its OWN girth scale
       const k = clamp((f - eF) / (1 - eF), 0, 1.4);
@@ -5853,7 +5893,12 @@ function buildRiderBody(pose, boneIndex, X, A) {
       const cov = 1 - smoothstep(clamp((f - (sleeveT - 0.014)) / 0.026, 0, 1));
       r += clothT * cov * lerp(0.72, 1.10, smoothstep(clamp(f / Math.max(sleeveT, 1e-3), 0, 1)));
       // the hem itself is turned and stitched: a visible thickened edge loop
-      r += clothT * 0.55 * cov * Math.exp(-(((f - sleeveT + 0.012) / 0.013) ** 2));
+      r += clothT * 0.70 * cov * Math.exp(-(((f - sleeveT + 0.012) / 0.013) ** 2));
+      // cloth GATHERS: a sleeve is not shrink-wrap, it bunches where the arm bends
+      // it and again just above the hem, and those rings are the whole reason a
+      // garment reads as fabric rather than as a painted layer on the skin.
+      r += clothT * 0.42 * cov * Math.exp(-(((f - sleeveT * 0.72) / 0.055) ** 2));
+      r += clothT * 0.30 * cov * Math.exp(-(((f - sleeveT * 0.40) / 0.070) ** 2));
       return r;
     };
     const armShape = (t) => {
@@ -5970,6 +6015,13 @@ function buildRiderBody(pose, boneIndex, X, A) {
       const drape = lerp(0.80, 1.15, smoothstep(clamp(f / Math.max(legT, 1e-3), 0, 1)))
         * bulge(f, 0.20, 0.26, 0.10) * bulge(f, kF, 0.07, -0.14);
       r += clothT * cov * drape;
+      // the KNEE BREAK: two gathered folds just above the knee where the bent leg
+      // pushes the cloth up, and a slack hollow just below it
+      r += clothT * 0.55 * cov * Math.exp(-(((f - kF + 0.075) / 0.038) ** 2));
+      r += clothT * 0.34 * cov * Math.exp(-(((f - kF + 0.022) / 0.030) ** 2));
+      // the HEM STACK: denim lands on the shoe and concertinas
+      r += clothT * 0.85 * cov * Math.exp(-(((f - legT + 0.030) / 0.026) ** 2));
+      r += clothT * 0.55 * cov * Math.exp(-(((f - legT + 0.072) / 0.030) ** 2));
       r += clothT * (X.bottom.cuffed ? 0.35 : 0.60) * cov
         * Math.exp(-(((f - legT + 0.010) / 0.012) ** 2));
       if (X.bottom.cuffed) r -= clothT * 0.45 * cov * smoothstep(clamp((f - legT + 0.06) / 0.05, 0, 1));
@@ -6333,7 +6385,7 @@ export async function createRider(ctx, profile = DEFAULT_PROFILE) {
     ...AD.maps, color: 0xffffff, metalness: 0, roughness: 1,
     // The weave and the fold relief only exist in the normal map, so it has to be
     // read at close to full strength or the garment is a flat colour again.
-    normalScale: new THREE.Vector2(1.05, 1.05), envMapIntensity: 0.95,
+    normalScale: new THREE.Vector2(1.15, 1.15), envMapIntensity: 1.14,
     // Cloth sheen: a retroreflective-ish lobe that lifts grazing angles, which is
     // what separates a woven garment from painted plastic at a silhouette edge.
     // 0.55 with a light sheen colour washed every garment pale at grazing angles
