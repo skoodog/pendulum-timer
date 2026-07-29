@@ -4586,6 +4586,42 @@ const _g = (x, s) => Math.exp(-((x / s) * (x / s)));
  * Brow, sockets, cheekbones, nose, lips, chin, mandible and occiput are all real
  * displacement — the paint only shades what the skull already does.
  */
+// Measured male SAGITTAL PROFILE — the forward reach of the midline of the face at
+// every head height, in units of R, with the nose left out (it is a separate ridge
+// laid on top). A head parameterised as an ellipsoid puts the chin at a pole where
+// the ring radius has already gone to nothing, which is why every earlier pass had
+// the mouth 38 mm and the chin 45 mm behind where they belong: the lower face was
+// literally falling off the back of the sphere. Driving the front of the head onto
+// this curve is what turns the profile from a balloon with a beak into a face.
+const SAGZ = [
+  [0.000, 0.240], [0.030, 0.700], [0.062, 0.888], [0.100, 0.938],
+  [0.160, 0.970], [0.240, 0.996], [0.310, 1.012], [0.400, 1.020],
+  [0.480, 1.020], [0.560, 1.012], [0.615, 1.020], [0.680, 1.008],
+  [0.760, 0.944], [0.830, 0.842], [0.900, 0.658], [0.955, 0.396],
+  [1.000, 0.000],
+]
+
+// Catmull-Rom through the knots. A per-segment smoothstep looked right in the
+// numbers and rendered as a stack of horizontal terraces across the cheeks: the
+// slope drops to zero at every knot, and the eye reads each of those as an edge.
+function sagittalZ(t) {
+  const n = SAGZ.length;
+  if (t <= SAGZ[0][0]) return SAGZ[0][1];
+  if (t >= SAGZ[n - 1][0]) return SAGZ[n - 1][1];
+  let i = 1;
+  while (i < n - 1 && t > SAGZ[i][0]) i++;
+  const p1 = SAGZ[i - 1], p2 = SAGZ[i];
+  const p0 = SAGZ[Math.max(0, i - 2)], p3 = SAGZ[Math.min(n - 1, i + 1)];
+  const h = p2[0] - p1[0];
+  const u = clamp((t - p1[0]) / h, 0, 1);
+  // finite-difference tangents, scaled into this segment's parameter
+  const m1 = (p2[1] - p0[1]) / Math.max(1e-6, p2[0] - p0[0]) * h;
+  const m2 = (p3[1] - p1[1]) / Math.max(1e-6, p3[0] - p1[0]) * h;
+  const u2 = u * u, u3 = u2 * u;
+  return (2 * u3 - 3 * u2 + 1) * p1[1] + (u3 - 2 * u2 + u) * m1
+    + (-2 * u3 + 3 * u2) * p2[1] + (u3 - u2) * m2;
+}
+
 function headSurface(a, t, R, S) {
   const yn = clamp(t * 2 - 1, -1, 1);
   const ring = Math.sqrt(Math.max(0, 1 - yn * yn));
@@ -4594,126 +4630,144 @@ function headSurface(a, t, R, S) {
   const sgn = xn < 0 ? -1 : 1;
   const ax = Math.abs(xn);
   const front = clamp((zn - 0.02) / 0.45, 0, 1);           // how face-on this point is
-  let px = xn * 0.822 * R * S.wide;
+  // Head box: 221 mm tall, 152 mm wide, 196 mm deep. The old 0.822 width / 1.005
+  // depth gave a 170 x 215 mm head — a beach ball with a face drawn on the front.
+  let px = xn * 0.735 * R * S.wide;
   let py = yn * 1.128 * R;
-  let pz = zn * 1.005 * R;
+  let pz = zn * 0.905 * R;
+  let frontZ = ring * 0.905 * R;      // where the raw ellipsoid reaches on the midline
 
   // A SKULL IS AN EGG IN PLAN, NOT A CIRCLE. Widest just behind the ear, then
   // tapering hard into the face so there is a real plane change from the side of
   // the head to the cheek. Without this the cheek was one unbroken dome running
   // from the nose all the way back to the ear, and no amount of paint could stop
   // the head reading as a potato with a picture on the front of it.
-  px *= 1 - 0.255 * Math.pow(Math.max(0, zn), 1.7) - 0.120 * Math.pow(Math.max(0, -zn), 2.6);
+  px *= 1 - 0.275 * Math.pow(Math.max(0, zn), 1.6) - 0.130 * Math.pow(Math.max(0, -zn), 2.6);
 
   // --- cranium ---------------------------------------------------------------
-  if (yn > 0.42) {                                          // dome narrows and flattens
-    const k = (yn - 0.42) / 0.58;
-    px *= 1 - 0.20 * k * k;
-    pz *= 1 - 0.13 * k * k;
-    py -= k * k * 0.050 * R;
+  if (yn > 0.38) {                                          // dome narrows and flattens
+    const k = (yn - 0.38) / 0.62;
+    px *= 1 - 0.19 * k * k;
+    pz *= 1 - 0.15 * k * k;
+    frontZ *= 1 - 0.15 * k * k;
+    py -= k * k * 0.058 * R;
   }
   // the back of the skull is a plane, not a ball
   pz += Math.max(0, -zn - 0.55) * _g(yn - 0.35, 0.55) * 0.10 * R;
-  pz -= Math.max(0, -zn) * _g(yn - 0.14, 0.40) * 0.022 * R;                        // occiput
+  pz -= Math.max(0, -zn) * _g(yn - 0.14, 0.40) * 0.026 * R;                        // occiput
+
+  // --- drive the front of the head onto the measured profile ------------------
+  if (frontZ > 1e-5) {
+    const kz = (sagittalZ(t) * R) / frontZ;
+    pz *= lerp(1, kz, Math.pow(clamp(ca, 0, 1), 0.80));
+  }
+
   // temple hollow, above and behind the outer end of the brow. This is the
   // landmark that tells the eye where the skull stops and the face starts.
   const temple = _g(yn - 0.285, 0.185) * _g(ax - 0.700, 0.255) * clamp(0.30 + zn * 1.05, 0, 1);
-  px -= sgn * temple * 0.078 * R;
+  px -= sgn * temple * 0.070 * R;
   pz -= temple * 0.016 * R;
   // zygomatic arch: a bony bridge running back from the cheekbone to the ear
   const arch = _g(yn + 0.075, 0.100) * _g(ax - 0.795, 0.225) * clamp(0.50 + zn * 0.9, 0, 1);
-  px += sgn * arch * 0.046 * R;
+  px += sgn * arch * 0.050 * R;
 
   // --- mandible --------------------------------------------------------------
-  const jl = clamp((-0.20 - yn) / 0.72, 0, 1);
-  px *= 1 - (0.40 + 0.14 * (1 - S.jaw)) * Math.pow(jl, 1.55);
-  // 0.14 pulled the whole lower face 14 % back toward the neck, which is what
-  // buried the chin behind the lips and gave the rider no profile at all.
-  pz *= 1 - 0.055 * Math.pow(jl, 2.1);
+  // The jaw keeps its width down to the gonial angle and only then turns in to
+  // the chin: a taper that starts at the cheek is what makes an egg, not a head.
+  const jl = clamp((-0.34 - yn) / 0.64, 0, 1);
+  px *= 1 - (0.20 + 0.13 * (1 - S.jaw)) * Math.pow(jl, 2.6);
   // masseter: the side of the jaw is a flat plane, and the hollow above it under
   // the arch is the whole difference between a jaw and a cheek
   const mass = _g(yn + 0.400, 0.230) * _g(ax - 0.700, 0.290) * clamp(0.35 + zn * 0.8, 0, 1);
-  px -= sgn * mass * 0.032 * R;
-  if (yn < -0.70) {                                         // soft under-jaw plane
-    // 0.62 flattened this into a hard-edged shelf, and the ridge where it met the
-    // cheek read as a seam right where the jaw silhouette matters most.
-    const k = smoothstep(clamp((-0.70 - yn) / 0.30, 0, 1));
-    py = lerp(py, -0.90 * 1.128 * R, k * 0.44);
-    pz -= Math.max(0, -zn) * k * 0.12 * R;                  // clear the neck at the back
+  px -= sgn * mass * 0.026 * R;
+  if (yn < -0.72) {                                         // flat plane under the jaw
+    const k = smoothstep(clamp((-0.72 - yn) / 0.28, 0, 1));
+    py = lerp(py, -0.925 * 1.128 * R, k * 0.60);
+    pz -= Math.max(0, -zn) * k * 0.13 * R;                  // clear the neck at the back
   }
-  const gon = _g(yn + 0.60, 0.18) * _g(ax - 0.62, 0.30) * _g(zn + 0.05, 0.55);
-  px += sgn * gon * 0.045 * R * S.jaw;                      // gonial angle
+  const gon = _g(yn + 0.600, 0.180) * _g(ax - 0.60, 0.30) * _g(zn + 0.02, 0.55);
+  px += sgn * gon * 0.090 * R * S.jaw;                      // gonial angle
+  pz -= gon * 0.014 * R;
   // the mandible edge itself — a defined line from the chin back to the jaw angle
-  const jawEdge = _g(yn + 0.78, 0.115) * Math.max(0, zn + 0.35) * (0.4 + 0.6 * front);
-  px += sgn * jawEdge * 0.034 * R * S.jaw;
-  pz += jawEdge * 0.012 * R * S.jaw;
+  const jawEdge = _g(yn + 0.800, 0.100) * Math.max(0, zn + 0.30) * (0.35 + 0.65 * front);
+  px += sgn * jawEdge * 0.040 * R * S.jaw;
+  py -= jawEdge * 0.012 * R;
 
   // --- chin ------------------------------------------------------------------
-  const chin = _g(yn + 0.875, 0.17) * Math.max(0, zn) * _g(xn, 0.34);
-  pz += chin * 0.185 * R * S.jaw;
-  py -= chin * 0.018 * R;
-  pz += _g(yn + 0.86, 0.10) * _g(xn, 0.17) * Math.max(0, zn) * 0.046 * R;   // chin button
-  pz -= _g(yn + 0.739, 0.075) * _g(xn, 0.26) * front * 0.042 * R;           // mentolabial crease
+  // the mask carries the chin out; these are the landmarks that live on it
+  pz += _g(yn + 0.855, 0.100) * _g(xn, 0.150) * front * 0.036 * R * S.jaw;   // chin button
+  px += sgn * _g(yn + 0.845, 0.120) * _g(ax - 0.185, 0.095) * front * 0.026 * R;  // chin corners
+  pz -= _g(yn + 0.726, 0.055) * _g(xn, 0.26) * front * 0.038 * R;            // mentolabial crease
 
   // --- mouth -----------------------------------------------------------------
-  const lipC = _g(xn, 0.40) * front;
-  pz += _g(yn + 0.55, 0.150) * lipC * 0.030 * R;            // the whole muzzle sits proud
-  pz += _g(yn + 0.549, 0.048) * lipC * 0.044 * R;           // upper lip
-  pz += _g(yn + 0.630, 0.052) * lipC * 0.052 * R;           // lower lip
-  pz -= _g(yn + 0.585, 0.019) * lipC * 0.040 * R;           // mouth line
-  pz -= _g(yn + 0.450, 0.042) * _g(xn, 0.060) * front * 0.022 * R;          // philtrum
+  const lipC = _g(xn, 0.215) * front;
+  pz += _g(yn + 0.545, 0.048) * lipC * 0.042 * R;                   // upper lip roll
+  pz += _g(yn + 0.638, 0.054) * lipC * 0.050 * R;                   // lower lip roll
+  pz -= _g(yn + 0.590, 0.022) * lipC * 0.040 * R;                   // the mouth line itself
+  // the corners of the mouth tuck in — without this the lips run off the face
+  pz -= _g(yn + 0.585, 0.070) * _g(ax - 0.275, 0.080) * front * 0.026 * R;
+  pz -= _g(yn + 0.455, 0.036) * _g(xn, 0.052) * front * 0.024 * R;             // philtrum
+  px += sgn * _g(yn + 0.455, 0.042) * _g(ax - 0.052, 0.028) * front * 0.009 * R; // philtral ridge
 
   // --- nose ------------------------------------------------------------------
-  // A swept ridge: half-width and forward reach both vary from root to base, and
-  // the cross-section is a rounded triangle, which is what gives a real nose its
-  // shadow line down each side instead of a painted stripe.
-  const nh = clamp((0.193 - yn) / 0.579, -0.4, 1.6);        // 0 at the root, 1 at the base
-  if (nh > -0.30 && nh < 1.45 && zn > -0.1) {
-    const halfW = lerp(0.075, 0.230, smoothstep(clamp(nh, 0, 1)));
-    const p = ax / halfW;
-    const across = Math.exp(-Math.pow(p, 2.5) * 1.35);
-    const along = smoothstep(clamp((nh + 0.06) / 0.26, 0, 1))
-      * (1 - smoothstep(clamp((nh - 0.96) / 0.26, 0, 1)));
-    const fwd = lerp(0.046, 0.298, smoothstep(clamp((nh - 0.10) / 0.66, 0, 1)));
+  // A swept ridge sitting ON the face mask: half-width and forward reach both vary
+  // from root to base, and the cross-section is a rounded triangle, which is what
+  // gives a real nose its shadow line down each side instead of a painted stripe.
+  // u = 0 at the nasion (t 0.552), 0.89 at the tip, 1 at the base. Parameterising
+  // off the real landmarks stopped the ridge starting ABOVE the brow, which is
+  // what made every earlier nose read as a blade growing out of the forehead.
+  const u = (0.552 - t) / 0.245;
+  if (u > -0.16 && u < 1.55 && zn > -0.1) {
+    const halfW = lerp(0.072, 0.200, smoothstep(clamp(u, 0, 1)));
+    const across = Math.exp(-Math.pow(ax / halfW, 2.2) * 1.25);
+    const along = smoothstep(clamp(u / 0.34, 0, 1))
+      * (1 - smoothstep(clamp((u - 0.98) / 0.24, 0, 1)));
+    // the dorsum is close to a straight line from nasion to tip
+    const fwd = lerp(0.008, 0.132, smoothstep(clamp(u / 0.88, 0, 1)));
     pz += along * across * fwd * R * front;
     // the tip is a ball of cartilage, not the end of a wedge
-    pz += _g(nh - 0.90, 0.115) * _g(ax, 0.110) * front * 0.046 * R;
+    pz += _g(u - 0.86, 0.145) * _g(ax, 0.135) * front * 0.052 * R;
+    py -= _g(u - 0.92, 0.11) * _g(ax, 0.11) * front * 0.012 * R;
     // alae flare either side of the tip, nostrils cut in underneath
-    const ala = _g(nh - 0.95, 0.13) * _g(ax - 0.180, 0.085) * front;
-    px += sgn * ala * 0.052 * R;
-    pz += ala * 0.038 * R;
-    const nostril = _g(nh - 1.10, 0.085) * _g(ax - 0.105, 0.055) * front;
+    const ala = _g(u - 0.97, 0.150) * _g(ax - 0.175, 0.088) * front;
+    px += sgn * ala * 0.058 * R;
+    pz += ala * 0.022 * R;
+    const nostril = _g(u - 1.12, 0.075) * _g(ax - 0.100, 0.054) * front;
     pz -= nostril * 0.048 * R;
-    py -= nostril * 0.010 * R;
+    py -= nostril * 0.012 * R;
+    // the nose sits ON the lip, with a shadow line under it
+    pz -= _g(u - 1.25, 0.062) * _g(ax, 0.17) * front * 0.026 * R;
   }
 
   // --- brow, sockets, eyes ---------------------------------------------------
   // The brow ridge and the orbital rim are GEOMETRY, not paint: at a 900 px
   // close-up a painted brow has no self-shadow and the head reads as an egg.
-  // A brow that OVERHANGS. At 0.086 R the ridge was a swelling the light slid
-  // over; the eye needs to sit in shadow under a real shelf.
-  const brow = _g(yn - 0.157, 0.098) * Math.max(0, zn - 0.22) * (0.45 + 0.55 * _g(ax - 0.30, 0.26));
-  pz += brow * 0.128 * R * S.brow;
-  py += brow * 0.013 * R * S.brow;                                                       // rim lip
+  // The ridge overhangs, but only over the eye — a brow that also projects on the
+  // midline buries the root of the nose and gives the rider a caveman shelf.
+  const brow = _g(yn - 0.150, 0.105) * Math.max(0, zn - 0.24)
+    * (0.30 * _g(ax, 0.17) + 0.70 * _g(ax - 0.320, 0.185));
+  pz += brow * 0.070 * R * S.brow;
+  py += brow * 0.008 * R * S.brow;                                                       // rim lip
+  // the nasion notch is a MIDLINE feature — put it in the sagittal table and it
+  // becomes a horizontal ledge running from temple to temple
+  pz -= _g(yn - 0.096, 0.040) * _g(ax, 0.075) * Math.max(0, zn - 0.35) * 0.038 * R;
   const eyeX = ax - 0.315;
   // orbital cavity, then the GLOBE as a spherical cap seated inside it — the
   // socket has to be deeper than the eye is proud or the eye is a sticker.
-  pz -= _g(yn - 0.020, 0.115) * _g(eyeX, 0.180) * Math.max(0, zn - 0.24) * 0.094 * R;   // socket
-  pz += _g(yn - 0.020, 0.062) * _g(eyeX, 0.092) * Math.max(0, zn - 0.40) * 0.084 * R;   // globe
-  pz -= _g(yn - 0.090, 0.026) * _g(eyeX, 0.086) * Math.max(0, zn - 0.42) * 0.028 * R;   // lid crease
-  // glabella: the bridge between the brows, which is what gives the nose a root
-  pz += _g(yn - 0.150, 0.070) * _g(xn, 0.090) * Math.max(0, zn - 0.40) * 0.026 * R;
+  pz -= _g(yn - 0.020, 0.112) * _g(eyeX, 0.175) * Math.max(0, zn - 0.24) * 0.086 * R;   // socket
+  pz += _g(yn - 0.020, 0.060) * _g(eyeX, 0.090) * Math.max(0, zn - 0.40) * 0.082 * R;   // globe
+  pz -= _g(yn - 0.088, 0.024) * _g(eyeX, 0.084) * Math.max(0, zn - 0.42) * 0.030 * R;   // lid crease
 
   // --- cheeks ----------------------------------------------------------------
-  const zyg = _g(yn + 0.170, 0.135) * _g(ax - 0.560, 0.210) * Math.max(0, zn * 0.65 + 0.35);
-  px += sgn * zyg * 0.058 * R;
-  pz += zyg * 0.026 * R;
-  const hollow = _g(yn + 0.400, 0.150) * _g(ax - 0.450, 0.200) * front;
-  pz -= hollow * 0.056 * R;
-  px -= sgn * hollow * 0.042 * R;
+  const zyg = _g(yn + 0.150, 0.128) * _g(ax - 0.505, 0.190) * Math.max(0, zn * 0.65 + 0.35);
+  px += sgn * zyg * 0.064 * R;
+  pz += zyg * 0.030 * R;
+  const hollow = _g(yn + 0.395, 0.140) * _g(ax - 0.420, 0.180) * front;
+  pz -= hollow * 0.048 * R;
+  px -= sgn * hollow * 0.036 * R;
   // nasolabial fold, and the soft pad of the cheek beside the mouth
-  pz -= _g(yn + 0.470, 0.070) * _g(ax - 0.225, 0.065) * front * 0.016 * R;
-  pz += _g(yn + 0.560, 0.100) * _g(ax - 0.300, 0.100) * front * 0.008 * R;
+  pz -= _g(yn + 0.480, 0.060) * _g(ax - 0.210, 0.060) * front * 0.022 * R;
+  pz += _g(yn + 0.575, 0.092) * _g(ax - 0.285, 0.092) * front * 0.012 * R;
   return V(px, py, pz);
 }
 
