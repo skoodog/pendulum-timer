@@ -3363,8 +3363,10 @@ function buildContext(profile, materials) {
   const botCol = splitTone(fabricAlbedo(P.bottom.colour, 0.205), topBody, 0.13);
   // Even a one-colour tee gets a tonal split at the sleeve, the way a real
   // garment does where the sleeve panel catches light differently to the body.
+  // A one-colour tee is ONE colour. A 0.15 lift on the sleeve panel turned every
+  // plain tee into what read as a two-tone raglan across the shoulders.
   const sleeveCol = twoTone ? fabricAlbedo(trim, 0.235)
-    : shade(topBody, lumOf(topBody) > 0.5 ? -0.13 : 0.15);
+    : shade(topBody, lumOf(topBody) > 0.5 ? -0.06 : 0.07);
 
   return {
     P, M, plan,
@@ -3484,20 +3486,19 @@ function buildWheelCore(isRear, AH) {
       const b = wheelPt(sx * 0.0062, rimHole, rimA);
       hw.push(AH.patch(rod(a, b, 0.00135, 0.00125, 6, false), 'SPOKE', 0.2, 0.8));
       const nb = wheelPt(sx * 0.0062, rimHole - 0.0075, rimA);
-      nipples.push(rod(b, nb, 0.0030, 0.0024, 6, true));
+      nipples.push(rod(b, nb, 0.0030, 0.0024, 5, true));
       // eyelet: a ferrule sitting in the rim bed, so the spoke enters something
       const eA = wheelPt(sx * 0.0062, rimHole + 0.0016, rimA);
       const eB = wheelPt(sx * 0.0062, rimHole - 0.0016, rimA);
-      eyelets.push(rod(eA, eB, 0.0040, 0.0040, 6, true));
-      // drilled flange hole
-      const hA = wheelPt(sx * (G.flangeX - 0.0020), G.flangeR - 0.0035, hubA);
-      const hB = wheelPt(sx * (G.flangeX + 0.0026), G.flangeR - 0.0035, hubA);
-      flangeHoles.push(rod(hA, hB, 0.0022, 0.0022, 6, true));
+      eyelets.push(rod(eA, eB, 0.0040, 0.0040, 4, true));
+      // The 36 drilled flange holes cost 1.3 k triangles a wheel and live INSIDE
+      // the hub flange, where no camera in the game can reach them. Budget goes
+      // on the character's silhouette instead.
     }
   }
   hw.push(AH.patch(merge(nipples), 'BRASS'));
   hw.push(AH.patch(merge(eyelets), 'BRASS'));
-  hw.push(AH.patch(merge(flangeHoles), 'STEEL'));
+  void flangeHoles;
 
   // --- valve stem -------------------------------------------------------------
   const va = 0.6;
@@ -4208,15 +4209,12 @@ function buildDrivetrain(AH) {
   }
   // 7.6 mm roller against 9.2 mm plates: it has to sit INSIDE the plate height or
   // consecutive rollers merge into a continuous knurled rod that reads as cable.
-  const roller = new THREE.CylinderGeometry(0.0038, 0.0038, 0.0044, 8);
+  const roller = new THREE.CylinderGeometry(0.0038, 0.0038, 0.0044, 6);
   roller.rotateX(Math.PI / 2);
   linkParts.push(AH.patch(roller, 'STEEL'));
-  for (const s of [-1, 1]) {                        // pin heads, peened proud
-    const pin = new THREE.CylinderGeometry(0.0021, 0.0018, 0.0014, 6);
-    pin.rotateX(Math.PI / 2);
-    pin.translate(0, 0, s * 0.0052);
-    linkParts.push(AH.patch(pin, 'CHROME'));
-  }
+  // The two peened pin heads were 2 mm cylinders repeated ~80 times round the
+  // loop — 3.8 k triangles, more than both hands, on a detail that is under one
+  // pixel at every framing the game actually ships. The plates carry the read.
 
   return {
     hardware: merge(hw), pedals,
@@ -4566,9 +4564,11 @@ function headSurface(a, t, R, S) {
   // the arch is the whole difference between a jaw and a cheek
   const mass = _g(yn + 0.400, 0.230) * _g(ax - 0.700, 0.290) * clamp(0.35 + zn * 0.8, 0, 1);
   px -= sgn * mass * 0.032 * R;
-  if (yn < -0.70) {                                         // flat-ish under-jaw plane
+  if (yn < -0.70) {                                         // soft under-jaw plane
+    // 0.62 flattened this into a hard-edged shelf, and the ridge where it met the
+    // cheek read as a seam right where the jaw silhouette matters most.
     const k = smoothstep(clamp((-0.70 - yn) / 0.30, 0, 1));
-    py = lerp(py, -0.90 * 1.128 * R, k * 0.62);
+    py = lerp(py, -0.90 * 1.128 * R, k * 0.44);
     pz -= Math.max(0, -zn) * k * 0.12 * R;                  // clear the neck at the back
   }
   const gon = _g(yn + 0.60, 0.18) * _g(ax - 0.62, 0.30) * _g(zn + 0.05, 0.55);
@@ -5601,11 +5601,13 @@ function buildRiderBody(pose, boneIndex, X, A) {
   // rider pitched forward over the bars a vertical root pushes its cap out through
   // the back of the shirt as a bare patch on the shoulder.
   push(limb(pose.neck.clone().addScaledVector(pose.lean, -0.055 * hs), pose.head.clone().add(V(0, 0.030 * hs, 0)),
-    neckR * 1.14, neckR * 0.90, {
-      radial: 12, capSegs: 3,
-      // trapezius flare at the base, a slight hollow at the throat
-      mid: (t) => lerp(1.05, 0.97, smoothstep(clamp(t * 1.35, 0, 1))),
-      shape: (t) => [lerp(1.10, 1.00, t), lerp(0.88, 0.98, t)],
+    neckR * 1.16, neckR * 0.86, {
+      radial: 14, capSegs: 3, bodyRings: 5,
+      // trapezius flare at the base, a hollow at the throat, and the pair of
+      // sternocleidomastoid cords running up to behind the ear
+      mid: (t) => lerp(1.06, 0.95, smoothstep(clamp(t * 1.30, 0, 1)))
+        * (1 + 0.05 * Math.exp(-(((t - 0.30) / 0.26) ** 2))),
+      shape: (t) => [lerp(1.12, 0.96, t), lerp(0.86, 1.00, t)],
     }),
   'SKIN', (g) => skinPart(g, boneIndex, 'neck', 'head', pose.neck, pose.head, 0.2, 1.0, 0.85));
 
