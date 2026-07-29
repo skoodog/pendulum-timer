@@ -268,7 +268,7 @@ function capsule2(len, ra, rb, opts = {}) {
     // Without this the u derivative explodes at the pole, the sampler drops to a
     // tiny mip and the joint shows the average of the whole atlas as a grey blob.
     const capR = y < 0 ? ra : y > len ? rb : 0;
-    const k = capR > 1e-6 ? clamp(r / capR, 0, 1) : 1;
+    const k = capR > 1e-6 ? clamp(Math.max(0.22, r / capR), 0, 1) : 1;
     for (let j = 0; j <= radial; j++) {
       // NEGATIVE sweep: u then increases toward the rider's left, so anything
       // painted left-to-right in the atlas reads left-to-right on the body.
@@ -353,10 +353,15 @@ function limbTube(atlas, chain, opts) {
   const live = sections.filter((s) => s.t1 - s.t0 > 1e-4);
   const rings = [];        // { t, rs, ax, na, pinch, sec }
   const r0 = rAt(0), r1 = rAt(1);
+  // The pinch has a FLOOR. At pinch = 0 every vertex on the pole ring carries
+  // u = 0.5, the u derivative blows up, the sampler drops to the smallest mip and
+  // the cap renders as a disc of the region's average colour — a lilac-grey blob
+  // sitting on the wrist and the ankle, which is exactly what the closeup showed.
+  const PINCH0 = 0.22;
   for (let k = 0; k < capSegs; k++) {                 // start cap (excludes t=0)
     const ph = (k / capSegs) * (Math.PI / 2);
     rings.push({ t: 0, rs: Math.sin(ph), ax: -Math.cos(ph) * r0 * capStart,
-      na: -Math.cos(ph), pinch: Math.sin(ph), sec: 0 });
+      na: -Math.cos(ph), pinch: Math.max(PINCH0, Math.sin(ph)), sec: 0 });
   }
   for (let si = 0; si < live.length; si++) {
     const s = live[si];
@@ -368,7 +373,7 @@ function limbTube(atlas, chain, opts) {
   for (let k = capSegs - 1; k >= 0; k--) {            // end cap
     const ph = (k / capSegs) * (Math.PI / 2);
     rings.push({ t: 1, rs: Math.sin(ph), ax: Math.cos(ph) * r1 * capEnd,
-      na: Math.cos(ph), pinch: Math.sin(ph), sec: live.length - 1 });
+      na: Math.cos(ph), pinch: Math.max(PINCH0, Math.sin(ph)), sec: live.length - 1 });
   }
 
   // --- emit ------------------------------------------------------------------
@@ -1961,9 +1966,12 @@ function hairSpeckle(c, x, y, rx, ry, colour, density, alpha) {
  * `out` is +1 toward the outer canthus.
  */
 function drawEye(c, x, y, sx, sy, out, iris, skin) {
-  const W = 15.5 * sx, H = 5.4 * sy;             // half opening: 31 mm × 11 mm
+  const W = 15.5 * sx, H = 5.0 * sy;             // half opening: 31 mm × 10 mm
   const inner = x - out * W, outer = x + out * W;
-  const irisR = 5.9;                             // 11.8 mm iris
+  // 12.4 mm iris in a 10 mm opening, so the LIDS CROP IT top and bottom the way
+  // they do on a real eye. At 11.8 mm in an 11 mm opening the iris floated as a
+  // small disc in a field of white and the eye read as a doll's.
+  const irisR = 6.2;
   const cxi = x + out * 0.6 * sx, cyi = y - 0.4 * sy;
 
   // the lid opening as a path, reused for the fill, the clip and the lash line
@@ -1980,11 +1988,14 @@ function drawEye(c, x, y, sx, sy, out, iris, skin) {
   c.save();
   openPath();
   // sclera: never white — it is a wet grey that darkens into both corners
+  // Value matters more than hue here. The old ramp peaked at 0.90 luminance —
+  // brighter than the lit side of the face — so the eye burned a white slot in
+  // the head at every framing. A sclera under a brow reads at about 0.55.
   const scl = c.createLinearGradient(inner, y, outer, y);
-  scl.addColorStop(0.00, '#9a938c');
-  scl.addColorStop(0.22, '#d9d2c9');
-  scl.addColorStop(0.55, '#e6dfd5');
-  scl.addColorStop(1.00, '#a9a29a');
+  scl.addColorStop(0.00, '#8d857e');
+  scl.addColorStop(0.22, '#c6bdb2');
+  scl.addColorStop(0.55, '#d3cabe');
+  scl.addColorStop(1.00, '#9b9389');
   c.fillStyle = scl; c.fill();
   c.clip();
 
@@ -2018,10 +2029,11 @@ function drawEye(c, x, y, sx, sy, out, iris, skin) {
   c.fillStyle = rgba(shade(iris, 0.75), 0.30);
   c.beginPath(); c.ellipse(cxi, cyi + iry * 0.42, irx * 0.52, iry * 0.36, 0, 0, TAU); c.fill();
   // upper lid shadow across the top third of the eye
-  const ls = c.createLinearGradient(0, y - H * 1.5, 0, y + H * 0.35);
-  ls.addColorStop(0, 'rgba(28,20,16,0.62)');
-  ls.addColorStop(1, 'rgba(28,20,16,0)');
-  c.fillStyle = ls; c.fillRect(inner - W, y - H * 1.6, W * 3, H * 2.2);
+  const ls = c.createLinearGradient(0, y - H * 1.6, 0, y + H * 0.55);
+  ls.addColorStop(0, 'rgba(24,17,14,0.66)');
+  ls.addColorStop(0.55, 'rgba(24,17,14,0.20)');
+  ls.addColorStop(1, 'rgba(24,17,14,0)');
+  c.fillStyle = ls; c.fillRect(inner - W, y - H * 1.8, W * 3, H * 2.6);
   // catchlight last, so nothing dulls it
   c.fillStyle = 'rgba(252,250,244,0.72)';
   c.beginPath();
@@ -2196,9 +2208,19 @@ function riderRegions() {
         const cool = mixc(skin, 0x8d94b0, 0.16);
         const deep = shade(skin, -0.30);
         fill(c, w, h, HEX(skin));
-        blob(c, fx(0.5), fy(0.66), w * 0.150, h * 0.115, rgba(cool, 0.42), 0.95);
-        blob(c, fx(0.5), fy(0.40), w * 0.135, h * 0.115, rgba(warm, 0.40), 0.95);
-        blob(c, fx(0.5), fy(0.150), w * 0.115, h * 0.090, rgba(cool, 0.30), 0.95);
+        // THE THREE ZONES OF A MALE FACE, and they have to be worth seeing: a
+        // cool, slightly darker forehead under the hairline, a warm flushed
+        // mid-face over the nose and cheekbones, and a cool desaturated lower
+        // third where the beard grows. At the old alphas the whole head was one
+        // orange swatch, which is most of why the skin read as painted plastic.
+        blob(c, fx(0.5), fy(0.70), w * 0.165, h * 0.120, rgba(mixc(cool, 0x2a2c33, 0.16), 0.52), 0.95);
+        blob(c, fx(0.5), fy(0.40), w * 0.140, h * 0.120, rgba(warm, 0.52), 0.95);
+        blob(c, fx(0.5), fy(0.150), w * 0.150, h * 0.105, rgba(mixc(cool, 0x6d6f78, 0.30), 0.44), 0.95);
+        // the jaw plane itself, from the chin back to the gonial angle
+        for (const sgn of [-1, 1]) {
+          blob(c, fx(0.5 + sgn * 0.155), fy(0.135), w * 0.085, h * 0.070,
+            rgba(mixc(cool, 0x60636d, 0.34), 0.34), 0.9);
+        }
         for (const sgn of [-1, 1]) {
           blob(c, fx(0.5 + sgn * 0.105), fy(0.395), w * 0.075, h * 0.070, rgba(warm, 0.34), 0.95);
           blob(c, fx(0.5 + sgn * FL.earU), fy(FL.earMid), w * 0.040, h * 0.070, rgba(warm, 0.45), 0.95);
@@ -5650,7 +5672,7 @@ function buildFist(wrist, barDir, handR, glove, barR, gripPoint, side) {
       g = Math.max(g, gs(s - mid, 0.052));
     }
     // widen and deepen toward the tips, where the fingers are furthest apart
-    return g * open * (0.30 + 0.16 * smoothstep(clamp((a - 60) / 110, 0, 1)));
+    return g * open * (0.27 + 0.11 * smoothstep(clamp((a - 60) / 110, 0, 1)));
   };
 
   const NS = 30, NA = 38;
@@ -5999,7 +6021,7 @@ function buildRiderBody(pose, boneIndex, X, A) {
     // Overlap the torso by well over one local radius so the two shells can never
     // separate into a visible junction, whatever the animator does to the arm.
     const rootExt = rShoulder * 1.45;
-    const tipExt = rWrist * 0.55;
+    const tipExt = rWrist * 1.15;
     const armRoot = sh.clone().addScaledVector(dSE, -rootExt);
     const armTip = wr.clone().addScaledVector(dEW, tipExt);
     const lSE = sh.distanceTo(el), lEW = el.distanceTo(wr);
@@ -6080,7 +6102,14 @@ function buildRiderBody(pose, boneIndex, X, A) {
     }
     if (!secs.length) secs.push({ key: sleeveKey, t0: 0, t1: 1 });
 
-    const arm = limbTube(A, [armRoot, sh, el, armTip], {
+    // A four-point Catmull-Rom rounds the elbow off into a banana. Two extra
+    // knots ON the humerus and ON the ulna, a tenth of a segment either side of
+    // the joint, hold the curve against the straight bones so the elbow is an
+    // ANGLE — which is the difference between an arm and a hose.
+    const eps = Math.min(lSE, lEW) * 0.11;
+    const arm = limbTube(A, [armRoot, sh,
+      el.clone().addScaledVector(dSE, -eps), el, el.clone().addScaledVector(dEW, eps),
+      armTip], {
       radial: 16, stepsPer: 12, zDir: LEFT,
       radius: armRadius, shape: armShape, sections: secs,
       capStart: 0.55, capEnd: 0.30, capSegs: 4,
@@ -6195,7 +6224,10 @@ function buildRiderBody(pose, boneIndex, X, A) {
     }
     if (!secs.length) secs.push({ key: 'BOTTOM', t0: 0, t1: 1 });
 
-    const leg = limbTube(A, [legRoot, hp, kn, legTip], {
+    const kEps = Math.min(lHK, lKA) * 0.11;
+    const leg = limbTube(A, [legRoot, hp,
+      kn.clone().addScaledVector(dHK, -kEps), kn, kn.clone().addScaledVector(dKA, kEps),
+      legTip], {
       radial: 16, stepsPer: 12, zDir: LEFT,
       radius: legRadius, shape: legShape, sections: secs,
       capStart: 0.45, capEnd: 0.35, capSegs: 4,
