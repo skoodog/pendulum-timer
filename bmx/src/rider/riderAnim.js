@@ -150,9 +150,25 @@ const PIVOT_BARS = [0, 0.94, 0.28];
 
 const POSES = {
   // ----------------------------------------------------------------- riding
-  ride: {},
-  pedal: { hips: [0.03, 0, 0], chest: [0.02, 0, 0], neck: [-0.04, 0, 0] },
-  roll: { hips: [0.02, 0, 0] },
+  // Not the bind pose. A rider at speed carries weight FORWARD over the bars:
+  // hips back off the seat, back rounded, chest down, head up looking down the
+  // line rather than at the stem. The small y/z offsets on neck and head break
+  // the left-right symmetry that otherwise reads as a mannequin.
+  ride: {
+    root: [0, -0.030, 0.028],
+    hips: [0.115, 0, 0], spine: [0.045, 0, 0.010], chest: [0.075, -0.020, 0],
+    neck: [-0.175, 0.030, -0.015], head: [-0.045, 0.055, 0.010],
+  },
+  pedal: {
+    root: [0, -0.035, 0.034],
+    hips: [0.145, 0, 0], spine: [0.055, 0, 0.012], chest: [0.095, -0.025, 0],
+    neck: [-0.205, 0.035, -0.018], head: [-0.050, 0.060, 0.012],
+  },
+  roll: {
+    root: [0, -0.022, 0.020],
+    hips: [0.090, 0, 0], spine: [0.035, 0, 0.008], chest: [0.058, -0.015, 0],
+    neck: [-0.140, 0.025, -0.012], head: [-0.035, 0.045, 0.008],
+  },
 
   // Root offsets here are deltas on top of the RESOLVED stance (see solveStance):
   // the stance already owns "how far the pelvis is off the saddle", so a crouch
