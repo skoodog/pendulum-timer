@@ -2225,31 +2225,42 @@ function riderRegions() {
         for (const sgn of [-1, 1]) {
           // inner ends 9 mm off centre, not 5: at 5 the two brows nearly met and
           // read as a unibrow at any distance where the face was legible at all
-          const x0 = mx(sgn * 9), x1 = mx(sgn * 24), x2 = mx(sgn * 38);
-          const y0 = fy(FL.brow - 0.008), y1 = fy(FL.brow + 0.016), y2 = fy(FL.brow + 0.002);
+          // A real brow is ~48 mm long and 6 mm deep. The old one ran 9 → 38 mm
+          // with 4.4 mm of solid stroke and 120 near-VERTICAL 6 mm hairs on top,
+          // which is 29 mm of black comb sitting on the brow ridge — the single
+          // crudest mark on the face at closeup framing.
+          const x0 = mx(sgn * 9), x1 = mx(sgn * 33), x2 = mx(sgn * 52);
+          const y0 = fy(FL.brow - 0.004), y1 = fy(FL.brow + 0.015), y2 = fy(FL.brow - 0.014);
+          const bAt = (t) => {
+            const it = 1 - t;
+            return [it * it * x0 + 2 * it * t * x1 + t * t * x2,
+              it * it * y0 + 2 * it * t * y1 + t * t * y2];
+          };
           c.save();
-          // The brow is the strongest value in a face read at distance. At 0.55
-          // alpha over a mid skin tone it sat barely 0.1 luminance below the
-          // cheek and vanished the moment the exposure dropped.
-          c.globalAlpha = 0.74;
-          c.strokeStyle = HEX(shade(browC, -0.40));
-          c.lineWidth = 4.4 * sy; c.lineCap = 'round';
-          c.beginPath(); c.moveTo(x0, y0); c.quadraticCurveTo(x1, y1, x2, y2); c.stroke();
+          // The brow is the strongest value in a face read at distance, but it is
+          // a MASS of hair, not a drawn line: a soft body under fine strokes.
+          c.globalAlpha = 0.46;
+          c.strokeStyle = HEX(shade(browC, -0.30));
+          c.lineCap = 'round'; c.lineJoin = 'round';
+          for (const [wid, al] of [[5.6, 0.45], [3.4, 0.75]]) {
+            c.globalAlpha = al * 0.62;
+            c.lineWidth = wid * sy;
+            c.beginPath(); c.moveTo(x0, y0); c.quadraticCurveTo(x1, y1, x2, y2); c.stroke();
+          }
           c.restore();
-          // individual hairs, sweeping up from the inner end and down at the tail
+          // hairs lie ALONG the brow, sweeping up at the head and down at the tail
           c.lineCap = 'round';
-          for (let i = 0; i < 120; i++) {
-            const t = i / 119;
-            const bx = x0 + (x2 - x0) * t;
-            const by = y0 + (y1 - y0) * 4 * t * (1 - t) + (y2 - y0) * t * t;
-            const jx = rand(-1.4, 1.4) * sx, jy = rand(-2.2, 2.2) * sy;
-            const len = lerp(4.2, 6.5, 1 - t) * sy;
-            const ang = lerp(-1.15, -0.15, t) * (sgn > 0 ? 1 : -1);
-            c.strokeStyle = rgba(rng() < 0.5 ? shade(browC, 0.22) : shade(browC, -0.30), rand(0.45, 0.9));
-            c.lineWidth = rand(0.7, 1.5) * sy;
+          for (let i = 0; i < 150; i++) {
+            const t = Math.pow(i / 149, 0.92);
+            const [bx, by] = bAt(t);
+            const jx = rand(-1.6, 1.6) * sx, jy = rand(-2.4, 2.4) * sy * lerp(1.15, 0.7, t);
+            const len = lerp(6.0, 3.4, t) * sx;
+            const rise = lerp(-0.62, 0.30, t) + rand(-0.16, 0.16);
+            c.strokeStyle = rgba(rng() < 0.45 ? shade(browC, 0.26) : shade(browC, -0.32), rand(0.30, 0.72));
+            c.lineWidth = rand(0.5, 1.05) * sy;
             c.beginPath();
             c.moveTo(bx + jx, by + jy);
-            c.lineTo(bx + jx + Math.cos(ang) * len * sgn * 0.9, by + jy - Math.abs(Math.sin(ang)) * len * 0.55);
+            c.lineTo(bx + jx + len * sgn, by + jy + rise * len * (sy / sx));
             c.stroke();
           }
         }
@@ -2282,9 +2293,9 @@ function riderRegions() {
           c.restore();
           blob(c, mx(sgn * 15), fy(FL.noseTip - 0.008), 5.0 * sx, 4.4 * sy,
             rgba(shade(skin, -0.34), 0.36), 0.92);          // ala shadow
-          c.fillStyle = rgba(0x1a1210, 0.82);
+          c.fillStyle = rgba(0x1a1210, 0.58);
           c.beginPath();
-          c.ellipse(mx(sgn * 8.4), fy(FL.noseBase - 0.004), 3.0 * sx, 2.1 * sy, sgn * 0.55, 0, TAU);
+          c.ellipse(mx(sgn * 8.4), fy(FL.noseBase - 0.006), 2.5 * sx, 1.7 * sy, sgn * 0.55, 0, TAU);
           c.fill();
           c.fillStyle = rgba(shade(skin, 0.30), 0.30);
           c.beginPath();
@@ -2295,7 +2306,10 @@ function riderRegions() {
         blob(c, fx(0.5), fy(FL.noseTip + 0.028), 3.0 * sx, 8.0 * sy, rgba(shade(skin, 0.24), 0.20), 0.9);
 
         // --- mouth ------------------------------------------------------------
-        const lip = mixc(skin, 0xa8514a, 0.34);
+        // Lips are SKIN with a little more blood in it, not a colour of their
+        // own: at a 0.34 mix over a 0.8 alpha fill the mouth read as a painted-on
+        // brown patch — the one mark that made the whole head look like a mask.
+        const lip = mixc(skin, 0xa8514a, X.M && X.M.gender === 'female' ? 0.26 : 0.17);
         const mw = FL.mouthW * w, my = fy(FL.mouth);
         const lipTopY = fy(FL.lipTop), lipLowY = fy(FL.lipLow);
         c.save();
@@ -2308,20 +2322,20 @@ function riderRegions() {
         c.quadraticCurveTo(fx(0.5) - mw * 0.55, lipLowY, fx(0.5) - mw, my);
         c.closePath();
         const lg = c.createLinearGradient(0, lipTopY, 0, lipLowY);
-        lg.addColorStop(0.00, rgba(shade(lip, -0.22), 0.72));
-        lg.addColorStop(0.48, rgba(shade(lip, -0.30), 0.78));
-        lg.addColorStop(0.62, rgba(lip, 0.80));
-        lg.addColorStop(1.00, rgba(shade(lip, 0.10), 0.72));
+        lg.addColorStop(0.00, rgba(shade(lip, -0.20), 0.40));
+        lg.addColorStop(0.48, rgba(shade(lip, -0.26), 0.46));
+        lg.addColorStop(0.62, rgba(lip, 0.48));
+        lg.addColorStop(1.00, rgba(shade(lip, 0.12), 0.36));
         c.fillStyle = lg; c.fill();
         c.clip();
-        for (let i = 0; i < 60; i++) {                        // lip creases
+        for (let i = 0; i < 34; i++) {                        // lip creases
           const lx = fx(0.5) + rand(-mw, mw);
-          c.strokeStyle = rgba(shade(lip, -0.45), rand(0.10, 0.28));
-          c.lineWidth = rand(0.6, 1.4) * sx;
+          c.strokeStyle = rgba(shade(lip, -0.40), rand(0.05, 0.13));
+          c.lineWidth = rand(0.5, 1.0) * sx;
           c.beginPath(); c.moveTo(lx, lipTopY); c.lineTo(lx + rand(-1, 1) * sx, lipLowY); c.stroke();
         }
         c.restore();
-        c.strokeStyle = rgba(shade(lip, -0.68), 0.70);        // the mouth line itself
+        c.strokeStyle = rgba(shade(lip, -0.62), 0.58);        // the mouth line itself
         c.lineWidth = 1.1 * sy; c.lineCap = 'round';
         c.beginPath();
         c.moveTo(fx(0.5) - mw * 0.96, my + 0.7 * sy);
@@ -4512,6 +4526,13 @@ function headSurface(a, t, R, S) {
   let py = yn * 1.128 * R;
   let pz = zn * 1.005 * R;
 
+  // A SKULL IS AN EGG IN PLAN, NOT A CIRCLE. Widest just behind the ear, then
+  // tapering hard into the face so there is a real plane change from the side of
+  // the head to the cheek. Without this the cheek was one unbroken dome running
+  // from the nose all the way back to the ear, and no amount of paint could stop
+  // the head reading as a potato with a picture on the front of it.
+  px *= 1 - 0.255 * Math.pow(Math.max(0, zn), 1.7) - 0.120 * Math.pow(Math.max(0, -zn), 2.6);
+
   // --- cranium ---------------------------------------------------------------
   if (yn > 0.42) {                                          // dome narrows and flattens
     const k = (yn - 0.42) / 0.58;
@@ -4521,13 +4542,26 @@ function headSurface(a, t, R, S) {
   }
   // the back of the skull is a plane, not a ball
   pz += Math.max(0, -zn - 0.55) * _g(yn - 0.35, 0.55) * 0.10 * R;
-  px *= 1 - 0.050 * _g(yn - 0.40, 0.20) * Math.max(0, 1 - Math.abs(zn) * 1.15);   // temples
   pz -= Math.max(0, -zn) * _g(yn - 0.14, 0.40) * 0.022 * R;                        // occiput
+  // temple hollow, above and behind the outer end of the brow. This is the
+  // landmark that tells the eye where the skull stops and the face starts.
+  const temple = _g(yn - 0.285, 0.185) * _g(ax - 0.700, 0.255) * clamp(0.30 + zn * 1.05, 0, 1);
+  px -= sgn * temple * 0.078 * R;
+  pz -= temple * 0.016 * R;
+  // zygomatic arch: a bony bridge running back from the cheekbone to the ear
+  const arch = _g(yn + 0.075, 0.100) * _g(ax - 0.795, 0.225) * clamp(0.50 + zn * 0.9, 0, 1);
+  px += sgn * arch * 0.046 * R;
 
   // --- mandible --------------------------------------------------------------
   const jl = clamp((-0.20 - yn) / 0.72, 0, 1);
   px *= 1 - (0.40 + 0.14 * (1 - S.jaw)) * Math.pow(jl, 1.55);
-  pz *= 1 - 0.14 * Math.pow(jl, 2.1);
+  // 0.14 pulled the whole lower face 14 % back toward the neck, which is what
+  // buried the chin behind the lips and gave the rider no profile at all.
+  pz *= 1 - 0.055 * Math.pow(jl, 2.1);
+  // masseter: the side of the jaw is a flat plane, and the hollow above it under
+  // the arch is the whole difference between a jaw and a cheek
+  const mass = _g(yn + 0.400, 0.230) * _g(ax - 0.700, 0.290) * clamp(0.35 + zn * 0.8, 0, 1);
+  px -= sgn * mass * 0.032 * R;
   if (yn < -0.70) {                                         // flat-ish under-jaw plane
     const k = smoothstep(clamp((-0.70 - yn) / 0.30, 0, 1));
     py = lerp(py, -0.90 * 1.128 * R, k * 0.62);
@@ -4542,9 +4576,9 @@ function headSurface(a, t, R, S) {
 
   // --- chin ------------------------------------------------------------------
   const chin = _g(yn + 0.875, 0.17) * Math.max(0, zn) * _g(xn, 0.34);
-  pz += chin * 0.115 * R * S.jaw;
-  py -= chin * 0.014 * R;
-  pz += _g(yn + 0.86, 0.10) * _g(xn, 0.17) * Math.max(0, zn) * 0.030 * R;   // chin button
+  pz += chin * 0.185 * R * S.jaw;
+  py -= chin * 0.018 * R;
+  pz += _g(yn + 0.86, 0.10) * _g(xn, 0.17) * Math.max(0, zn) * 0.046 * R;   // chin button
   pz -= _g(yn + 0.739, 0.075) * _g(xn, 0.26) * front * 0.042 * R;           // mentolabial crease
 
   // --- mouth -----------------------------------------------------------------
@@ -4566,37 +4600,43 @@ function headSurface(a, t, R, S) {
     const across = Math.exp(-Math.pow(p, 2.5) * 1.35);
     const along = smoothstep(clamp((nh + 0.06) / 0.26, 0, 1))
       * (1 - smoothstep(clamp((nh - 0.96) / 0.26, 0, 1)));
-    const fwd = lerp(0.034, 0.228, smoothstep(clamp((nh - 0.10) / 0.66, 0, 1)));
+    const fwd = lerp(0.046, 0.298, smoothstep(clamp((nh - 0.10) / 0.66, 0, 1)));
     pz += along * across * fwd * R * front;
+    // the tip is a ball of cartilage, not the end of a wedge
+    pz += _g(nh - 0.90, 0.115) * _g(ax, 0.110) * front * 0.046 * R;
     // alae flare either side of the tip, nostrils cut in underneath
-    const ala = _g(nh - 0.95, 0.13) * _g(ax - 0.180, 0.080) * front;
-    px += sgn * ala * 0.036 * R;
-    pz += ala * 0.026 * R;
-    const nostril = _g(nh - 1.09, 0.09) * _g(ax - 0.110, 0.060) * front;
-    pz -= nostril * 0.032 * R;
-    py -= nostril * 0.006 * R;
+    const ala = _g(nh - 0.95, 0.13) * _g(ax - 0.180, 0.085) * front;
+    px += sgn * ala * 0.052 * R;
+    pz += ala * 0.038 * R;
+    const nostril = _g(nh - 1.10, 0.085) * _g(ax - 0.105, 0.055) * front;
+    pz -= nostril * 0.048 * R;
+    py -= nostril * 0.010 * R;
   }
 
   // --- brow, sockets, eyes ---------------------------------------------------
   // The brow ridge and the orbital rim are GEOMETRY, not paint: at a 900 px
   // close-up a painted brow has no self-shadow and the head reads as an egg.
-  const brow = _g(yn - 0.157, 0.105) * Math.max(0, zn - 0.22) * (0.50 + 0.50 * _g(ax - 0.30, 0.27));
-  pz += brow * 0.086 * R * S.brow;
-  py += brow * 0.010 * R * S.brow;                                                       // rim lip
+  // A brow that OVERHANGS. At 0.086 R the ridge was a swelling the light slid
+  // over; the eye needs to sit in shadow under a real shelf.
+  const brow = _g(yn - 0.157, 0.098) * Math.max(0, zn - 0.22) * (0.45 + 0.55 * _g(ax - 0.30, 0.26));
+  pz += brow * 0.128 * R * S.brow;
+  py += brow * 0.013 * R * S.brow;                                                       // rim lip
   const eyeX = ax - 0.315;
-  pz -= _g(yn - 0.030, 0.100) * _g(eyeX, 0.170) * Math.max(0, zn - 0.28) * 0.058 * R;   // socket
-  pz += _g(yn - 0.025, 0.065) * _g(eyeX, 0.100) * Math.max(0, zn - 0.42) * 0.036 * R;   // globe
-  pz -= _g(yn - 0.090, 0.028) * _g(eyeX, 0.090) * Math.max(0, zn - 0.42) * 0.020 * R;   // lid crease
+  // orbital cavity, then the GLOBE as a spherical cap seated inside it — the
+  // socket has to be deeper than the eye is proud or the eye is a sticker.
+  pz -= _g(yn - 0.020, 0.115) * _g(eyeX, 0.180) * Math.max(0, zn - 0.24) * 0.094 * R;   // socket
+  pz += _g(yn - 0.020, 0.062) * _g(eyeX, 0.092) * Math.max(0, zn - 0.40) * 0.084 * R;   // globe
+  pz -= _g(yn - 0.090, 0.026) * _g(eyeX, 0.086) * Math.max(0, zn - 0.42) * 0.028 * R;   // lid crease
   // glabella: the bridge between the brows, which is what gives the nose a root
-  pz += _g(yn - 0.150, 0.070) * _g(xn, 0.090) * Math.max(0, zn - 0.40) * 0.022 * R;
+  pz += _g(yn - 0.150, 0.070) * _g(xn, 0.090) * Math.max(0, zn - 0.40) * 0.026 * R;
 
   // --- cheeks ----------------------------------------------------------------
-  const zyg = _g(yn + 0.170, 0.150) * _g(ax - 0.600, 0.245) * Math.max(0, zn * 0.65 + 0.35);
-  px += sgn * zyg * 0.042 * R;
-  pz += zyg * 0.016 * R;
-  const hollow = _g(yn + 0.400, 0.165) * _g(ax - 0.470, 0.230) * front;
-  pz -= hollow * 0.040 * R;
-  px -= sgn * hollow * 0.032 * R;
+  const zyg = _g(yn + 0.170, 0.135) * _g(ax - 0.560, 0.210) * Math.max(0, zn * 0.65 + 0.35);
+  px += sgn * zyg * 0.058 * R;
+  pz += zyg * 0.026 * R;
+  const hollow = _g(yn + 0.400, 0.150) * _g(ax - 0.450, 0.200) * front;
+  pz -= hollow * 0.056 * R;
+  px -= sgn * hollow * 0.042 * R;
   // nasolabial fold, and the soft pad of the cheek beside the mouth
   pz -= _g(yn + 0.470, 0.070) * _g(ax - 0.225, 0.065) * front * 0.016 * R;
   pz += _g(yn + 0.560, 0.100) * _g(ax - 0.300, 0.100) * front * 0.008 * R;
@@ -4607,7 +4647,10 @@ function buildHead(centre, R, S) {
   // 52 x 34 rather than 40 x 26: the brow ridge, the orbital rim and the nose are
   // all real displacement now, and at the old tessellation the nose was four
   // quads wide and the socket rim was faceted at a 900 px close-up.
-  const NU = 52, NV = 34;
+  // 64 x 44: the orbital cavity, the globe cap and the nose alae are all
+  // gaussians two to three rows wide, and at 34 rows the socket resolved as one
+  // facet — the sculpt existed in the maths and not on screen.
+  const NU = 64, NV = 44;
   const pos = [], uvs = [], idx = [];
   for (let j = 0; j <= NV; j++) {
     const s = j / NV;
@@ -5038,6 +5081,42 @@ function slab(fn, NU, NV, thick, uvFn) {
   return geo;
 }
 
+/**
+ * ONE EYELID, as real geometry with real thickness.
+ *
+ * A face texture alone reads dead at any close framing: the painted eye has no
+ * self-shadow, so the lids have no edge and the globe has no depth. This builds
+ * the lid as a slab lying over the orbit — its lash edge stands ~3 mm proud of
+ * the eye and rolls back into the crease, so the upper lid casts a real shadow
+ * across the top of the globe and the lower lid catches a real light on its rim.
+ * The aperture between the two is left open onto the painted eye underneath.
+ */
+function buildEyelid(centre, R, S, side, lower) {
+  // FL.eye ± 0.024 is the painted opening (a 5.4 mm half-height on a 221 mm
+  // head), so the lash edges are authored to land exactly on it.
+  const dE = FL.eyeDX, wA = FL.eyeW * 1.20;
+  // The painted aperture is 5.4 mm half-height on a 221 mm head = 0.0236 in `t`.
+  // The lash edge is authored just clear of it: a lid that overlaps the opening
+  // reads as a half-closed eye, not as a lid.
+  const tLash = lower ? -0.0272 : 0.0288;
+  const tBack = lower ? -0.0470 : 0.0510;
+  const geom = (u, v) => {
+    const uu = clamp(u, 0, 1), vv = clamp(v, 0, 1);
+    const a = side * (dE + (uu - 0.5) * 2 * wA) * TAU;
+    const arc = Math.pow(Math.sin(Math.PI * clamp(uu * 0.92 + 0.04, 0, 1)), 0.55);
+    const t = FL.eye + lerp(tLash * arc, lerp(tBack * 0.55, tBack, arc), vv);
+    const p = headSurface(a, t, R, S);
+    const n = p.clone().normalize();
+    // proud at the lash line, flush at the crease so there is no step to catch
+    const out = lerp(lower ? 0.014 : 0.021, -0.003, smoothstep(vv) ** 0.7) * R;
+    return p.addScaledVector(n, out).add(centre);
+  };
+  // Painted from the plain SKIN band, not FACE: FACE at the lid's own station is
+  // sclera, and one crease higher is eyebrow — either one lands a stripe on the
+  // eyelid. The form here is entirely geometric, which is the point.
+  return slab(geom, 14, 3, (lower ? 0.010 : 0.013) * R, (u, v) => [u, 0.42 + v * 0.16]);
+}
+
 /** Cap (forwards or backwards) and beanie. Returns null for helmet / none. */
 function buildLid(centre, R, S, X) {
   const style = X.lid.style;
@@ -5121,12 +5200,17 @@ function buildLid(centre, R, S, X) {
     const dir = back ? Math.PI : 0;
     const span = 62 * DEG;
     const len = (back ? 0.100 : 0.125) * (R / 0.098);
+    // The peak projects along ONE direction and fans, it does not follow the band
+    // round the skull: deriving `out` from each column's own azimuth sent the two
+    // corners of the peak shooting sideways past the ears as a pair of black wings.
+    const outC = V(Math.sin(dir), -0.16, Math.cos(dir)).normalize();
+    const outS = V(Math.cos(dir), 0, -Math.sin(dir));
     const brim = slab((u, t) => {
       const s = (u - 0.5) * 2;                             // -1 … 1 across the peak
       const a = dir + s * span;
       const v = lineAt(a) + 0.030;
       const base = shell(a, v);
-      const out = V(Math.sin(a) * 0.62, -0.16, Math.cos(a) * 0.98).normalize();
+      const out = outC.clone().addScaledVector(outS, s * 0.30).normalize();
       // the peak is shorter at its corners and curls down along its length
       const reach = len * t * (1 - 0.30 * s * s);
       const droop = (back ? 0.20 : 0.42) * t * t;
@@ -5517,6 +5601,10 @@ function buildRiderBody(pose, boneIndex, X, A) {
   push(buildHead(headC, headR, S), 'FACE', (g) => skinPart(g, boneIndex, 'head', null));
   for (const s of [-1, 1]) {
     push(buildEar(headC, headR, S, s), 'SKIN', (g) => skinPart(g, boneIndex, 'head', null), 0.62, 0.86);
+    for (const lower of [false, true]) {
+      push(buildEyelid(headC, headR, S, s, lower), 'SKIN',
+        (g) => skinPart(g, boneIndex, 'head', null), 0.365, 0.425);
+    }
   }
 
   // Under a helmet the hair used to be culled to v > 0.88 — nothing showed, so
@@ -6088,6 +6176,47 @@ export async function createRider(ctx, profile = DEFAULT_PROFILE) {
     sheen: 0.55, sheenRoughness: 0.72, sheenColor: new THREE.Color(0xb6bcc6),
   });
   riderMat.name = 'riderSkinned';
+
+  // SKIN IS NOT CLOTH. One material carries the whole character, so skin used to
+  // get the fabric's sheen lobe and a plain lambert falloff: the face went waxy
+  // in the light and dead grey in the shadow, and at the closeup framing that is
+  // most of why it read as a mannequin. The atlas puts SKIN and FACE in the two
+  // lowest bands, so `v` alone says whether a fragment is skin — no extra vertex
+  // attribute, no second draw call. Skin then gets:
+  //   - a wrap-diffuse term tinted toward blood, which is the cheap subsurface
+  //     approximation: light bleeds ~35° past the terminator and goes red doing it
+  //   - the cloth sheen taken back off it
+  const skinVMax = (AD.index.FACE ? AD.index.FACE.v1 : 0.36);
+  riderMat.onBeforeCompile = (shader) => {
+    shader.uniforms.uSkinVMax = { value: skinVMax };
+    shader.uniforms.uSkinWarm = { value: new THREE.Color(0.85, 0.36, 0.26) };
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+        uniform float uSkinVMax;
+        uniform vec3 uSkinWarm;
+        float rSkinMask = 0.0;`)
+      .replace('#include <lights_physical_fragment>', `#include <lights_physical_fragment>
+        rSkinMask = 1.0 - smoothstep( uSkinVMax - 0.012, uSkinVMax, vMapUv.y );
+        #ifdef USE_SHEEN
+          material.sheenColor *= ( 1.0 - 0.88 * rSkinMask );
+        #endif`)
+      .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>
+        #if ( NUM_DIR_LIGHTS > 0 )
+        if ( rSkinMask > 0.002 ) {
+          vec3 rSss = vec3( 0.0 );
+          IncidentLight rDL;
+          for ( int i = 0; i < NUM_DIR_LIGHTS; i ++ ) {
+            getDirectionalLightInfo( directionalLights[ i ], rDL );
+            float nl = dot( geometryNormal, rDL.direction );
+            // wrapped diffuse minus the lambert already accounted for: what is
+            // left is exactly the band around the terminator
+            rSss += rDL.color * max( clamp( ( nl + 0.55 ) / 1.55, 0.0, 1.0 ) - clamp( nl, 0.0, 1.0 ), 0.0 );
+          }
+          reflectedLight.directDiffuse += rSss * uSkinWarm * diffuseColor.rgb * ( rSkinMask * 0.17 );
+        }
+        #endif`);
+  };
+  riderMat.customProgramCacheKey = () => 'riderSkinWrap';
 
   const helmetMat = new THREE.MeshPhysicalMaterial({
     ...AM.maps, color: 0xffffff, metalness: 0.15, roughness: 1,
