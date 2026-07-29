@@ -1985,7 +1985,7 @@ function drawEye(c, x, y, sx, sy, out, iris, skin) {
   ls.addColorStop(1, 'rgba(28,20,16,0)');
   c.fillStyle = ls; c.fillRect(inner - W, y - H * 1.6, W * 3, H * 2.2);
   // catchlight last, so nothing dulls it
-  c.fillStyle = 'rgba(255,253,247,0.92)';
+  c.fillStyle = 'rgba(252,250,244,0.72)';
   c.beginPath();
   c.ellipse(cxi - out * irx * 0.34, cyi - iry * 0.40, irx * 0.20, iry * 0.16, -0.4, 0, TAU);
   c.fill();
@@ -2001,8 +2001,8 @@ function drawEye(c, x, y, sx, sy, out, iris, skin) {
   // and the eye stopped reading as an eye at exactly the distance it matters.
   c.save();
   c.lineCap = 'round';
-  c.strokeStyle = 'rgba(12,9,8,0.98)';
-  c.lineWidth = Math.max(2.4, 2.1 * sy);
+  c.strokeStyle = 'rgba(16,12,10,0.86)';
+  c.lineWidth = Math.max(1.8, 1.55 * sy);
   c.beginPath();
   c.moveTo(inner + out * 0.6 * sx, y + 0.6 * sy);
   c.bezierCurveTo(x - out * W * 0.55, y - H * 1.34, x + out * W * 0.35, y - H * 1.28,
@@ -2233,7 +2233,7 @@ function riderRegions() {
           // which is 29 mm of black comb sitting on the brow ridge — the single
           // crudest mark on the face at closeup framing.
           const x0 = mx(sgn * 9), x1 = mx(sgn * 33), x2 = mx(sgn * 52);
-          const y0 = fy(FL.brow - 0.004), y1 = fy(FL.brow + 0.015), y2 = fy(FL.brow - 0.014);
+          const y0 = fy(FL.brow - 0.014), y1 = fy(FL.brow + 0.004), y2 = fy(FL.brow - 0.024);
           const bAt = (t) => {
             const it = 1 - t;
             return [it * it * x0 + 2 * it * t * x1 + t * t * x2,
@@ -2245,7 +2245,7 @@ function riderRegions() {
           c.globalAlpha = 0.46;
           c.strokeStyle = HEX(shade(browC, -0.30));
           c.lineCap = 'round'; c.lineJoin = 'round';
-          for (const [wid, al] of [[5.6, 0.45], [3.4, 0.75]]) {
+          for (const [wid, al] of [[5.2, 0.34], [3.0, 0.52]]) {
             c.globalAlpha = al * 0.62;
             c.lineWidth = wid * sy;
             c.beginPath(); c.moveTo(x0, y0); c.quadraticCurveTo(x1, y1, x2, y2); c.stroke();
@@ -2253,13 +2253,13 @@ function riderRegions() {
           c.restore();
           // hairs lie ALONG the brow, sweeping up at the head and down at the tail
           c.lineCap = 'round';
-          for (let i = 0; i < 150; i++) {
-            const t = Math.pow(i / 149, 0.92);
+          for (let i = 0; i < 130; i++) {
+            const t = Math.pow(i / 129, 0.92);
             const [bx, by] = bAt(t);
             const jx = rand(-1.6, 1.6) * sx, jy = rand(-2.4, 2.4) * sy * lerp(1.15, 0.7, t);
             const len = lerp(6.0, 3.4, t) * sx;
             const rise = lerp(-0.62, 0.30, t) + rand(-0.16, 0.16);
-            c.strokeStyle = rgba(rng() < 0.45 ? shade(browC, 0.26) : shade(browC, -0.32), rand(0.30, 0.72));
+            c.strokeStyle = rgba(rng() < 0.5 ? shade(browC, 0.30) : shade(browC, -0.26), rand(0.20, 0.52));
             c.lineWidth = rand(0.5, 1.05) * sy;
             c.beginPath();
             c.moveTo(bx + jx, by + jy);
@@ -2373,16 +2373,16 @@ function riderRegions() {
       rough: (c, w, h, X) => {
         const fx = (u) => u * w, fy = (v) => (1 - v) * h;
         const sx = w / 492.6, sy = h / 221;
-        fill(c, w, h, '#b8b8b8');
-        overlay(c, w, h, 0.28, 6);
+        fill(c, w, h, '#c2c2c2');
+        overlay(c, w, h, 0.30, 6);
         // sheen sits on the forehead, the nose ridge and the cheekbones — soft
         // falloffs only: any hard-edged rectangle here shows up as a visible
         // glossy patch on the face under a moving light.
-        blob(c, fx(0.5), fy(0.660), w * 0.120, h * 0.055, 'rgba(126,126,126,0.55)', 0.9);
+        blob(c, fx(0.5), fy(0.660), w * 0.120, h * 0.055, 'rgba(150,150,150,0.42)', 0.9);
         blob(c, fx(0.5), fy(0.430), w * 0.022, h * 0.090, 'rgba(104,104,104,0.60)', 0.9);
         blob(c, fx(0.5), fy(FL.noseTip), w * 0.016, h * 0.020, 'rgba(84,84,84,0.75)', 0.9);
         for (const sgn of [-1, 1]) {
-          blob(c, fx(0.5 + sgn * 0.115), fy(0.455), w * 0.050, h * 0.040, 'rgba(136,136,136,0.45)', 0.9);
+          blob(c, fx(0.5 + sgn * 0.115), fy(0.455), w * 0.050, h * 0.040, 'rgba(158,158,158,0.35)', 0.9);
           blob(c, fx(0.5 + sgn * FL.eyeDX), fy(FL.eye), 12 * sx, 8 * sy, 'rgba(30,30,30,0.85)', 0.95);
         }
         blob(c, fx(0.5), fy(FL.mouth), w * 0.048, h * 0.024, 'rgba(58,58,58,0.70)', 0.9);
@@ -4632,7 +4632,7 @@ function headSurface(a, t, R, S) {
   const front = clamp((zn - 0.02) / 0.45, 0, 1);           // how face-on this point is
   // Head box: 221 mm tall, 152 mm wide, 196 mm deep. The old 0.822 width / 1.005
   // depth gave a 170 x 215 mm head — a beach ball with a face drawn on the front.
-  let px = xn * 0.735 * R * S.wide;
+  let px = xn * 0.762 * R * S.wide;
   let py = yn * 1.128 * R;
   let pz = zn * 0.905 * R;
   let frontZ = ring * 0.905 * R;      // where the raw ellipsoid reaches on the midline
@@ -4824,7 +4824,7 @@ function buildEar(centre, R, S, side) {
   // reads as part of the head rather than a card stuck to it
   const at = headSurface(side * (Math.PI * 0.5 + 0.34), FL.earMid, R, S).add(centre)
     .addScaledVector(out, -0.022 * R).addScaledVector(fore, -0.020 * R);
-  const rx = 0.190 * R, ry = 0.320 * R;
+  const rx = 0.168 * R, ry = 0.290 * R;
 
   const pos = [], uvs = [], idx = [];
   // θ = 0 toward the face, π/2 up, π back
@@ -4850,8 +4850,8 @@ function buildEar(centre, R, S, side) {
     const tragus = _g(rho - 0.30, 0.20) * _g(Math.atan2(Math.sin(th + 0.35), Math.cos(th + 0.35)), 0.45);
     // the whole shell flares away from the skull toward the top and the back
     const flare = clamp(0.28 + 0.72 * rho, 0, 1) * (0.45 + 0.55 * clamp(0.5 - cth * 0.7, 0, 1));
-    const d = 0.086 * R * rimAmt * rimArc + 0.026 * R * anti
-      - 0.062 * R * bowl + 0.026 * R * tragus + 0.034 * R * flare;
+    const d = 0.078 * R * rimAmt * rimArc + 0.028 * R * anti
+      - 0.082 * R * bowl + 0.026 * R * tragus + 0.020 * R * flare;
     const p = at.clone()
       .addScaledVector(fore, px)
       .addScaledVector(up, py)
@@ -4899,9 +4899,9 @@ function buildEar(centre, R, S, side) {
 // from there at the temples and again at the nape.
 const HAIR_SPEC = {
   bald: { t: 0, line: 0.760 },
-  buzz: { t: 0.14, line: 0.722, noise: 0.10 },
-  short: { t: 0.28, line: 0.730, noise: 0.18 },
-  fade: { t: 0.36, line: 0.730, taper: 1.0, noise: 0.14 },
+  buzz: { t: 0.16, line: 0.720, noise: 0.10 },
+  short: { t: 0.34, line: 0.726, noise: 0.20 },
+  fade: { t: 0.42, line: 0.728, taper: 1.0, noise: 0.14 },
   messy: { t: 0.50, line: 0.738, noise: 0.55, freq: 7 },
   spikes: { t: 0.54, line: 0.742, noise: 0.90, freq: 11, spike: 1 },
   curly: { t: 0.70, line: 0.740, noise: 0.62, freq: 9 },
@@ -4924,7 +4924,7 @@ function hairThickness(X, R) {
   // A helmet crushes hair. Without this an afro under a lid pushes straight
   // through the EPS liner, which is why the shell used to cull the hair entirely.
   const crush = X.lid && X.lid.helmet ? 0.42 : 1;
-  return 0.034 * spec.t * (0.6 + 0.7 * vol) * crush * (R / 0.098);
+  return 0.050 * spec.t * (0.6 + 0.7 * vol) * crush * (R / 0.098);
 }
 
 /**
@@ -5282,15 +5282,25 @@ function buildLid(centre, R, S, X) {
   // hairline itself and the rider read as shaved under the lid.
   const lineAt = (a) => lowV + (beanie ? 0.070 : backwards ? 0.172 : 0.058) * Math.max(0, Math.cos(a))
     - (beanie ? 0.028 : backwards ? 0.048 : 0.030) * Math.max(0, -Math.cos(a));
+  const K = R / 0.098;
   const shell = (a, v) => {
     const base = headSurface(a, v, R, S);
     const nrm = base.clone().normalize();
+    const lo = lineAt(a);
+    const up = smoothstep(clamp((v - lo) / Math.max(1e-4, 0.985 - lo), 0, 1));
     const puff = beanie ? 1 + 0.10 * smoothstep(clamp((v - 0.72) / 0.28, 0, 1)) : 1.0;
+    // A cap is a STRUCTURED shell, not shrink-wrap. Offsetting the skull by a
+    // constant gave a swim cap: the crown has to stand off the head, tallest over
+    // the front panels, and settle onto a stiffened band at the bottom edge.
+    const fwd = clamp(Math.cos(a) * 0.5 + 0.5, 0, 1);
+    const stand = beanie ? 0.014 * K * up : 0.030 * K * up * lerp(0.42, 1.0, fwd);
     // six panels joined by raised seams, and a crown that sits a touch flatter
     // than the skull under it — a cap is stitched, not shrink-wrapped
-    const seam = beanie ? 0 : 0.0026 * R / 0.098 * Math.pow(Math.abs(Math.cos(3 * a)), 14);
-    const crown = beanie ? 0 : -0.010 * R / 0.098 * smoothstep(clamp((v - 0.88) / 0.12, 0, 1));
-    return base.multiplyScalar(puff).addScaledVector(nrm, thick + seam + crown).add(centre);
+    const seam = beanie ? 0 : 0.0026 * K * Math.pow(Math.abs(Math.cos(3 * a)), 14);
+    const crown = beanie ? 0 : -0.014 * K * smoothstep(clamp((v - 0.86) / 0.14, 0, 1));
+    const band = beanie ? 0 : 0.0050 * K * _g(v - lo - 0.020, 0.026);
+    return base.multiplyScalar(puff)
+      .addScaledVector(nrm, thick + seam + stand + crown + band).add(centre);
   };
   const pos = [], uvs = [], idx = [];
   for (let j = 0; j <= NV; j++) {
@@ -5345,8 +5355,8 @@ function buildLid(centre, R, S, X) {
     // brim: a curved visor with real thickness, swept out of the band
     const back = style === 'capBackwards';
     const dir = back ? Math.PI : 0;
-    const span = 62 * DEG;
-    const len = (back ? 0.100 : 0.125) * (R / 0.098);
+    const span = (back ? 50 : 62) * DEG;
+    const len = (back ? 0.072 : 0.125) * (R / 0.098);
     // The peak projects along ONE direction and fans, it does not follow the band
     // round the skull: deriving `out` from each column's own azimuth sent the two
     // corners of the peak shooting sideways past the ears as a pair of black wings.
@@ -5360,17 +5370,17 @@ function buildLid(centre, R, S, X) {
       const out = outC.clone().addScaledVector(outS, s * 0.30).normalize();
       // the peak is shorter at its corners and curls down along its length
       const reach = len * t * (1 - 0.30 * s * s);
-      const droop = (back ? 0.20 : 0.42) * t * t;
+      const droop = (back ? 0.62 : 0.42) * t * t;
       const curl = 0.055 * (R / 0.098) * s * s * t;        // side-to-side curve
       return base.addScaledVector(out, reach)
         .add(V(0, -len * droop - curl, 0));
     }, 18, 4, 0.0075 * (R / 0.098), (u, t) => [0.10 + u * 0.80, 0.80 + t * 0.18]);
     parts.push(brim);
     // crown button
-    const btn = new THREE.SphereGeometry(0.012 * (R / 0.098), 8, 6);
+    const btn = new THREE.SphereGeometry(0.0075 * (R / 0.098), 8, 6);
     const top = shell(0, 0.999);
-    btn.scale(1, 0.7, 1);
-    btn.translate(top.x, top.y + 0.004, top.z);
+    btn.scale(1, 0.55, 1);
+    btn.translate(top.x, top.y + 0.001 * (R / 0.098), top.z);
     parts.push(btn);
   }
   return merge(parts);
@@ -6367,7 +6377,7 @@ export async function createRider(ctx, profile = DEFAULT_PROFILE) {
             // left is exactly the band around the terminator
             rSss += rDL.color * max( clamp( ( nl + 0.55 ) / 1.55, 0.0, 1.0 ) - clamp( nl, 0.0, 1.0 ), 0.0 );
           }
-          reflectedLight.directDiffuse += rSss * uSkinWarm * diffuseColor.rgb * ( rSkinMask * 0.17 );
+          reflectedLight.directDiffuse += rSss * uSkinWarm * diffuseColor.rgb * ( rSkinMask * 0.26 );
         }
         #endif`);
   };
