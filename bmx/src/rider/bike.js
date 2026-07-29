@@ -4968,7 +4968,13 @@ function buildHair(centre, R, S, X, coverV) {
   if (NC) {
     const cpos = [], cuv = [], cidx = [];
     const drop = spec.curtain * 0.26 * (R / 0.098);
-    const lenAt = (a) => Math.max(0, -Math.cos(a) * 0.55 + 0.55) * drop;
+    // Long hair falls BEHIND the eye, not across it. The old ramp started at the
+    // hairline dead front and reached 0.55 by the temples, so a 14 cm curtain
+    // hung straight down over the cheekbone, the jaw and half the mouth — every
+    // long style rendered as a blond slab pasted across the face.
+    const lenAt = (a) => Math.max(0, -Math.cos(a) * 0.78 + 0.36) * drop;
+    // it also swings back and out as it falls, the way hair hangs off a skull
+    const backDir = V(0, 0, -1);
     for (let j = 0; j <= NC; j++) {
       for (let i = 0; i <= NU; i++) {
         const a = Math.PI - (i / NU) * TAU;
@@ -4976,8 +4982,11 @@ function buildHair(centre, R, S, X, coverV) {
         const base = shellPt(a, v);
         const t = j / NC;
         const l = lenAt(a) * t;
-        const out = base.clone().sub(centre).setY(0).normalize().multiplyScalar(0.004 * (1 - t));
-        cpos.push(base.x + out.x, base.y - l, base.z + out.z);
+        const radial = base.clone().sub(centre).setY(0).normalize();
+        const p = base.clone()
+          .addScaledVector(radial, (0.006 + 0.020 * t) * (R / 0.098))
+          .addScaledVector(backDir, 0.030 * t * t * (R / 0.098) * Math.max(0, 0.5 + Math.cos(a) * 0.5));
+        cpos.push(p.x, p.y - l, p.z);
         cuv.push(i / NU * 3, 1 - t * 0.9);
       }
     }
