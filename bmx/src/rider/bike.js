@@ -2565,7 +2565,7 @@ function riderRegions() {
         c.fillStyle = T.trimCuff ? HEX(T.trim) : HEX(shade(T.body, 0.13));
         c.fillRect(0, 0, w, h * 0.026);
         for (let i = 0; i < 120; i++) {                      // rib knit
-          c.fillStyle = rgba(shade(T.body, i % 2 ? 0.24 : -0.16), 0.45);
+          c.fillStyle = rgba(shade(T.body, i % 2 ? 0.20 : -0.14), 0.22);
           c.fillRect((i / 120) * w, 0, w / 240, h * 0.026);
         }
         c.fillStyle = rgba(shade(T.body, -0.45), 0.5);
@@ -4455,7 +4455,7 @@ function riderPose(pts, X) {
   // like a potato" in one number. A real male has ~70 mm of throat showing above
   // a tee collar; this puts the atlanto-occipital joint where that is true, and
   // sets it FORWARD of the spine, which is where a neck actually is.
-  const head = neck.clone().add(V(0, 0.108 * hs, 0.026 * hs));
+  const head = neck.clone().add(V(0, 0.094 * hs, 0.030 * hs));
   // the torso's own frame: +X is the chest front, +Z the rider's left
   const front = new THREE.Vector3().crossVectors(lean, V(-1, 0, 0)).normalize();
 
@@ -4795,24 +4795,24 @@ function headSurface(a, t, R, S) {
     pz -= Math.max(0, -zn) * k * 0.13 * R;                  // clear the neck at the back
   }
   const gon = _g(yn + 0.600, 0.180) * _g(ax - 0.60, 0.30) * _g(zn + 0.02, 0.55);
-  px += sgn * gon * 0.090 * R * S.jaw;                      // gonial angle
+  px += sgn * gon * 0.106 * R * S.jaw;                      // gonial angle
   pz -= gon * 0.014 * R;
   // the mandible edge itself — a defined line from the chin back to the jaw angle
-  const jawEdge = _g(yn + 0.800, 0.100) * Math.max(0, zn + 0.30) * (0.35 + 0.65 * front);
-  px += sgn * jawEdge * 0.040 * R * S.jaw;
-  py -= jawEdge * 0.012 * R;
+  const jawEdge = _g(yn + 0.800, 0.092) * Math.max(0, zn + 0.30) * (0.35 + 0.65 * front);
+  px += sgn * jawEdge * 0.056 * R * S.jaw;
+  py -= jawEdge * 0.020 * R;
 
   // --- chin ------------------------------------------------------------------
   // the mask carries the chin out; these are the landmarks that live on it
-  pz += _g(yn + 0.855, 0.100) * _g(xn, 0.150) * front * 0.036 * R * S.jaw;   // chin button
+  pz += _g(yn + 0.855, 0.095) * _g(xn, 0.145) * front * 0.048 * R * S.jaw;   // chin button
   px += sgn * _g(yn + 0.845, 0.120) * _g(ax - 0.185, 0.095) * front * 0.026 * R;  // chin corners
   pz -= _g(yn + 0.726, 0.055) * _g(xn, 0.26) * front * 0.038 * R;            // mentolabial crease
 
   // --- mouth -----------------------------------------------------------------
   const lipC = _g(xn, 0.215) * front;
-  pz += _g(yn + 0.545, 0.048) * lipC * 0.042 * R;                   // upper lip roll
-  pz += _g(yn + 0.638, 0.054) * lipC * 0.050 * R;                   // lower lip roll
-  pz -= _g(yn + 0.590, 0.022) * lipC * 0.040 * R;                   // the mouth line itself
+  pz += _g(yn + 0.545, 0.044) * lipC * 0.054 * R;                   // upper lip roll
+  pz += _g(yn + 0.638, 0.050) * lipC * 0.064 * R;                   // lower lip roll
+  pz -= _g(yn + 0.590, 0.019) * lipC * 0.056 * R;                   // the mouth line itself
   // the corners of the mouth tuck in — without this the lips run off the face
   pz -= _g(yn + 0.585, 0.070) * _g(ax - 0.275, 0.080) * front * 0.026 * R;
   pz -= _g(yn + 0.455, 0.036) * _g(xn, 0.052) * front * 0.024 * R;             // philtrum
@@ -4853,29 +4853,44 @@ function headSurface(a, t, R, S) {
   // close-up a painted brow has no self-shadow and the head reads as an egg.
   // The ridge overhangs, but only over the eye — a brow that also projects on the
   // midline buries the root of the nose and gives the rider a caveman shelf.
-  const brow = _g(yn - 0.150, 0.105) * Math.max(0, zn - 0.24)
-    * (0.30 * _g(ax, 0.17) + 0.70 * _g(ax - 0.320, 0.185));
-  pz += brow * 0.070 * R * S.brow;
-  py += brow * 0.008 * R * S.brow;                                                       // rim lip
+  const brow = _g(yn - 0.150, 0.098) * Math.max(0, zn - 0.24)
+    * (0.26 * _g(ax, 0.17) + 0.74 * _g(ax - 0.320, 0.180));
+  // The ridge has to OVERHANG, and the overhang has to be deep enough to throw a
+  // shadow onto the lid in overcast light: at 0.070 R (15 mm) it was a swelling,
+  // and the eye read the whole orbit as paint on a curve. 0.104 R is 23 mm of
+  // supraorbital projection, which is a male brow, and the lip on top of it is
+  // what makes the shadow start at a hard line instead of fading in.
+  pz += brow * 0.104 * R * S.brow;
+  py += brow * 0.016 * R * S.brow;                                                       // rim lip
+  // the plane UNDER the ridge falls away — the shelf that puts the eye in a hole
+  pz -= _g(yn - 0.082, 0.042) * _g(ax - 0.300, 0.190) * Math.max(0, zn - 0.30) * 0.040 * R * S.brow;
   // the nasion notch is a MIDLINE feature — put it in the sagittal table and it
   // becomes a horizontal ledge running from temple to temple
   pz -= _g(yn - 0.096, 0.040) * _g(ax, 0.075) * Math.max(0, zn - 0.35) * 0.038 * R;
   const eyeX = ax - 0.315;
   // orbital cavity, then the GLOBE as a spherical cap seated inside it — the
   // socket has to be deeper than the eye is proud or the eye is a sticker.
-  pz -= _g(yn - 0.020, 0.112) * _g(eyeX, 0.175) * Math.max(0, zn - 0.24) * 0.086 * R;   // socket
-  pz += _g(yn - 0.020, 0.060) * _g(eyeX, 0.090) * Math.max(0, zn - 0.40) * 0.082 * R;   // globe
-  pz -= _g(yn - 0.088, 0.024) * _g(eyeX, 0.084) * Math.max(0, zn - 0.42) * 0.030 * R;   // lid crease
+  pz -= _g(yn - 0.020, 0.112) * _g(eyeX, 0.175) * Math.max(0, zn - 0.24) * 0.112 * R;   // socket
+  pz += _g(yn - 0.020, 0.058) * _g(eyeX, 0.086) * Math.max(0, zn - 0.40) * 0.104 * R;   // globe
+  pz -= _g(yn - 0.092, 0.022) * _g(eyeX, 0.082) * Math.max(0, zn - 0.42) * 0.046 * R;   // lid crease
+  // the lower orbital rim: the bony edge the lower lid sits on, and the tear
+  // trough inboard of it. Without these the eye has no floor and the cheek runs
+  // straight up into the brow.
+  py -= _g(yn + 0.062, 0.030) * _g(eyeX, 0.120) * Math.max(0, zn - 0.36) * 0.020 * R;
+  pz -= _g(yn + 0.058, 0.034) * _g(ax - 0.185, 0.075) * Math.max(0, zn - 0.36) * 0.030 * R;
 
   // --- cheeks ----------------------------------------------------------------
-  const zyg = _g(yn + 0.150, 0.128) * _g(ax - 0.505, 0.190) * Math.max(0, zn * 0.65 + 0.35);
-  px += sgn * zyg * 0.064 * R;
-  pz += zyg * 0.030 * R;
-  const hollow = _g(yn + 0.395, 0.140) * _g(ax - 0.420, 0.180) * front;
-  pz -= hollow * 0.048 * R;
-  px -= sgn * hollow * 0.036 * R;
+  // The cheekbone is the widest point of the face and the plane change off it is
+  // what separates the front of the head from the side. Weak here and the head is
+  // a dome whatever else is done to it.
+  const zyg = _g(yn + 0.150, 0.120) * _g(ax - 0.505, 0.175) * Math.max(0, zn * 0.65 + 0.35);
+  px += sgn * zyg * 0.086 * R;
+  pz += zyg * 0.042 * R;
+  const hollow = _g(yn + 0.395, 0.135) * _g(ax - 0.420, 0.170) * front;
+  pz -= hollow * 0.062 * R;
+  px -= sgn * hollow * 0.048 * R;
   // nasolabial fold, and the soft pad of the cheek beside the mouth
-  pz -= _g(yn + 0.480, 0.060) * _g(ax - 0.210, 0.060) * front * 0.022 * R;
+  pz -= _g(yn + 0.480, 0.055) * _g(ax - 0.210, 0.058) * front * 0.032 * R;
   pz += _g(yn + 0.575, 0.092) * _g(ax - 0.285, 0.092) * front * 0.012 * R;
   return V(px, py, pz);
 }
@@ -5578,8 +5593,20 @@ function buildFist(wrist, barDir, handR, glove, barR, gripPoint, side) {
   const sIn = -handR * 0.42, sOut = handR * 1.36;
   const A0 = -118, AK = 4, A1 = 210;      // palm heel → knuckle row → tips, tucked
 
+  // FINGER LANE CENTRES. Index, middle, ring, pinky are not four equal slots: the
+  // middle finger is the longest and reaches furthest round the bar, the pinky is
+  // short, thin and does not make it past the underside. The whole read of a fist
+  // at macro framing is those four cylinders being visibly different lengths.
+  const LANE = [0.135, 0.395, 0.640, 0.865];
+  const LANE_LEN = [0.95, 1.00, 0.955, 0.845];       // how far round each finger goes
+  const LANE_FAT = [1.05, 1.06, 0.98, 0.84];
+
   /** flesh over the grip, in handR units, at lane `s` and wrap angle `a`. */
   const thick = (s, a) => {
+    // nearest finger lane, and how far this station reaches round for that lane
+    let li = 0, ld = 9;
+    for (let k = 0; k < 4; k++) { const d = Math.abs(s - LANE[k]); if (d < ld) { ld = d; li = k; } }
+    const reach = A1 * LANE_LEN[li];
     let t;
     if (a < AK) {
       // dorsum: thin over the metacarpal heads, thickening into the palm heel
@@ -5587,30 +5614,46 @@ function buildFist(wrist, barDir, handR, glove, barR, gripPoint, side) {
       t = lerp(0.40, 0.70, smoothstep(k));
     } else {
       // proximal → middle → distal phalanx, with a real crease at each joint
-      const k = clamp((a - AK) / (A1 - AK), 0, 1);
-      t = lerp(0.47, 0.225, smoothstep(k) ** 0.72);
-      t -= 0.060 * gs(a - 84, 15);                      // PIP crease
-      t -= 0.048 * gs(a - 158, 15);                     // DIP crease
+      const k = clamp((a - AK) / (reach - AK), 0, 1);
+      t = lerp(0.50, 0.205, smoothstep(k) ** 0.70);
+      t -= 0.085 * gs(a - 86, 13);                      // PIP crease
+      t -= 0.068 * gs(a - 156, 13);                     // DIP crease
+      t += 0.055 * gs(a - 46, 26);                      // proximal phalanx belly
+      t += 0.040 * gs(a - 120, 22);                     // middle phalanx belly
+      // past this finger's own reach the surface drops onto the grip, which is
+      // what makes the tips STAGGER instead of all ending on one ring
+      t *= 1 - smoothstep(clamp((a - reach) / 26, 0, 1));
     }
-    // knuckle heads: one bony dome per lane, standing proud of the dorsum
+    // knuckle heads: one bony dome per lane, standing proud of the dorsum. A real
+    // knuckle row is the single loudest landmark on a fist seen from above, so it
+    // is narrow in wrap angle and tall, not a general swelling of the back.
     let kn = 0;
-    for (let k = 0; k < 4; k++) kn = Math.max(kn, gs(s - (k + 0.5) / 4, 0.082));
-    t += (glove ? 0.150 : 0.115) * gs(a - 12, 24) * (0.42 + 0.58 * kn);
-    // index side carries the mass, the pinky lane is visibly slimmer and shorter
-    t *= lerp(1.06, 0.82, clamp((s - 0.26) / 0.74, 0, 1));
-    // the outer two fingers do not reach as far round the bar
-    t *= 1 - 0.30 * smoothstep(clamp((a - 150) / 60, 0, 1)) * smoothstep(clamp((s - 0.55) / 0.45, 0, 1));
+    for (let k = 0; k < 4; k++) kn = Math.max(kn, gs(s - LANE[k], 0.070) * LANE_FAT[k]);
+    t += (glove ? 0.195 : 0.155) * gs(a - 10, 17) * (0.26 + 0.74 * kn);
+    t += (glove ? 0.055 : 0.045) * gs(a + 46, 34);      // metacarpal ridges on the back
+    // index side carries the mass, the pinky lane is visibly slimmer
+    t *= lerp(1.06, 0.80, clamp((s - 0.20) / 0.80, 0, 1));
     return t;
   };
-  /** the valleys between the digits — zero across the palm, deep past the knuckles */
+  /**
+   * The valleys between the digits. At 0.195 handR (8 mm) the fingers were four
+   * shallow scallops in one roll of flesh — a mitten with lines drawn on it. A
+   * real gap between two fingers closed on a 22 mm bar is most of the finger's
+   * own thickness, and it has to stay open all the way to the tip, which is what
+   * lets each finger take its own light and read as a cylinder.
+   */
   const groove = (s, a) => {
-    const open = smoothstep(clamp((a - AK) / 50, 0, 1));
+    const open = smoothstep(clamp((a - AK + 26) / 46, 0, 1));
     let g = 0;
-    for (let k = 1; k <= 3; k++) g = Math.max(g, gs(s - k / 4, 0.048));
-    return g * open * 0.195;
+    for (let k = 0; k < 3; k++) {
+      const mid = (LANE[k] + LANE[k + 1]) * 0.5;
+      g = Math.max(g, gs(s - mid, 0.052));
+    }
+    // widen and deepen toward the tips, where the fingers are furthest apart
+    return g * open * (0.30 + 0.16 * smoothstep(clamp((a - 60) / 110, 0, 1)));
   };
 
-  const NS = 20, NA = 30;
+  const NS = 30, NA = 38;
   const pos = [], uvs = [], idx = [];
   // One extra ring outside each border drops the surface onto the grip, so the
   // shell is closed at the index edge, the pinky edge, the heel and the tips.
@@ -5656,14 +5699,27 @@ function buildFist(wrist, barDir, handR, glove, barR, gripPoint, side) {
   }), tA, tB, up));
 
   // --- thumb: round the inboard side, pad across the front of the index ------
-  const th = handR * 0.245;
+  // The thumb is what says CLOSED. It leaves the thenar on the back-inboard
+  // quarter, crosses the front of the bar diagonally and lands its pad on the
+  // index finger's middle phalanx, so the loop round the grip is visibly shut
+  // from every camera. Kept proud of the fist shell (which reaches roughly
+  // curlR + 0.30 handR across the front) or it simply disappears inside it.
+  const th = handR * 0.285;
   parts.push(sweep([
-    at(sIn - handR * 0.18, -60, curlR + handR * 0.50),
-    at(sIn - handR * 0.10, -4, curlR + handR * 0.46),
-    at(sIn + handR * 0.16, 52, curlR + handR * 0.40),
-    at(sIn + handR * 0.60, 104, curlR + handR * 0.33),
-  ], { radius: th, radial: 8, steps: 10, taper: (k) => lerp(1.16, 0.72, k),
-    oval: (k) => [lerp(0.92, 0.86, k), 1] }));
+    at(sIn - handR * 0.26, -66, curlR + handR * 0.56),
+    at(sIn - handR * 0.14, -8, curlR + handR * 0.54),
+    at(sIn + handR * 0.14, 54, curlR + handR * 0.50),
+    at(sIn + handR * 0.50, 104, curlR + handR * 0.44),
+    at(sIn + handR * 0.74, 132, curlR + handR * 0.38),
+  ], { radius: th, radial: 9, steps: 14, taper: (k) => lerp(1.12, 0.70, k),
+    oval: (k) => [lerp(0.94, 0.84, k), 1] }));
+  // the web of skin between thumb and index — without it the thumb is a worm
+  // laid on the hand rather than part of it
+  const wA = at(sIn - handR * 0.06, -24, curlR + handR * 0.46);
+  const wB = at(sIn + handR * 0.30, 34, curlR + handR * 0.40);
+  parts.push(placeZ(capsule2(wA.distanceTo(wB), handR * 0.21, handR * 0.15, {
+    radial: 8, capSegs: 2, capA: 0.4, capB: 0.4, shape: () => [0.55, 1.0],
+  }), wA, wB, up));
 
   // --- wrist cuff: a real closure band, not a bare tube end ------------------
   const cuffDir = G.clone().sub(wrist);
@@ -5808,7 +5864,7 @@ function buildRiderBody(pose, boneIndex, X, A) {
     // shirt climbing the throat. A yoke is nearly FLAT across the top of the
     // shoulders; 0.24 puts the fabric where the trapezius is and lets the neck
     // out of the collar.
-    capA: 0.30, capB: 0.24,
+    capA: 0.30, capB: 0.34,
     // hem flare → WAIST → ribcage → the shoulder yoke.
     // The base radius already tapers 140 → 90 mm, so the old profile (0.92 at the
     // waist, 1.16 at the chest) cancelled the taper exactly and left a constant
@@ -5817,9 +5873,15 @@ function buildRiderBody(pose, boneIndex, X, A) {
     // section to ~107 mm at the navel and let it open back to ~127 mm at the chest.
     mid: (t) => {
       const base = (t < 0.12 ? lerp(1.02 + topLoose * 0.05, 0.95, smoothstep(t / 0.12))
-        : t < 0.38 ? lerp(0.95, 0.875, smoothstep((t - 0.12) / 0.26))
-          : t < 0.72 ? lerp(0.875, 1.225, smoothstep((t - 0.38) / 0.34))
-            : lerp(1.225, 0.98, smoothstep((t - 0.72) / 0.28))) * (1 + topLoose * 0.05);
+        : t < 0.38 ? lerp(0.95, 0.845, smoothstep((t - 0.12) / 0.26))
+          : t < 0.72 ? lerp(0.845, 1.235, smoothstep((t - 0.38) / 0.34))
+            : lerp(1.235, 1.02, smoothstep((t - 0.72) / 0.28))) * (1 + topLoose * 0.05)
+        // NECK HOLE. The tube ran full width all the way to the neck joint, so the
+        // shirt's opening was a 220 mm ellipse with a 140 mm collar band floating
+        // loose inside it — the collar read as a hoop hung round the throat. The
+        // last eighth of the torso is above the acromion: it has to close down to
+        // something a neck fits through.
+        * (1 - 0.30 * smoothstep(clamp((t - 0.845) / 0.155, 0, 1)));
       if (X.top.style === 'tank') return base;
       const r = 0.140 * hs;                        // reference radius for the step
       const cov = smoothstep(clamp((t - (hemT - 0.012)) / 0.024, 0, 1));
@@ -5843,12 +5905,13 @@ function buildRiderBody(pose, boneIndex, X, A) {
   // collar: a real rolled band around the neck opening, not a painted stripe
   if (X.top.style !== 'tank') {
     const nDir = pose.head.clone().sub(pose.neck).normalize();
-    const cR = 0.058 * hs * lerp(0.94, 1.10, M.build) * (X.top.style === 'hoodie' ? 1.18 : 1.0);
-    // A tee collar is a rib band, not a cowl: 1.10x the neck and 22 mm tall, or
-    // it stands off the throat and reads as a roll-neck under the chin.
-    const collar = placeZ(capsule2(0.022 * hs, cR * 1.10, cR * 1.06, {
-      radial: 16, capSegs: 2, capA: 0.30, capB: 0.30, shape: () => [1.04, 1.0],
-    }), torsoB.clone().addScaledVector(nDir, -0.010 * hs), torsoB.clone().addScaledVector(nDir, 0.012 * hs),
+    const cR = 0.0545 * hs * lerp(0.94, 1.10, M.build) * (X.top.style === 'hoodie' ? 1.18 : 1.0);
+    // A tee collar is a rib band, not a cowl: it has to sit ON the throat, wider
+    // across than fore-and-aft (a neck opening is an oval, not a circle), and it
+    // has to be TALLER than it is proud or the rib reads as a bead.
+    const collar = placeZ(capsule2(0.026 * hs, cR * 1.04, cR * 1.00, {
+      radial: 18, capSegs: 2, capA: 0.28, capB: 0.28, shape: () => [0.92, 1.14],
+    }), torsoB.clone().addScaledVector(nDir, -0.016 * hs), torsoB.clone().addScaledVector(nDir, 0.010 * hs),
     LEFT);
     // sample only the collar band at the very top of the garment region
     const cu = collar.attributes.uv;
@@ -5858,18 +5921,25 @@ function buildRiderBody(pose, boneIndex, X, A) {
   }
 
   // ------------------------------------------------------------ neck + head
-  const neckR = 0.0505 * hs * lerp(0.92, 1.10, M.build) * (M.gender === 'female' ? 0.93 : 1);
+  const neckR = 0.0545 * hs * lerp(0.92, 1.10, M.build) * (M.gender === 'female' ? 0.93 : 1);
   // The neck's root has to run DOWN THE TORSO AXIS, not down the world Y: with the
   // rider pitched forward over the bars a vertical root pushes its cap out through
   // the back of the shirt as a bare patch on the shoulder.
-  push(limb(pose.neck.clone().addScaledVector(pose.lean, -0.055 * hs), pose.head.clone().add(V(0, 0.030 * hs, 0)),
-    neckR * 1.16, neckR * 0.86, {
-      radial: 14, capSegs: 3, bodyRings: 5,
-      // trapezius flare at the base, a hollow at the throat, and the pair of
-      // sternocleidomastoid cords running up to behind the ear
-      mid: (t) => lerp(1.14, 0.94, smoothstep(clamp(t * 0.95, 0, 1)))
-        * (1 + 0.05 * Math.exp(-(((t - 0.22) / 0.22) ** 2))),
-      shape: (t) => [lerp(1.16, 0.94, t), lerp(0.84, 1.02, t)],
+  push(limb(pose.neck.clone().addScaledVector(pose.lean, -0.075 * hs), pose.head.clone().add(V(0, 0.030 * hs, 0)),
+    neckR * 1.02, neckR * 0.80, {
+      radial: 16, capSegs: 3, bodyRings: 8,
+      // A neck is a CONE, not a column: it leaves the skull at about 90 mm across
+      // and lands on the shoulders at 150 mm, because the trapezius is part of its
+      // silhouette. The old near-constant 1.14 → 0.94 profile made a stovepipe,
+      // and once the head was lifted to expose it that stovepipe read as a giraffe.
+      // A throat hollow above the sternal notch and the pair of sternocleidomastoid
+      // cords running up behind the ear are what stop it being a smooth taper.
+      mid: (t) => lerp(1.24, 0.92, smoothstep(clamp(t * 1.06, 0, 1)) ** 0.72)
+        * (1 + 0.055 * Math.exp(-(((t - 0.30) / 0.24) ** 2))
+          - 0.045 * Math.exp(-(((t - 0.10) / 0.16) ** 2))),
+      // deep front-to-back at the base (the trapezius sits behind), narrowing and
+      // squaring off under the jaw
+      shape: (t) => [lerp(1.22, 0.92, smoothstep(t)), lerp(0.92, 1.04, t)],
     }),
   'SKIN', (g) => skinPart(g, boneIndex, 'neck', 'head', pose.neck, pose.head, 0.2, 1.0, 0.85));
 
@@ -5980,7 +6050,15 @@ function buildRiderBody(pose, boneIndex, X, A) {
     const armShape = (t) => {
       const f = fOf(t);
       const el2 = _g(f - eF, 0.10);                       // elbow flattens
-      return [1 + 0.06 * _g(f - 0.06, 0.24) - 0.10 * el2, lerp(1.08, 0.94, clamp(f, 0, 1)) + 0.10 * el2];
+      // A WRIST IS FLAT. It is ~55 mm across the styloids and ~38 mm front to
+      // back; a round section there is what let the forearm run into the hand as
+      // one unbroken sausage. The section rolls from round at the elbow to a
+      // flattened oval over the last third of the forearm.
+      const wr2 = smoothstep(clamp((f - 0.72) / 0.28, 0, 1));
+      return [
+        (1 + 0.06 * _g(f - 0.06, 0.24) - 0.10 * el2) * (1 - 0.20 * wr2),
+        (lerp(1.08, 0.94, clamp(f, 0, 1)) + 0.10 * el2) * (1 + 0.16 * wr2),
+      ];
     };
 
     // sections: sleeve → cuff trim → skin, in curve-parameter space
