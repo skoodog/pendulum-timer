@@ -85,8 +85,53 @@ html, body { margin: 0; padding: 0; height: 100%; background: #0a0c11; overflow:
 
 <style>${css}</style>
 <script type="module">${safeJs}</script>
+<style>
+#diag {
+  position: fixed; left: 12px; bottom: 12px; z-index: 60; max-width: min(680px, 92vw);
+  display: none; padding: .7rem .85rem; border-radius: 6px;
+  background: rgba(18,10,10,.94); border: 1px solid #7a2b2b; color: #ffb4b4;
+  font: 400 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap; word-break: break-word; max-height: 40vh; overflow: auto;
+}
+#diag b { color: #ff7a7a; display: block; margin-bottom: .35rem; font-size: 12px; }
+</style>
+<div id="diag"></div>
 <script>
 (function () {
+  // If the GPU rejects a shader or the frame loop throws, the DOM UI keeps
+  // drawing while the canvas stays black — which reads as "no graphics" with no
+  // explanation. Surface it instead of leaving a blank screen.
+  var diag = document.getElementById('diag');
+  var seen = {};
+  function report(kind, text) {
+    if (!text || seen[text]) return;
+    seen[text] = 1;
+    diag.style.display = 'block';
+    if (!diag.firstChild) {
+      var b = document.createElement('b');
+      b.textContent = 'Renderer problem — please send this to Claude:';
+      diag.appendChild(b);
+    }
+    diag.appendChild(document.createTextNode('[' + kind + '] ' + String(text).slice(0, 600) + '\\n'));
+  }
+  var realError = console.error;
+  console.error = function () {
+    var t = Array.prototype.map.call(arguments, function (a) { return (a && a.message) || String(a); }).join(' ');
+    if (/shader|program|glsl|webgl|context lost/i.test(t)) report('gl', t);
+    return realError.apply(console, arguments);
+  };
+  window.addEventListener('error', function (e) { report('js', e.message); });
+  window.addEventListener('unhandledrejection', function (e) { report('promise', e.reason && e.reason.message || e.reason); });
+  var cv = document.getElementById('viewport');
+  cv && cv.addEventListener('webglcontextlost', function (e) { e.preventDefault(); report('gl', 'WebGL context lost'); });
+  // No WebGL at all is worth saying plainly.
+  try {
+    var probe = document.createElement('canvas');
+    if (!probe.getContext('webgl2') && !probe.getContext('webgl')) {
+      report('gl', 'This browser reports no WebGL support, so the 3D view cannot render.');
+    }
+  } catch (err) { report('gl', 'WebGL probe threw: ' + err.message); }
+
   var boot = document.getElementById('boot');
   function dismiss() {
     if (!boot || boot.classList.contains('gone')) return;

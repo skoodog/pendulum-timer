@@ -411,9 +411,84 @@ export const QUALITY = {
  *  reads much softer than that, and the target look is an overcast deck. */
 const DEFAULT_SHADOW_SOFTNESS = 0.13;
 
+/**
+ * Compile a throwaway scene that exercises the injected shader chunks, and
+ * report whether the driver accepted them.
+ *
+ * We hand-patch two of three's shader chunks (PCSS `getShadow`, the custom tone
+ * curve). A software rasteriser accepts GLSL that a real driver rejects, so a
+ * build verified headlessly can compile nothing at all on the user's GPU — and
+ * a failed program link means every material draws nothing while the DOM UI
+ * carries on rendering. That failure mode looks exactly like "the HUD works but
+ * there are no graphics", so we detect it here, before the world is built,
+ * rather than shipping a black canvas.
+ */
+function shaderChunksCompile(renderer) {
+  // The injected chunk only lands in a shader that actually samples a shadow
+  // map, so the probe has to run with shadows switched on and in the same
+  // shadow mode the engine will use. Probing before that is why an earlier
+  // version of this check passed a deliberately broken shader.
+  const prevEnabled = renderer.shadowMap.enabled;
+  const prevType = renderer.shadowMap.type;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.BasicShadowMap;
+
+  const scene = new THREE.Scene();
+  const cam = new THREE.PerspectiveCamera(50, 1, 0.1, 10);
+  cam.position.set(0, 1, 3);
+  const light = new THREE.DirectionalLight(0xffffff, 1);
+  light.position.set(2, 4, 2);
+  light.castShadow = true;
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(1, 1, 1),
+    new THREE.MeshStandardMaterial({ color: 0x808080, roughness: 0.6, metalness: 0.2 }));
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  // A receiver the caster can actually shadow, so the sampler is exercised.
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(6, 6),
+    new THREE.MeshStandardMaterial({ color: 0x909090, roughness: 0.8 }));
+  ground.rotation.x = -Math.PI / 2;
+  ground.position.y = -0.6;
+  ground.receiveShadow = true;
+  scene.add(light, light.target, mesh, ground);
+
+  const originalError = console.error;
+  let failed = false;
+  let message = '';
+  console.error = (...args) => {
+    const text = args.map((a) => (a && a.message) || String(a)).join(' ');
+    if (/shader|program|glsl|compile|link/i.test(text)) {
+      failed = true;
+      if (!message) message = text.slice(0, 400);
+    }
+    originalError.apply(console, args);
+  };
+  try {
+    renderer.compile(scene, cam);
+    renderer.render(scene, cam);
+  } catch (err) {
+    failed = true;
+    message = message || String(err && err.message || err);
+  } finally {
+    console.error = originalError;
+    mesh.geometry.dispose();
+    mesh.material.dispose();
+    ground.geometry.dispose();
+    ground.material.dispose();
+    renderer.shadowMap.enabled = prevEnabled;
+    renderer.shadowMap.type = prevType;
+  }
+  return { ok: !failed, message };
+}
+
 export function createEngine(canvas, { quality = 'high' } = {}) {
-  const pcssOk = installContactShadows();
-  const toneOk = installToneCurve();
+  // Keep the originals so a driver that rejects our GLSL can be given three's.
+  const originalShadowChunk = THREE.ShaderChunk.shadowmap_pars_fragment;
+  const originalToneChunk = THREE.ShaderChunk.tonemapping_pars_fragment;
+
+  let pcssOk = installContactShadows();
+  let toneOk = installToneCurve();
 
   const renderer = new THREE.WebGLRenderer({
     canvas,
@@ -422,6 +497,26 @@ export function createEngine(canvas, { quality = 'high' } = {}) {
     stencil: false,
     alpha: false,
   });
+  // Pre-flight: if the driver rejects the injected chunks, put three's own back
+  // and carry on with standard PCF shadows and ACES. A slightly softer look
+  // beats a black canvas.
+  let shaderFallback = null;
+  if (pcssOk || toneOk) {
+    const probe = shaderChunksCompile(renderer);
+    if (!probe.ok) {
+      THREE.ShaderChunk.shadowmap_pars_fragment = originalShadowChunk;
+      THREE.ShaderChunk.tonemapping_pars_fragment = originalToneChunk;
+      contactShadowsInstalled = false;
+      toneCurveInstalled = false;
+      pcssOk = false;
+      toneOk = false;
+      shaderFallback = probe.message || 'shader compilation failed';
+      // Do NOT dispose the renderer here — the probe's own materials are gone
+      // and every later material compiles fresh against the restored chunks.
+      console.warn('[engine] custom shader chunks rejected by this driver, falling back:', shaderFallback);
+    }
+  }
+
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = toneOk ? THREE.CustomToneMapping : THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.05;
@@ -545,7 +640,7 @@ export function createEngine(canvas, { quality = 'high' } = {}) {
     sunLight: null,       // set by environment
     envScene: null,       // set by environment
     /** Diagnostics for the capture harness / settings screen. */
-    features: { contactShadows: pcssOk, toneCurve: toneOk },
+    features: { contactShadows: pcssOk, toneCurve: toneOk, shaderFallback },
 
     setQuality(name) {
       const q = QUALITY[name];
