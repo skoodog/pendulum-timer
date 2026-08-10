@@ -74,6 +74,37 @@
 const STORAGE_KEY = 'concreterepublic.input.v1';
 const STORAGE_VERSION = 1;
 
+// ---------------------------------------------------------------------------
+// Gamepad access can be REFUSED, not merely absent.
+//
+// Inside an embedded frame the Permissions Policy can disallow the "gamepad"
+// feature, and then navigator.getGamepads() THROWS a SecurityError rather than
+// returning an empty list. This is polled at the top of every frame, so an
+// unguarded call takes down the whole frame loop before the renderer ever runs
+// — the DOM HUD keeps its last paint while the canvas stays black.
+//
+// One refusal is permanent for the life of the document, so latch it and stop
+// asking. Keyboard play is unaffected.
+// ---------------------------------------------------------------------------
+let gamepadBlocked = false;
+const EMPTY_PADS = [];
+
+function readGamepads() {
+  if (gamepadBlocked) return EMPTY_PADS;
+  if (typeof navigator === 'undefined' || !navigator.getGamepads) return EMPTY_PADS;
+  try {
+    return navigator.getGamepads() || EMPTY_PADS;
+  } catch (err) {
+    gamepadBlocked = true;
+    console.warn('[input] gamepad access refused by permissions policy; keyboard only:', err && err.message);
+    return EMPTY_PADS;
+  }
+}
+
+/** True when this document is not allowed to see gamepads at all. */
+export function gamepadsUnavailable() { return gamepadBlocked; }
+
+
 /** Declaration order — also the order the settings screen walks. */
 export const ACTIONS = [
   'forward', 'back', 'left', 'right', 'pedal', 'brake',
@@ -594,10 +625,10 @@ export function createInput(opts) {
     padActivity = false;
     state.padCount = 0;
 
-    if (typeof navigator === 'undefined' || !navigator.getGamepads) { state.anyGamepad = false; return; }
+    if (gamepadBlocked) { state.anyGamepad = false; return; }
     // getGamepads() allocates its snapshot array — that is the API, and it is the
     // only allocation in the polling path.
-    const pads = navigator.getGamepads();
+    const pads = readGamepads();
     if (!pads) { state.anyGamepad = false; return; }
 
     let count = 0;
@@ -694,8 +725,8 @@ export function createInput(opts) {
   }
 
   function captureBaseline() {
-    if (typeof navigator === 'undefined' || !navigator.getGamepads) return;
-    const pads = navigator.getGamepads();
+    const pads = readGamepads();
+    if (!pads.length) return;
     if (!pads) return;
     captureBtnBase.fill(0);
     captureAxisBase.fill(0);
@@ -716,8 +747,8 @@ export function createInput(opts) {
     if (now >= capture.deadline) { finishCapture(null, 'timeout'); return; }
     if (capture.device !== 'gamepad') return;
     if (!capture.based) { captureBaseline(); capture.based = true; return; }
-    if (typeof navigator === 'undefined' || !navigator.getGamepads) return;
-    const pads = navigator.getGamepads();
+    const pads = readGamepads();
+    if (!pads.length) return;
     if (!pads) return;
     for (let pi = 0; pi < pads.length && pi < MAX_PADS; pi++) {
       const g = pads[pi];
@@ -755,8 +786,8 @@ export function createInput(opts) {
   let refreshAt = 0;
 
   function eachActuator(fn) {
-    if (typeof navigator === 'undefined' || !navigator.getGamepads) return;
-    const pads = navigator.getGamepads();
+    const pads = readGamepads();
+    if (!pads.length) return;
     if (!pads) return;
     for (let i = 0; i < pads.length; i++) {
       const g = pads[i];

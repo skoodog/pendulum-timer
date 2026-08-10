@@ -104,6 +104,20 @@ async function boot() {
   engine.configureAO({ radius: 0.4, distanceExponent: 1.7, thickness: 0.35, scale: 1.1 });
 
   // --- loop ----------------------------------------------------------------
+  // Run one subsystem, and if it throws, report it ONCE and keep the frame
+  // alive. Repeating the same error every frame would bury the console.
+  const stepFailures = new Set();
+  function step(name, fn) {
+    try {
+      fn();
+    } catch (err) {
+      if (!stepFailures.has(name)) {
+        stepFailures.add(name);
+        console.error('[frame] ' + name + ' update failed, continuing without it:', err);
+      }
+    }
+  }
+
   let last = performance.now();
   let accumulator = 0;
 
@@ -116,32 +130,37 @@ async function boot() {
     ctx.time.elapsed += dt;
     ctx.time.frame++;
 
-    input.poll(now);
+    step('input', () => input.poll(now));
 
     if (!ctx.flags.paused && !ctx.flags.freeze) {
       accumulator += dt;
       let steps = 0;
       while (accumulator >= FIXED_DT && steps < MAX_SUBSTEPS) {
-        ctx.player.physics.fixedUpdate(FIXED_DT, ctx);
-        ctx.player.grind.fixedUpdate(FIXED_DT, ctx);
-        ctx.player.tricks.fixedUpdate(FIXED_DT, ctx);
-        ctx.player.scoring.fixedUpdate(FIXED_DT, ctx);
+        step('physics', () => ctx.player.physics.fixedUpdate(FIXED_DT, ctx));
+        step('grind', () => ctx.player.grind.fixedUpdate(FIXED_DT, ctx));
+        step('tricks', () => ctx.player.tricks.fixedUpdate(FIXED_DT, ctx));
+        step('scoring', () => ctx.player.scoring.fixedUpdate(FIXED_DT, ctx));
         accumulator -= FIXED_DT;
         steps++;
       }
       if (steps === MAX_SUBSTEPS) accumulator = 0;
     }
 
-    ctx.player.anim.update(dt, ctx);
-    ctx.world.environment.update?.(dt, ctx);
-    ctx.world.puddles?.update?.(dt, ctx);
-    ctx.world.park.update?.(dt, ctx);
-    ctx.cameraRig.update(dt, ctx);
-    ctx.fx.update(dt, ctx);
-    ctx.audio.update(dt, ctx);
-    ctx.hud.update(dt, ctx);
-    ctx.settings?.update?.(dt, ctx);
-    ctx.screens.update?.(dt, ctx);
+    // Each subsystem is stepped independently and the renderer runs no matter
+    // what. A throw anywhere in here used to abort the whole frame before
+    // engine.render(), which leaves the DOM HUD on screen over a canvas that
+    // never draws — indistinguishable, to a player, from "the graphics are
+    // broken". A blocked browser API in one subsystem must not cost the frame.
+    step('anim', () => ctx.player.anim.update(dt, ctx));
+    step('environment', () => ctx.world.environment.update?.(dt, ctx));
+    step('puddles', () => ctx.world.puddles?.update?.(dt, ctx));
+    step('park', () => ctx.world.park.update?.(dt, ctx));
+    step('camera', () => ctx.cameraRig.update(dt, ctx));
+    step('fx', () => ctx.fx.update(dt, ctx));
+    step('audio', () => ctx.audio.update(dt, ctx));
+    step('hud', () => ctx.hud.update(dt, ctx));
+    step('settings', () => ctx.settings?.update?.(dt, ctx));
+    step('screens', () => ctx.screens.update?.(dt, ctx));
 
     engine.render(ctx.time.elapsed);
   }
